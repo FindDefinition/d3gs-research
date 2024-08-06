@@ -10,7 +10,7 @@ from cumm.gemm.codeops import div_up
 from d3sim.constants import IsAppleSiliconMacOs
 import cumm.tensorview as tv
 from d3sim.ops.d3gs.data.utils.general_utils import strip_symmetric, build_scaling_rotation
-from cumm.inliner import torch_tensor_to_tv
+from cumm.inliner import torch_tensor_to_tv, measure_and_print_torch
 def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
     L = build_scaling_rotation(scaling_modifier * scaling, rotation)
     actual_covariance = L @ L.transpose(1, 2)
@@ -33,6 +33,7 @@ class GaussianSplatConfig:
     gaussian_lowpass_filter: float = 0.3
     alpha_eps: float = 1.0 / 255.0
     transmittance_eps: float = 0.0001
+    depth_32bit_prec: float = 0.001
 
     bg_color: np.ndarray = dataclasses.field(default_factory=lambda: np.zeros((3), np.float32))
 
@@ -42,7 +43,8 @@ class GaussianSplatForward:
 
     def forward(self, model: GaussianModelBase, intrinsic: np.ndarray,
                    cam2world: np.ndarray, image_shape_wh: tuple[int, int],
-                   axis_front_u_v: tuple[int, int, int], scale_global: float = 1.0):
+                   axis_front_u_v: tuple[int, int, int], scale_global: float = 1.0,
+                   enable_32bit_sort: bool = False):
         num = len(model)
         enable_verbose = False
 
@@ -65,6 +67,8 @@ class GaussianSplatForward:
         cam2world_center_np = cam2world_T_np[3]
         tile_num_x = div_up(width, self.cfg.tile_size[0])
         tile_num_y = div_up(height, self.cfg.tile_size[1])
+        if enable_32bit_sort:
+            assert tile_num_x * tile_num_y < 2 ** 13, "32bit sort only support 13 bits tile idx"
         block_size = self.cfg.tile_size[0] * self.cfg.tile_size[1]
         tile_num_xy_np = np.array([tile_num_x, tile_num_y], np.int32)
         xyz = model.xyz_act
@@ -88,7 +92,7 @@ class GaussianSplatForward:
         custom_feat = model.custom_features
         num_custom_feat = 0 if custom_feat is None else custom_feat.shape[1]
         t1 = time.time()
-        with tv.measure_and_print("1", enable=enable_verbose):
+        with measure_and_print_torch("1", enable=enable_verbose):
             prep_kernel_name = f"gs3d_preprocess_{axis_front_u_v}_{self.cfg.tile_size}_{degree}"
             INLINER.kernel_1d(prep_kernel_name, num, 0, f"""
             namespace op = tv::arrayops;
@@ -150,33 +154,16 @@ class GaussianSplatForward:
 
             # print(INLINER.get_nvrtc_module(prep_kernel_name).params.debug_code)
             # breakpoint()
-        # torch.cuda.synchronize()
-        # print("Preprocess", time.time() - t1, radii)
-        # print(cov3d_ref[0])
-        # from d3sim.ops.d3gs.data.utils.sh_utils import eval_sh
-        # quat_wxyz = quat_xyzw[:, [3, 0, 1, 2]]
-        # cov3d_ref = build_covariance_from_scaling_rotation(scales, 1, quat_wxyz)
-
-        # shs_view = color_sh.transpose(1, 2).view(-1, 3, (3+1)**2)
-        # dir_pp = (xyz - torch.from_numpy(cam2world_T_np[3]).cuda().repeat(color_sh.shape[0], 1))
-        # dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
-        # sh2rgb = eval_sh(3, shs_view, dir_pp_normalized)
-        # colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
-        # print(torch.linalg.norm(colors_precomp - rgb_gaussian))
-        # # print(debug_cov3d[0])
-        # # print(quat_xyzw[0])
-        # breakpoint()
-        with tv.measure_and_print("2", enable=enable_verbose):
-
+        with measure_and_print_torch("2", enable=enable_verbose):
             tiles_touched.cumsum_(0)
             num_rendered = int(tiles_touched[-1].item())
         if (num_rendered == 0):
             return
-        keys_tile_idx_depth = torch.empty(num_rendered, dtype=torch.int64, device=xyz.device)
+        keys_tile_idx_depth = torch.empty(num_rendered, dtype=torch.int64 if not enable_32bit_sort else torch.int32, device=xyz.device)
         gaussian_idx = torch.empty(num_rendered, dtype=torch.int32, device=xyz.device)
-        with tv.measure_and_print(f"3 {num_rendered}", enable=enable_verbose):
-
-            INLINER.kernel_1d("prepare_sort_data", num, 0, f"""
+        with measure_and_print_torch(f"3 {num_rendered}", enable=enable_verbose):
+            code = pccm.code()
+            code.raw(f"""
             namespace op = tv::arrayops;
             using math_op_t = tv::arrayops::MathScalarOp<float>;
 
@@ -186,44 +173,75 @@ class GaussianSplatForward:
             auto tile_num_xy = $tile_num_xy_np;
             auto tile_size_xy_float = tile_size_xy.cast<float>();
 
-            if (radii_val > 0){{
-                auto depth_uint = reinterpret_cast<const TV_METAL_DEVICE uint32_t*>($depths)[i];
+            """)
+            with code.if_("radii_val > 0"):
+                if enable_32bit_sort:
+                    code.raw(f"""
+                    auto depth_uint = uint32_t($depths[i] / $(self.cfg.depth_32bit_prec));
+                    """)
+                else:
+                    code.raw(f"""
+                    auto depth_uint = reinterpret_cast<const TV_METAL_DEVICE uint32_t*>($depths)[i];
+                    """)
+                code.raw(f"""
                 auto offset = i == 0 ? 0 : $tiles_touched[i - 1];
                 auto uv = op::reinterpret_cast_alignedarray<2>($uvs)[i];
                 auto gaussian_rect_min = ((uv - radii_fp) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
                 auto gaussian_rect_max = ((uv + radii_fp + tile_size_xy_float - 1) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
-                for (int y = gaussian_rect_min[1]; y < gaussian_rect_max[1]; ++y){{
-                    for (int x = gaussian_rect_min[0]; x < gaussian_rect_max[0]; ++x){{
-                        uint64_t key = y * tile_num_xy[0] + x;
-                        key <<= 32;
-                        key |= depth_uint; // assume depth always > 0
-                        $keys_tile_idx_depth[offset] = key;
-                        $gaussian_idx[offset] = i;
-                        ++offset;
-                    }}
-                }}
-            }}
-            """)
+                """)
+                with code.for_("int y = gaussian_rect_min[1]; y < gaussian_rect_max[1]; ++y"):
+                    with code.for_("int x = gaussian_rect_min[0]; x < gaussian_rect_max[0]; ++x"):
+                        if enable_32bit_sort:
+                            code.raw(f"""
+                            uint32_t key = y * tile_num_xy[0] + x;
+                            key <<= 18;
+                            key |= depth_uint; // assume depth always > 0
+                            $keys_tile_idx_depth[offset] = key;
+                            $gaussian_idx[offset] = i;
+                            ++offset;
+                            """)
+                        else:
+                            code.raw(f"""
+                            uint64_t key = y * tile_num_xy[0] + x;
+                            key <<= 32;
+                            key |= depth_uint; // assume depth always > 0
+                            $keys_tile_idx_depth[offset] = key;
+                            $gaussian_idx[offset] = i;
+                            ++offset;
+                            """)
+            INLINER.kernel_1d(f"prepare_sort_data_{enable_32bit_sort}", num, 0, code)
         # print(debug_ten.min(), debug_ten.max(), debug_ten)
 
         # TODO use radix sort with trunated bits (faster) for cuda
         # TODO use 32bit sort, for 1920x1080 tile, the max tile idx is 8100, 13 bits
         # so we can use 18bit for depth.
-        with tv.measure_and_print("4", enable=enable_verbose):
+        # with measure_and_print_torch("4", enable=enable_verbose):
+        #     keys_tile_idx_depth_cpu = keys_tile_idx_depth.cpu()
 
+        #     sorted_vals, indices = torch.sort(keys_tile_idx_depth_cpu)
+        #     sorted_vals = sorted_vals.to(keys_tile_idx_depth.device)
+        #     indices = indices.to(keys_tile_idx_depth.device)
+        #     gaussian_idx_sorted = torch.gather(gaussian_idx, 0, indices)
+        with measure_and_print_torch("4", enable=enable_verbose):
             sorted_vals, indices = torch.sort(keys_tile_idx_depth)
-        with tv.measure_and_print("4.2", enable=enable_verbose):
-
             gaussian_idx_sorted = torch.gather(gaussian_idx, 0, indices)
+
+        # keys_tile_idx_depth_cpu = gaussian_idx.cpu()
+        # with measure_and_print_torch("4.1", enable=enable_verbose):
+
+        #     sorted_vals_, indices_ = torch.sort(gaussian_idx)
+
+        with measure_and_print_torch("4.2", enable=enable_verbose):
             workload_ranges = torch.empty([tile_num_x * tile_num_y, 2], dtype=torch.int32, device=xyz.device)
-            INLINER.kernel_1d("prepare_workload_range", num_rendered, 0, f"""
+            shift_bits = 32 if not enable_32bit_sort else 18
+            INLINER.kernel_1d(f"prepare_workload_range_{enable_32bit_sort}", num_rendered, 0, f"""
             auto key = $sorted_vals[i];
-            uint32_t tile_idx = key >> 32;
+            uint32_t tile_idx = key >> {shift_bits};
             if (i == 0){{
                 $workload_ranges[tile_idx * 2 + 0] = 0;
             }}else{{
                 auto last_key = $sorted_vals[i - 1];
-                uint32_t last_tile_idx = last_key >> 32;
+                uint32_t last_tile_idx = last_key >> {shift_bits};
                 if (tile_idx != last_tile_idx){{
                     $workload_ranges[last_tile_idx * 2 + 1] = i;
                     $workload_ranges[tile_idx * 2 + 0] = i;
@@ -257,8 +275,8 @@ class GaussianSplatForward:
             bool inside = true;
             // keep in mind that metal only have 32KB shared memory
             threadgroup int collected_id[{self.cfg.tile_size[0] * self.cfg.tile_size[1]}];
-            threadgroup tv::array<float, 2> collected_xy[{self.cfg.tile_size[0] * self.cfg.tile_size[1]}];
-            threadgroup tv::array<float, 4> collected_conic_opacity[{self.cfg.tile_size[0] * self.cfg.tile_size[1]}];
+            threadgroup float2 collected_xy[{self.cfg.tile_size[0] * self.cfg.tile_size[1]}];
+            threadgroup float4 collected_conic_opacity[{self.cfg.tile_size[0] * self.cfg.tile_size[1]}];
             threadgroup int num_done_shared[32];
             uint thread_rank = threadPositionInThreadgroup.y * {self.cfg.tile_size[0]} + threadPositionInThreadgroup.x;
             """)
@@ -297,33 +315,54 @@ class GaussianSplatForward:
             """)
 
         with code_render_fwd.for_(f"int i = 0; i < rounds; ++i, toDo -= {block_size}"):
-            if IsAppleSiliconMacOs:
-                code_render_fwd.raw(f"""
-                int num_done_simd = metal::simd_sum(int(done));
-                num_done_shared[tv::parallel::warp_index()] = num_done_simd;
-                tv::parallel::block_sync();
-                int num_done = 0;
-                for (int j = 0; j < ({block_size}u / tv::parallel::warp_size()); ++j){{
-                    num_done += num_done_shared[j];
-                }}
-                """)
-            else:
+            if not IsAppleSiliconMacOs:
+            #     code_render_fwd.raw(f"""
+            #     tv::parallel::block_sync();
+            #     int num_done = 0;
+            #     for (int j = 0; j < ({block_size}u / tv::parallel::warp_size()); ++j){{
+            #         num_done += num_done_shared[j];
+            #     }}
+            #     """)
+            # else:
                 code_render_fwd.raw(f"""
                 int num_done = __syncthreads_count(done);
+                if (num_done == {block_size}){{
+                    break;
+                }}
                 """)
             code_render_fwd.raw(f"""
-            if (num_done == {block_size}){{
-                break;
-            }}
             int progress = i * {block_size} + thread_rank;
             if (range[0] + progress < range[1]){{
                 int gaussian_id = $gaussian_idx_sorted_tv[range[0] + progress];
                 collected_id[thread_rank] = gaussian_id;
-                collected_xy[thread_rank] = reinterpret_cast<const float2*>($uvs_tv)[gaussian_id];
-                collected_conic_opacity[thread_rank] = reinterpret_cast<const float4*>($conic_opacity_tv)[gaussian_id];
+                collected_xy[thread_rank] = reinterpret_cast<TV_METAL_DEVICE const float2*>($uvs_tv)[gaussian_id];
+                collected_conic_opacity[thread_rank] = reinterpret_cast<TV_METAL_DEVICE const float4*>($conic_opacity_tv)[gaussian_id];
             }}
+            """)
+            # if IsAppleSiliconMacOs:
+            #     code_render_fwd.raw(f"""
+            #     int num_done_simd = metal::simd_sum(int(done));
+            #     num_done_shared[tv::parallel::warp_index()] = num_done_simd;
+
+            #     tv::parallel::block_sync();
+            #     int num_done = 0;
+
+            #     for (int j = 0; j < ({block_size}u / tv::parallel::warp_size()); ++j){{
+            #         num_done += num_done_shared[j];
+            #     }}
+            #     if (num_done == {block_size}){{
+            #         break;
+            #     }}
+
+            #     """)
+            # else:
+            #     code_render_fwd.raw(f"""
+            #     tv::parallel::block_sync();
+            #     """)
+            code_render_fwd.raw(f"""
             tv::parallel::block_sync();
             """)
+
             with code_render_fwd.for_(f"int j = 0; !done && j < std::min({block_size}, toDo); ++j"):
                 code_render_fwd.raw(f"""
                 ++contributor;
@@ -338,7 +377,7 @@ class GaussianSplatForward:
                 }}
                 float alpha = math_op_t::min(0.99f, conic_opacity_vec.w * math_op_t::exp(power));
                 // TODO if remove the 'f', this kernel runs 4x slower.
-                if (alpha < 1.0f / 350.0f){{
+                if (alpha < 1.0f / 255.0f){{
                     continue;
                 }}
                 float next_T = T * (1.0f - alpha);
@@ -351,6 +390,7 @@ class GaussianSplatForward:
                 last_contributor = contributor;
                 auto gaussian_id = collected_id[j];
                 auto rgb_val = op::reinterpret_cast_array_nd<3>($rgb_gaussian_tv)[gaussian_id];
+                rgb += weight * rgb_val;
                 """) 
                 if num_custom_feat > 0:
                     code_render_fwd.raw(f"""
@@ -381,7 +421,7 @@ class GaussianSplatForward:
 
         kernel_unique_name = (f"render_forward_{self.cfg.tile_size}_{num_custom_feat}_"
             f"{self.cfg.alpha_eps}_{self.cfg.transmittance_eps}")
-        with tv.measure_and_print("5", enable=enable_verbose):
+        with measure_and_print_torch("5", enable=enable_verbose):
             INLINER.kernel_raw(kernel_unique_name, launch_param, code_render_fwd)
         # print(INLINER.get_nvrtc_kernel_attrs(kernel_unique_name))
         # print(INLINER.get_nvrtc_module(kernel_unique_name).get_ptx())
