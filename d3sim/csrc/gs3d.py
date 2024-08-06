@@ -35,6 +35,28 @@ class Gaussian3D(pccm.Class):
     def __init__(self):
         super().__init__()
         self.add_dependency(TensorViewArrayLinalg, TensorViewNVRTC)
+
+#         self.add_global_code("""
+# __device__ const float SH_C0 = 0.28209479177387814f;
+# __device__ const float SH_C1 = 0.4886025119029199f;
+# __device__ const float SH_C2[] = {
+# 	1.0925484305920792f,
+# 	-1.0925484305920792f,
+# 	0.31539156525252005f,
+# 	-1.0925484305920792f,
+# 	0.5462742152960396f
+# };
+# __device__ const float SH_C3[] = {
+# 	-0.5900435899266435f,
+# 	2.890611442640554f,
+# 	-0.4570457994644658f,
+# 	0.3731763325901154f,
+# 	-0.4570457994644658f,
+# 	1.445305721320277f,
+# 	-0.5900435899266435f
+# };
+
+#         """)
     
     @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
     def sh_dir_to_rgb(self):
@@ -53,7 +75,8 @@ class Gaussian3D(pccm.Class):
             T x = dir[0];
             T y = dir[1];
             T z = dir[2];
-            result = result - {SHConstants.SH_C1} * y * sh[1] + T({SHConstants.SH_C1}) * z * sh[2] - T({SHConstants.SH_C1}) * x * sh[3];
+            constexpr T C1 = T({SHConstants.SH_C1});
+            result = result - C1 * y * sh[1] + C1 * z * sh[2] - C1 * x * sh[3];
 
             if (Degree > 1)
             {{

@@ -29,3 +29,4 @@ __deps: list[type[pccm.Class]] = [
 
 INLINER = NVRTCInlineBuilder(__deps,
                              reload_when_code_change=True, mps_context=MPSContext())
+INLINER.maximum_1d_threads = 256
