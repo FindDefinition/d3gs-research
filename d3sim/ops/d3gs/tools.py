@@ -24,6 +24,7 @@ def load_3dgs_origin_model(ply_path: str):
     for i in range(4):
         rot_vecs.append(vertex[f"rot_{i}"])
     rots = np.stack(rot_vecs, axis=1).astype(np.float32)[:, [1, 2, 3, 0]]
+    rots = np.ascontiguousarray(rots)
     scale_vecs = []
     for i in range(3):
         scale_vecs.append(vertex[f"scale_{i}"])
@@ -40,14 +41,17 @@ def load_3dgs_origin_model(ply_path: str):
 class _Args:
     def __init__(self):
         self.resolution = -1
-        self.data_device = "mps"
+        self.data_device = "cuda"
 
 def _main():
     from d3sim.ops.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, camera_to_JSON
 
     data_path = "/Users/yanyan/Downloads/360_v2/garden"
-    scene_info = readColmapSceneInfo(data_path, None, False)
+    data_path = "/root/autodl-tmp/garden_scene/garden"
+
+    scene_info = readColmapSceneInfo(data_path, "images_4", True)
     train_camera_infos = scene_info.train_cameras
+    print(len(scene_info.train_cameras), len(scene_info.test_cameras))
     train_camera_first = next(cameraList_from_camInfos_gen(train_camera_infos, 1, _Args()))
     intrinsic = train_camera_first.get_intrinsic()
     world2cam = np.eye(4, dtype=np.float32)
@@ -57,18 +61,20 @@ def _main():
     # breakpoint()
     print("REF", train_camera_first.FoVx, train_camera_first.FoVy)
     path = "/Users/yanyan/Downloads/models/garden/point_cloud/iteration_30000/point_cloud.ply"
+    path = "/root/autodl-tmp/garden_model/garden/point_cloud/iteration_30000/point_cloud.ply"
+
     mod = load_3dgs_origin_model(path)
     cfg = GaussianSplatConfig()
     fwd = GaussianSplatForward(cfg)
     for j in range(5):
-        t = time.time()
-        fwd.forward(mod, intrinsic, np.linalg.inv(world2cam),image_shape_wh, axis_front_u_v=(2, 0, 1))
-        # out_color_u8 = (out_color.permute(1, 2, 0) * 255).to(torch.uint8).cpu().numpy()
-        # import cv2 
-        # cv2.imwrite("test.png", out_color_u8)
+        # t = time.time()
+        _, _, out_color = fwd.forward(mod, intrinsic, np.linalg.inv(world2cam),image_shape_wh, axis_front_u_v=(2, 0, 1))
+        out_color_u8 = (out_color.permute(1, 2, 0) * 255).to(torch.uint8).cpu().numpy()
+        import cv2 
+        cv2.imwrite("test.png", out_color_u8[..., ::-1])
         # breakpoint()
 
-        torch.mps.synchronize()
-        print(time.time() - t)
+        # torch.cuda.synchronize()
+        # print(time.time() - t)
 if __name__ == "__main__":
     _main()

@@ -9,6 +9,13 @@ import pccm
 from cumm.gemm.codeops import div_up
 from d3sim.constants import IsAppleSiliconMacOs
 import cumm.tensorview as tv
+from d3sim.ops.d3gs.data.utils.general_utils import strip_symmetric, build_scaling_rotation
+
+def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
+    L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+    actual_covariance = L @ L.transpose(1, 2)
+    symm = strip_symmetric(actual_covariance)
+    return symm
 
 def fov2focal(fov: float, length: int):
     return float(length) / (2 * math.tan(fov / 2))
@@ -66,13 +73,14 @@ class GaussianSplatForward:
         opacity = model.opacity_act
         color_sh = model.color_sh_act
         degree = model.color_sh_degree
+
         depths = torch.empty(num, dtype=torch.float32, device=xyz.device)
         radii = torch.empty(num, dtype=torch.int32, device=xyz.device)
         uvs = torch.empty([num, 2], dtype=torch.float32, device=xyz.device)
         conic_opacity = torch.empty([num, 4], dtype=torch.float32, device=xyz.device)
         tiles_touched = torch.empty(num, dtype=torch.int32, device=xyz.device)
         rgb_gaussian = torch.empty([num, 3], dtype=torch.float32, device=xyz.device)
-        # debug_cov3d = torch.empty([num, 6], dtype=torch.float32, device=xyz.device)
+        debug_cov3d = torch.empty([num, 6], dtype=torch.float32, device=xyz.device)
         # debug_cov2d = torch.empty([num, 3], dtype=torch.float32, device=xyz.device)
 
         # debug_ten = torch.empty(num, dtype=torch.float32, device=xyz.device)
@@ -90,31 +98,35 @@ class GaussianSplatForward:
         auto point = op::reinterpret_cast_array_nd<3>($xyz)[i];
         auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
         auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[i];
-
         auto point_cam = op::slice<0, 3>(cam2world_T).op<op::mv_rowmajor>(point - cam2world_T[3]);
-        auto uv_unified_and_z = CameraOps::pos_cam_to_uv_no_distort<{axis_front_u_v[0]}, {axis_front_u_v[1]}, {axis_front_u_v[2]}>(
+        auto ndc_unified_and_z = CameraOps::pos_cam_to_ndc_uv_no_distort<{axis_front_u_v[0]}, {axis_front_u_v[1]}, {axis_front_u_v[2]}>(
             point_cam, principal_point, focal_xy / resolution_wh.cast<float>());
-        auto uv = std::get<0>(uv_unified_and_z) * resolution_wh.cast<float>() + 0.5f;
-        auto z_in_cam = std::get<1>(uv_unified_and_z);
+        auto ndc_unified = std::get<0>(ndc_unified_and_z);
+        auto uv = (std::get<0>(ndc_unified_and_z) + 1) * resolution_wh.cast<float>() / 2.0f - 0.5f;
+        auto z_in_cam = std::get<1>(ndc_unified_and_z);
         auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale, $scale_global, quat);
+        // op::reinterpret_cast_array_nd<6>($debug_cov3d)[i] = cov3d_vec;
+        // tv::printf2_once<' ', 1>("point_cam", point_cam[0],point_cam[1], point_cam[2]);;
         auto cov2d_vec = Gaussian3D::project_gaussian_to_2d(point_cam, focal_xy, tan_fov, cam2world_T, cov3d_vec, $(self.cfg.projected_clamp_factor));
         cov2d_vec[0] += $(self.cfg.gaussian_lowpass_filter);
         cov2d_vec[2] += $(self.cfg.gaussian_lowpass_filter);
-        
+        tv::printf2_once<' ', 1>(cov2d_vec[0], cov2d_vec[1], cov2d_vec[2], "CONV2D");
         auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det(cov2d_vec, $(self.cfg.eps));
         auto cov2d_inv = std::get<0>(cov2d_inv_and_det);
         auto det = std::get<1>(cov2d_inv_and_det);
         auto radii_fp = math_op_t::ceil(Gaussian3D::get_gaussian_2d_ellipse(cov2d_vec, det, 
             $(self.cfg.cov2d_radii_eigen_eps), $(self.cfg.gaussian_std_sigma)));
-        // op::reinterpret_cast_array_nd<6>($debug_cov3d)[i] = cov3d_vec;
         // op::reinterpret_cast_array_nd<3>($debug_cov2d)[i] = cov2d_vec;
         constexpr auto tile_size_xy = tv::array<int, 2>{{{self.cfg.tile_size[0]}, {self.cfg.tile_size[1]}}};
         auto tile_num_xy = tv::div_up(resolution_wh, tile_size_xy);
         auto tile_size_xy_float = tile_size_xy.cast<float>();
         auto gaussian_rect_min = ((uv - radii_fp) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
         auto gaussian_rect_max = ((uv + radii_fp + tile_size_xy_float - 1) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
-        bool is_empty = (det == 0 || z_in_cam < 0.2);
         int rect_area = (gaussian_rect_max[0] - gaussian_rect_min[0]) * (gaussian_rect_max[1] - gaussian_rect_min[1]);
+        bool is_empty = (det == 0 || z_in_cam < 0.2) || rect_area == 0;
+        // tv::printf2_once<' ', 1>(ndc_unified[0], ndc_unified[1], gaussian_rect_min[0], gaussian_rect_min[1], 
+        //     gaussian_rect_max[0], gaussian_rect_max[1]);
+
         $tiles_touched[i] = is_empty ? 0 : rect_area;
         $radii[i] = is_empty ? 0 : int(radii_fp);
         $depths[i] = z_in_cam;
@@ -124,11 +136,26 @@ class GaussianSplatForward:
         tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], $opacity[i]}};
         op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
         auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1)};
-        op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{degree}>(sh_ptr, point_cam.op<op::normalize>());
+        op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{degree}>(sh_ptr, (point - cam2world_T[3]).op<op::normalize>());
 
         """)
-        torch.mps.synchronize()
-        print("Preprocess", time.time() - t1)
+        # torch.cuda.synchronize()
+        # print("Preprocess", time.time() - t1, radii)
+        # print(cov3d_ref[0])
+        from d3sim.ops.d3gs.data.utils.sh_utils import eval_sh
+        quat_wxyz = quat_xyzw[:, [3, 0, 1, 2]]
+        cov3d_ref = build_covariance_from_scaling_rotation(scales, 1, quat_wxyz)
+
+        shs_view = color_sh.transpose(1, 2).view(-1, 3, (3+1)**2)
+        dir_pp = (xyz - torch.from_numpy(cam2world_T_np[3]).cuda().repeat(color_sh.shape[0], 1))
+        dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+        sh2rgb = eval_sh(3, shs_view, dir_pp_normalized)
+        colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+        print(torch.linalg.norm(colors_precomp, rgb_gaussian))
+        # print(debug_cov3d[0])
+        # print(quat_xyzw[0])
+        breakpoint()
+
         tiles_touched.cumsum_(0)
         num_rendered = int(tiles_touched[-1].item())
         if (num_rendered == 0):

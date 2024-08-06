@@ -153,3 +153,31 @@ class CameraOps(pccm.Class):
         return std::make_tuple(uv, AxisFrontSign * pos_cam[AxisFrontAbs]);
         """)
         return code.ret("std::tuple<tv::array<float, 2>, float>")
+
+
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def pos_cam_to_ndc_uv_no_distort(self):
+        code = pccm.code()
+        code.nontype_targ("AxisFront", "int", "2")
+        code.nontype_targ("AxisU", "int", "0")
+        code.nontype_targ("AxisV", "int", "1")
+        code.nontype_targ("AxisFrontSign", "int", "1")
+        code.nontype_targ("AxisUSign", "int", "1")
+        code.nontype_targ("AxisVSign", "int", "1")
+
+        code.arg("pos_cam", "tv::array<float, 3>")
+        code.arg("principal_point", "tv::array<float, 2>")
+        code.arg("focal_length_unified", "tv::array<float, 2>")
+        code.raw(f"""
+        namespace op = tv::arrayops;
+        constexpr int AxisFrontAbs = AxisFront > 0 ? AxisFront : -AxisFront;
+        constexpr int AxisUAbs = AxisU > 0 ? AxisU : -AxisU;
+        constexpr int AxisVAbs = AxisV > 0 ? AxisV : -AxisV;
+
+        using vec3 = tv::array<float, 3>;
+        using vec2 = tv::array<float, 2>;
+        vec2 uv{{AxisUSign * pos_cam[AxisUAbs] / pos_cam[AxisFrontAbs], AxisVSign * pos_cam[AxisVAbs] / pos_cam[AxisFrontAbs]}};
+        uv = uv * 2 * focal_length_unified;
+        return std::make_tuple(uv, AxisFrontSign * pos_cam[AxisFrontAbs]);
+        """)
+        return code.ret("std::tuple<tv::array<float, 2>, float>")

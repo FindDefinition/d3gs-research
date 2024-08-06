@@ -41,11 +41,11 @@ class Gaussian3D(pccm.Class):
         code = pccm.code()
         code.nontype_targ("Degree", "int")
         code.targ("T")
-        code.arg("sh_ptr", "device const tv::array<T, 3>*")
+        code.arg("sh_ptr", "TV_METAL_DEVICE const tv::array<T, 3>*")
         code.arg("dir", "tv::array<T, 3>")
         code.raw(f"""
         namespace op = tv::arrayops;
-        op::PointerValueReader<device const tv::array<T, 3>> sh(sh_ptr);
+        op::PointerValueReader<TV_METAL_DEVICE const tv::array<T, 3>> sh(sh_ptr);
         static_assert(Degree >= 0 && Degree <= 3, "Degree must be in [0, 3]");
         tv::array<T, 3> result = T({SHConstants.SH_C0}) * sh[0];
         if (Degree > 0)
@@ -80,7 +80,7 @@ class Gaussian3D(pccm.Class):
             }}
         }}
         result += T(0.5);
-        return result;
+        return result.template op<op::maximum>(0.0f);
         """)
         return code.ret("tv::array<T, 3>")
 
@@ -95,7 +95,7 @@ class Gaussian3D(pccm.Class):
         namespace op = tv::arrayops;
         using math_op_t = tv::arrayops::MathScalarOp<T>;
         auto S = (scale * scale_global).template op<op::from_diagonal>();
-        auto R = quat.template op<op::uqmat_colmajor>();
+        auto R = quat.template op<op::uqmat_colmajor>().template op<op::transpose>();
         auto M = S.template op<op::mm_nn>(R);
         auto sigma = M.template op<op::transpose>().template op<op::mm_nn>(M);
         return {{sigma[0][0], sigma[0][1], sigma[0][2], sigma[1][1], sigma[1][2], sigma[2][2]}};
