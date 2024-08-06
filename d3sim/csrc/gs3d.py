@@ -34,7 +34,7 @@ class GLMDebugDep(pccm.Class):
 class Gaussian3D(pccm.Class):
     def __init__(self):
         super().__init__()
-        self.add_dependency(TensorViewArrayLinalg, TensorViewNVRTC, GLMDebugDep)
+        self.add_dependency(TensorViewArrayLinalg, TensorViewNVRTC)
     
     @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
     def sh_dir_to_rgb(self):
@@ -203,7 +203,7 @@ class Gaussian3D(pccm.Class):
         namespace op = tv::arrayops;
         using math_op_t = tv::arrayops::MathScalarOp<T>;
 
-        T mid = T(0.5) * (cov2d_vec[0] + cov2d_vec[3]);
+        T mid = T(0.5) * (cov2d_vec[0] + cov2d_vec[2]);
         T sqrt_part = math_op_t::sqrt(math_op_t::max(ellipsis_eps, mid * mid - det));
         T eigen1 = mid + sqrt_part;
         T eigen2 = mid - sqrt_part;

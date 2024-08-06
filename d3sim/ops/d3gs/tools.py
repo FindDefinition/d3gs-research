@@ -1,3 +1,4 @@
+import time
 from plyfile import PlyData
 import torch 
 from d3sim.constants import D3SIM_DEFAULT_DEVICE
@@ -59,7 +60,15 @@ def _main():
     mod = load_3dgs_origin_model(path)
     cfg = GaussianSplatConfig()
     fwd = GaussianSplatForward(cfg)
-    fwd.forward(mod, intrinsic, np.linalg.inv(world2cam),image_shape_wh, axis_front_u_v=(2, 0, 1))
+    for j in range(5):
+        t = time.time()
+        fwd.forward(mod, intrinsic, np.linalg.inv(world2cam),image_shape_wh, axis_front_u_v=(2, 0, 1))
+        # out_color_u8 = (out_color.permute(1, 2, 0) * 255).to(torch.uint8).cpu().numpy()
+        # import cv2 
+        # cv2.imwrite("test.png", out_color_u8)
+        # breakpoint()
 
+        torch.mps.synchronize()
+        print(time.time() - t)
 if __name__ == "__main__":
     _main()

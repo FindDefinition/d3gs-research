@@ -1,3 +1,4 @@
+import time
 from d3sim.core import dataclass_dispatch as dataclasses
 from d3sim.ops.d3gs.base import GaussianModelBase
 from d3sim.csrc.inliner import INLINER
@@ -56,7 +57,7 @@ class GaussianSplatForward:
         cam2world_T_np = np.ascontiguousarray(cam2world[:3].T)
         tile_num_x = div_up(width, self.cfg.tile_size[0])
         tile_num_y = div_up(height, self.cfg.tile_size[1])
-        block_size = tile_num_x * tile_num_y
+        block_size = self.cfg.tile_size[0] * self.cfg.tile_size[1]
         tile_num_xy_np = np.array([tile_num_x, tile_num_y], np.int32)
         xyz = model.xyz_act
         # quat should be normed in user-defined quaternion_xyzw_act.
@@ -71,12 +72,13 @@ class GaussianSplatForward:
         conic_opacity = torch.empty([num, 4], dtype=torch.float32, device=xyz.device)
         tiles_touched = torch.empty(num, dtype=torch.int32, device=xyz.device)
         rgb_gaussian = torch.empty([num, 3], dtype=torch.float32, device=xyz.device)
-        debug_cov3d = torch.empty([num, 6], dtype=torch.float32, device=xyz.device)
-        debug_cov2d = torch.empty([num, 3], dtype=torch.float32, device=xyz.device)
+        # debug_cov3d = torch.empty([num, 6], dtype=torch.float32, device=xyz.device)
+        # debug_cov2d = torch.empty([num, 3], dtype=torch.float32, device=xyz.device)
 
-        debug_ten = torch.empty(num, dtype=torch.float32, device=xyz.device)
+        # debug_ten = torch.empty(num, dtype=torch.float32, device=xyz.device)
         custom_feat = model.custom_features
         num_custom_feat = 0 if custom_feat is None else custom_feat.shape[1]
+        t1 = time.time()
         INLINER.kernel_1d(f"gs3d_preprocess_{axis_front_u_v}_{self.cfg.tile_size}_{degree}", num, 0, f"""
         namespace op = tv::arrayops;
         using math_op_t = tv::arrayops::MathScalarOp<float>;
@@ -104,9 +106,8 @@ class GaussianSplatForward:
         auto det = std::get<1>(cov2d_inv_and_det);
         auto radii_fp = math_op_t::ceil(Gaussian3D::get_gaussian_2d_ellipse(cov2d_vec, det, 
             $(self.cfg.cov2d_radii_eigen_eps), $(self.cfg.gaussian_std_sigma)));
-        $debug_ten[i] = det;
-        op::reinterpret_cast_array_nd<6>($debug_cov3d)[i] = cov3d_vec;
-        op::reinterpret_cast_array_nd<3>($debug_cov2d)[i] = cov2d_vec;
+        // op::reinterpret_cast_array_nd<6>($debug_cov3d)[i] = cov3d_vec;
+        // op::reinterpret_cast_array_nd<3>($debug_cov2d)[i] = cov2d_vec;
         constexpr auto tile_size_xy = tv::array<int, 2>{{{self.cfg.tile_size[0]}, {self.cfg.tile_size[1]}}};
         auto tile_num_xy = tv::div_up(resolution_wh, tile_size_xy);
         auto tile_size_xy_float = tile_size_xy.cast<float>();
@@ -117,6 +118,8 @@ class GaussianSplatForward:
         $tiles_touched[i] = is_empty ? 0 : rect_area;
         $radii[i] = is_empty ? 0 : int(radii_fp);
         $depths[i] = z_in_cam;
+        // $debug_ten[i] = tile_num_xy[0];
+
         op::reinterpret_cast_array_nd<2>($uvs)[i] = uv;
         tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], $opacity[i]}};
         op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
@@ -124,8 +127,8 @@ class GaussianSplatForward:
         op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{degree}>(sh_ptr, point_cam.op<op::normalize>());
 
         """)
-        print(debug_ten.min(), debug_ten.max(), debug_ten)
-        breakpoint()
+        torch.mps.synchronize()
+        print("Preprocess", time.time() - t1)
         tiles_touched.cumsum_(0)
         num_rendered = int(tiles_touched[-1].item())
         if (num_rendered == 0):
@@ -143,7 +146,7 @@ class GaussianSplatForward:
         auto tile_size_xy_float = tile_size_xy.cast<float>();
 
         if (radii_val > 0){{
-            auto depth_uint = reinterpret_cast<const uint32_t*>($depth)[i];
+            auto depth_uint = reinterpret_cast<const TV_METAL_DEVICE uint32_t*>($depths)[i];
             auto offset = i == 0 ? 0 : $tiles_touched[i - 1];
             auto uv = op::reinterpret_cast_alignedarray<2>($uvs)[i];
             auto gaussian_rect_min = ((uv - radii_fp) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
@@ -160,6 +163,8 @@ class GaussianSplatForward:
             }}
         }}
         """)
+        # print(debug_ten.min(), debug_ten.max(), debug_ten)
+
         # TODO use radix sort with trunated bits (faster) for cuda
         # TODO use 32bit sort, for 1920x1080 tile, the max tile idx is 8100, 13 bits
         # so we can use 18bit for depth.
@@ -183,6 +188,7 @@ class GaussianSplatForward:
             $workload_ranges[tile_idx * 2 + 1] = $num_rendered;
         }}
         """)
+
         final_T = torch.empty([height * width], dtype=torch.float32, device=xyz.device)
         n_contrib = torch.empty([height * width], dtype=torch.int32, device=xyz.device)
         out_color = torch.empty([3, height, width], dtype=torch.float32, device=xyz.device)
@@ -198,7 +204,7 @@ class GaussianSplatForward:
             launch_param = tv.LaunchParam((width, height, 1), (self.cfg.tile_size[0], self.cfg.tile_size[1], 1))
             code_render_fwd.raw(f"""
             tv::array<uint32_t, 2> pixel_idx_xy{{threadPositionInGrid.x, threadPositionInGrid.y}};
-            tv::array<uint32_t, 2> tile_idx_xy{{threadGroupPositionInGrid.x, threadGroupPositionInGrid.y}};
+            tv::array<uint32_t, 2> tile_idx_xy{{threadgroupPositionInGrid.x, threadgroupPositionInGrid.y}};
             bool inside = true;
             // keep in mind that metal only have 32KB shared memory
             threadgroup int collected_id[{self.cfg.tile_size[0] * self.cfg.tile_size[1]}];
@@ -221,6 +227,11 @@ class GaussianSplatForward:
         code_render_fwd.raw(f"""
         uint32_t pixel_id = $width * pixel_idx_xy[1] + pixel_idx_xy[0];
         auto pixel_idx_xy_fp = pixel_idx_xy.cast<float>();
+
+        // Check if this thread is associated with a valid pixel or outside.
+        // Done threads can help with fetching, but don't rasterize
+        bool done = !inside;
+
         auto range = op::reinterpret_cast_array_nd<2>($workload_ranges)[tile_idx_xy[1] * $tile_num_x + tile_idx_xy[0]];
         int rounds = tv::div_up(range[1] - range[0], {self.cfg.tile_size[0] * self.cfg.tile_size[1]});
         int toDo = range[1] - range[0];
@@ -243,7 +254,7 @@ class GaussianSplatForward:
                 num_done_shared[tv::parallel::warp_index()] = num_done_simd;
                 tv::parallel::block_sync();
                 int num_done = 0;
-                for (int j = 0; j < (block_size / tv::parallel::warp_size()); ++j){{
+                for (int j = 0; j < ({block_size}u / tv::parallel::warp_size()); ++j){{
                     num_done += num_done_shared[j];
                 }}
                 """)
@@ -290,7 +301,8 @@ class GaussianSplatForward:
                 T = next_T;
                 last_contributor = contributor;
                 auto gaussian_id = collected_id[j];
-                rgb += weight * op::reinterpret_cast_array_nd<3>($rgb_gaussian)[gaussian_id];
+                auto rgb_val = op::reinterpret_cast_array_nd<3>($rgb_gaussian)[gaussian_id];
+                rgb += weight * rgb_val;
                 """) 
                 if num_custom_feat > 0:
                     code_render_fwd.raw(f"""
@@ -302,11 +314,11 @@ class GaussianSplatForward:
         auto bg_color_val = $(self.cfg.bg_color);
         if (inside)
         {{
-            final_T[pixel_id] = T;
-            n_contrib[pixel_id] = last_contributor;
-            out_color[0 * $height * $width + pixel_id] = rgb[0] + T * bg_color_val[0];
-            out_color[1 * $height * $width + pixel_id] = rgb[1] + T * bg_color_val[1];
-            out_color[2 * $height * $width + pixel_id] = rgb[2] + T * bg_color_val[2];
+            $final_T[pixel_id] = T;
+            $n_contrib[pixel_id] = last_contributor;
+            $out_color[0 * $height * $width + pixel_id] = rgb[0] + T * bg_color_val[0];
+            $out_color[1 * $height * $width + pixel_id] = rgb[1] + T * bg_color_val[1];
+            $out_color[2 * $height * $width + pixel_id] = rgb[2] + T * bg_color_val[2];
         }}
         """)
         if num_custom_feat:
@@ -314,7 +326,7 @@ class GaussianSplatForward:
             if (inside)
             {{
                 for (int channel_idx = 0; channel_idx < {num_custom_feat}; ++channel_idx){{
-                    out_custom_feat[channel_idx * $height * $width + pixel_id] = custom_feature[channel_idx];
+                    $out_custom_feat[channel_idx * $height * $width + pixel_id] = custom_feature[channel_idx];
                 }}
             }}
             """) 
