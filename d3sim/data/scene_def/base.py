@@ -1,16 +1,18 @@
 import copy
 import enum
-from regex import P
 import d3sim.core.dataclass_dispatch as dataclasses 
 import abc 
 from typing import Any, Hashable, TypeVar, Generic
 import numpy as np 
 import torch
-
+from scipy.spatial.transform import Rotation
+from d3sim.core.geodef import EulerIntrinsicOrder
 from d3sim.core.registry import HashableRegistry 
 from pydantic_core import PydanticCustomError, core_schema
 from pydantic import (
     GetCoreSchemaHandler, )
+
+from d3sim.core.ops.rotation import euler_from_matrix_np
 
 T = TypeVar("T")
 
@@ -117,6 +119,7 @@ class Pose:
     to_vehicle: np.ndarray = dataclasses.field(default_factory=lambda: np.eye(4))
     to_world: np.ndarray = dataclasses.field(default_factory=lambda: np.eye(4))
     velocity: np.ndarray = dataclasses.field(default_factory=lambda: np.zeros(3))
+    acceleration: np.ndarray = dataclasses.field(default_factory=lambda: np.zeros(3))
 
     @property 
     def vehicle_to_world(self):
@@ -131,19 +134,37 @@ class Pose:
         self.to_world = world2new @ self.to_world
         return self
 
+    def get_euler_in_vehicle(self, order: EulerIntrinsicOrder = EulerIntrinsicOrder.XYZ) -> np.ndarray:
+        r, p, y = euler_from_matrix_np(self.to_vehicle[:3, :3], order)
+        return np.array([r, p, y], np.float64)
+
+    def get_euler_in_world(self, order: EulerIntrinsicOrder = EulerIntrinsicOrder.XYZ) -> np.ndarray:
+        r, p, y = euler_from_matrix_np(self.to_world[:3, :3], order)
+        return np.array([r, p, y], np.float64)
+
 @dataclasses.dataclass(kw_only=True)
 class ObjectBase:
-    track_id: int 
-    type: str 
-    source: str 
+    track_id: int | str 
+    type: int | str 
+    source: str = ""
 
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
-class Object3d(ObjectBase, Pose):
-    dim: list[float]
+class Object3d(ObjectBase):
+    pose: Pose
+    size: np.ndarray
 
-@dataclasses.dataclass(kw_only=True)
+    def apply_world_transform(self, world2new: np.ndarray):
+        new_self = copy.deepcopy(self)
+        new_self.apply_world_transform_inplace(world2new)
+        return new_self
+
+    def apply_world_transform_inplace(self, world2new: np.ndarray):
+        self.pose.apply_world_transform_inplace(world2new)
+        return self
+
+@dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class Object2d(ObjectBase):
-    bbox: list[float]
+    bbox_xywh: np.ndarray
 
 
 class CoordSystem(enum.IntEnum):
@@ -176,6 +197,14 @@ class BaseFrame:
     timestamp: int
     pose: Pose
     sensors: list[Sensor] = dataclasses.field(default_factory=list)
+    objects: list[Object3d] = dataclasses.field(default_factory=list)
+
+    def get_objects_by_source(self, source: str = "") -> list[Object3d]:
+        res: list[Object3d] = []
+        for obj in self.objects:
+            if obj.source == source:
+                res.append(obj)
+        return res
 
     def apply_world_transform(self, world2new: np.ndarray):
         new_self = copy.deepcopy(self)
@@ -186,6 +215,8 @@ class BaseFrame:
         self.pose.apply_world_transform_inplace(world2new)
         for s in self.sensors:
             s.apply_world_transform_inplace(world2new)
+        for obj in self.objects:
+            obj.apply_world_transform_inplace(world2new)
         return self
 
     def release_all_loaders(self):
@@ -301,3 +332,9 @@ class Scene(Generic[T_frame]):
         for f in self.frames:
             f.apply_world_transform_inplace(world2new)
         return self
+
+
+class DistortType(enum.IntEnum):
+    kOpencvPinhole = 0
+
+

@@ -1,4 +1,3 @@
-from ast import List
 import enum
 from pathlib import Path
 import time
@@ -6,24 +5,20 @@ from typing import Any
 from typing_extensions import override
 
 import torch
-import tqdm
 from d3sim.constants import D3SIM_DEFAULT_DEVICE
 import d3sim.core.dataclass_dispatch as dataclasses
 
-from d3sim.data.scene_def.base import CoordSystem, Pose, Scene, Sensor, Resource, BaseFrame, ALL_RESOURCE_LOADERS, ResourceLoader
+from d3sim.data.scene_def.base import CoordSystem, Object2d, Object3d, Pose, Scene, Sensor, Resource, BaseFrame, ALL_RESOURCE_LOADERS, ResourceLoader
 from d3sim.data.scene_def.camera import BasicCamera, BasicPinholeCamera
 import dask.dataframe as dd
 import numpy as np
-from d3sim.data.datasets.waymo.ops import range_image_to_point_cloud
+from d3sim.data.datasets.waymo.ops import range_image_to_point_cloud, range_image_to_point_cloud_v2
 from d3sim.data.scene_def.frame import BasicFrame
 from d3sim.data.scene_def.lidar import BasicLidar
-
-import torchvision
+from cumm import tensorview as tv 
 import cv2
 
-from d3sim.ops.points.downsample import downsample_indices  
-
-
+from d3sim.core.ops.rotation import get_rotation_matrix_np
 
 class CameraName(enum.IntEnum):
     """Name of camera."""
@@ -43,6 +38,115 @@ class LaserName(enum.IntEnum):
     SIDE_LEFT = 3
     SIDE_RIGHT = 4
     REAR = 5
+
+class CameraSegType(enum.IntEnum):
+    # Anything that does not fit the other classes or is too ambiguous to
+    # label.
+    TYPE_UNDEFINED = 0
+    # The Waymo vehicle.
+    TYPE_EGO_VEHICLE = 1
+    # Small vehicle such as a sedan, SUV, pickup truck, minivan or golf cart.
+    TYPE_CAR = 2
+    # Large vehicle that carries cargo.
+    TYPE_TRUCK = 3
+    # Large vehicle that carries more than 8 passengers.
+    TYPE_BUS = 4
+    # Large vehicle that is not a truck or a bus.
+    TYPE_OTHER_LARGE_VEHICLE = 5
+    # Bicycle with no rider.
+    TYPE_BICYCLE = 6
+    # Motorcycle with no rider.
+    TYPE_MOTORCYCLE = 7
+    # Trailer attached to another vehicle or horse.
+    TYPE_TRAILER = 8
+    # Pedestrian. Does not include objects associated with the pedestrian, such
+    # as suitcases, strollers or cars.
+    TYPE_PEDESTRIAN = 9
+    # Bicycle with rider.
+    TYPE_CYCLIST = 10
+    # Motorcycle with rider.
+    TYPE_MOTORCYCLIST = 11
+    # Birds, including ones on the ground.
+    TYPE_BIRD = 12
+    # Animal on the ground such as a dog, cat, cow, etc.
+    TYPE_GROUND_ANIMAL = 13
+    # Cone or short pole related to construction.
+    TYPE_CONSTRUCTION_CONE_POLE = 14
+    # Permanent horizontal and vertical lamp pole, traffic sign pole, etc.
+    TYPE_POLE = 15
+    # Large object carried/pushed/dragged by a pedestrian.
+    TYPE_PEDESTRIAN_OBJECT = 16
+    # Sign related to traffic, including front and back facing signs.
+    TYPE_SIGN = 17
+    # The box that contains traffic lights regardless of front or back facing.
+    TYPE_TRAFFIC_LIGHT = 18
+    # Permanent building and walls, including solid fences.
+    TYPE_BUILDING = 19
+    # Drivable road with proper markings, including parking lots and gas
+    # stations.
+    TYPE_ROAD = 20
+    # Marking on the road that is parallel to the ego vehicle and defines
+    # lanes.
+    TYPE_LANE_MARKER = 21
+    # All markings on the road other than lane markers.
+    TYPE_ROAD_MARKER = 22
+    # Paved walkable surface for pedestrians, including curbs.
+    TYPE_SIDEWALK = 23
+    # Vegetation including tree trunks, tree branches, bushes, tall grasses,
+    # flowers and so on.
+    TYPE_VEGETATION = 24
+    # The sky, including clouds.
+    TYPE_SKY = 25
+    # Other horizontal surfaces that are drivable or walkable.
+    TYPE_GROUND = 26
+    # Object that is not permanent in its current position and does not belong
+    # to any of the above classes.
+    TYPE_DYNAMIC = 27
+    # Object that is permanent in its current position and does not belong to
+    # any of the above classes.
+    TYPE_STATIC = 28
+
+class PointSegType(enum.IntEnum):
+    TYPE_UNDEFINED = 0
+    TYPE_CAR = 1
+    TYPE_TRUCK = 2
+    TYPE_BUS = 3
+    # Other small vehicles (e.g. pedicab) and large vehicles (e.g. construction
+    # vehicles, RV, limo, tram).
+    TYPE_OTHER_VEHICLE = 4
+    TYPE_MOTORCYCLIST = 5
+    TYPE_BICYCLIST = 6
+    TYPE_PEDESTRIAN = 7
+    TYPE_SIGN = 8
+    TYPE_TRAFFIC_LIGHT = 9
+    # Lamp post, traffic sign pole etc.
+    TYPE_POLE = 10
+    # Construction cone/pole.
+    TYPE_CONSTRUCTION_CONE = 11
+    TYPE_BICYCLE = 12
+    TYPE_MOTORCYCLE = 13
+    TYPE_BUILDING = 14
+    # Bushes, tree branches, tall grasses, flowers etc.
+    TYPE_VEGETATION = 15
+    TYPE_TREE_TRUNK = 16
+    # Curb on the edge of roads. This does not include road boundaries if
+    # there’s no curb.
+    TYPE_CURB = 17
+    # Surface a vehicle could drive on. This include the driveway connecting
+    # parking lot and road over a section of sidewalk.
+    TYPE_ROAD = 18
+    # Marking on the road that’s specifically for defining lanes such as
+    # single/double white/yellow lines.
+    TYPE_LANE_MARKER = 19
+    # Marking on the road other than lane markers, bumps, cateyes, railtracks
+    # etc.
+    TYPE_OTHER_GROUND = 20
+    # Most horizontal surface that’s not drivable, e.g. grassy hill,
+    # pedestrian walkway stairs etc.
+    TYPE_WALKABLE = 21
+    # Nicely paved walkable surface when pedestrians most likely to walk on.
+    TYPE_SIDEWALK = 22
+
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -93,26 +197,81 @@ class WaymoLidar(BasicLidar):
         return self
 
     def _load_xyz_inten_mask(self):
+        enable = False
         if self._point_load_cache is not None:
             return self._point_load_cache
-        veh_to_world = torch.from_numpy(self.pose.vehicle_to_world.astype(np.float32)).to(D3SIM_DEFAULT_DEVICE)
-        extrinsic = torch.from_numpy(self.pose.to_vehicle.astype(np.float32)).to(D3SIM_DEFAULT_DEVICE)
-        ris = self.range_images_rc.data 
-        inclination = torch.from_numpy(self.beam_inclination).to(D3SIM_DEFAULT_DEVICE)
-        ri_0 = torch.from_numpy(ris[0]).to(D3SIM_DEFAULT_DEVICE)
-        ri_1 = torch.from_numpy(ris[1]).to(D3SIM_DEFAULT_DEVICE)
-        pixel_pose: torch.Tensor | None = None
-        if self.id == f"lidar_{LaserName.TOP}": # TOP
-            pixel_pose = torch.from_numpy(self.point_pose_rc.data).to(D3SIM_DEFAULT_DEVICE)
+        with tv.measure_and_print_cpu("load_xyz_inten_mask", enable=enable):
+            veh_to_world = torch.from_numpy(self.pose.vehicle_to_world.astype(np.float32)).to(D3SIM_DEFAULT_DEVICE)
+            extrinsic = torch.from_numpy(self.pose.to_vehicle.astype(np.float32)).to(D3SIM_DEFAULT_DEVICE)
+            ris = self.range_images_rc.data 
+            pixel_pose_data = self.point_pose_rc.data
+        with tv.measure_and_print_cpu("read rg", enable=enable):
+            inclination = torch.from_numpy(self.beam_inclination).to(D3SIM_DEFAULT_DEVICE)
+            ri_0 = torch.from_numpy(ris[0]).to(D3SIM_DEFAULT_DEVICE)
+            ri_1 = torch.from_numpy(ris[1]).to(D3SIM_DEFAULT_DEVICE)
+            pixel_pose: torch.Tensor | None = None
+            if self.id == f"lidar_{LaserName.TOP}": # TOP
+                pixel_pose = torch.from_numpy(pixel_pose_data).to(D3SIM_DEFAULT_DEVICE)
             # breakpoint()
-        res_0, res_0_mask = range_image_to_point_cloud(ri_0, extrinsic, inclination, pixel_pose, veh_to_world, self._tmp_pixel_pose_transform)
-        res_1, res_1_mask = range_image_to_point_cloud(ri_1, extrinsic, inclination, pixel_pose, veh_to_world, self._tmp_pixel_pose_transform)
-        res = torch.cat([res_0, res_1], dim=0).cpu().numpy()
-        inten_0 = ri_0[..., 1].reshape(-1)
-        inten_1 = ri_1[..., 1].reshape(-1)
-        inten = torch.cat([inten_0, inten_1], dim=0).cpu().numpy()
-        mask = torch.cat([res_0_mask, res_1_mask], dim=0).cpu().numpy()
+            pixel_tr_np = self._tmp_pixel_pose_transform.astype(np.float32)
+        with tv.measure_and_print_cpu("range_image_to_point_cloud", enable=enable):
+            res_0, res_0_mask = range_image_to_point_cloud(ri_0, extrinsic, inclination, pixel_pose, veh_to_world, pixel_tr_np)
+            res_1, res_1_mask = range_image_to_point_cloud(ri_1, extrinsic, inclination, pixel_pose, veh_to_world, pixel_tr_np)
+        with tv.measure_and_print_cpu("post", enable=enable):
+            res = torch.cat([res_0, res_1], dim=0).cpu().numpy()
+            inten_0 = ri_0[..., 1].reshape(-1)
+            inten_1 = ri_1[..., 1].reshape(-1)
+            inten = torch.cat([inten_0, inten_1], dim=0).cpu().numpy()
+            mask = torch.cat([res_0_mask, res_1_mask], dim=0).cpu().numpy()
+        # breakpoint()
         res_all = res, inten, mask
+        self._point_load_cache = res_all
+        return res_all
+
+    def _load_xyz_inten_mask_v2(self):
+        enable = False
+        if self._point_load_cache is not None:
+            return self._point_load_cache
+        with tv.measure_and_print_cpu("load_xyz_inten_mask", enable=enable):
+            ris = self.range_images_rc.data 
+            pixel_pose_data = self.point_pose_rc.data
+        with tv.measure_and_print_cpu("read rg", enable=enable):
+            # veh_to_world = torch.from_numpy(self.pose.vehicle_to_world.astype(np.float32)).to(D3SIM_DEFAULT_DEVICE)
+            # extrinsic = torch.from_numpy(self.pose.to_vehicle.astype(np.float32)).to(D3SIM_DEFAULT_DEVICE)
+
+            inclination = torch.from_numpy(self.beam_inclination).to(D3SIM_DEFAULT_DEVICE)
+            # ri_0 = torch.from_numpy(ris[0]).to(D3SIM_DEFAULT_DEVICE)
+            # ri_1 = torch.from_numpy(ris[1]).to(D3SIM_DEFAULT_DEVICE)
+            ris = np.stack([ris[0], ris[1]], axis=0)
+            ris_th = torch.from_numpy(ris).to(D3SIM_DEFAULT_DEVICE)
+            # ris_th = torch.stack([ri_0, ri_1], dim=0)
+
+            pixel_pose: torch.Tensor | None = None
+            if self.id == f"lidar_{LaserName.TOP}": # TOP
+                pixel_pose = torch.from_numpy(pixel_pose_data).to(D3SIM_DEFAULT_DEVICE)
+            # breakpoint()
+            pixel_tr_np = self._tmp_pixel_pose_transform.astype(np.float32)
+        with tv.measure_and_print_cpu("range_image_to_point_cloud", enable=enable):
+            res, mask = range_image_to_point_cloud_v2(ris_th, self.pose.to_vehicle, 
+                inclination, pixel_pose, self.pose.vehicle_to_world, pixel_tr_np)
+            # res_1, mask = range_image_to_point_cloud_v2(ris_th[1], self.pose.to_vehicle, 
+            #     inclination, pixel_pose, veh_to_world, pixel_tr_np)
+
+            # res_0, res_0_mask = range_image_to_point_cloud(ri_0, extrinsic, inclination, pixel_pose, veh_to_world, pixel_tr_np)
+            # res_1, res_1_mask = range_image_to_point_cloud(ri_1, extrinsic, inclination, pixel_pose, veh_to_world, pixel_tr_np)
+            # res = torch.cat([res_0, res_1], dim=0)
+            # res_0, res_0_mask = range_image_to_point_cloud(ri_0, extrinsic, inclination, pixel_pose, veh_to_world, pixel_tr_np)
+            # res_1, res_1_mask = range_image_to_point_cloud(ri_1, extrinsic, inclination, pixel_pose, veh_to_world, pixel_tr_np)
+        with tv.measure_and_print_cpu("post", enable=enable):
+            # resx = torch.cat([res_0, res_1], dim=0)
+            # print(torch.linalg.norm(resx - res))
+            # breakpoint()
+            # inten_0 = ri_0[..., 1].reshape(-1)
+            # inten_1 = ri_1[..., 1].reshape(-1)
+            # inten = torch.cat([inten_0, inten_1], dim=0).cpu().numpy()
+            inten = ris[..., 1].reshape(-1)
+            # mask = torch.cat([res_0_mask, res_1_mask], dim=0).cpu().numpy()
+            res_all = res.cpu().numpy(), inten, mask.cpu().numpy()
         self._point_load_cache = res_all
         return res_all
 
@@ -130,15 +289,15 @@ class WaymoLidar(BasicLidar):
 
     @property 
     def xyz(self):
-        return self._load_xyz_inten_mask()[0]
+        return self._load_xyz_inten_mask_v2()[0]
 
     @property
     def intensity(self):
-        return self._load_xyz_inten_mask()[1]
+        return self._load_xyz_inten_mask_v2()[1]
 
     @property
     def mask(self):
-        return self._load_xyz_inten_mask()[2]
+        return self._load_xyz_inten_mask_v2()[2]
 
     @property
     def segmentation(self):
@@ -181,9 +340,9 @@ class WaymoImageSegLoader(ResourceLoader):
         if data.compute()['[CameraSegmentationLabelComponent].panoptic_label'].shape[0] == 0:
             return None
         img_png_bytes = data.compute()['[CameraSegmentationLabelComponent].panoptic_label'].iloc[0]
-        img_decoded = cv2.imdecode(np.frombuffer(img_png_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+        img_decoded = cv2.imdecode(np.frombuffer(img_png_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
         dividor = data.compute()['[CameraSegmentationLabelComponent].panoptic_label_divisor'].iloc[0]
-        return img_decoded % dividor
+        return img_decoded // dividor
 
 class _WaymoLidarLoaderBase(ResourceLoader):
     def __init__(self, key: str, store_whole_seq: bool = False, is_pair: bool = True):
@@ -305,6 +464,12 @@ class WaymoLidarWholeStorageSegLoader(_WaymoLidarLoaderBase):
     def __init__(self):
         super().__init__('LiDARSegmentationLabelComponent', True)
 
+
+def _read_all(scene_id: str, folder: str, tag: str) -> dd.DataFrame:
+    path = Path(f"{folder}/{tag}/{scene_id}.parquet")
+    return dd.read_parquet(path)
+
+
 def _read_camera_metadata(scene_id: str, folder: str):
     path = Path(f"{folder}/camera_image/{scene_id}.parquet")
 
@@ -377,6 +542,9 @@ def load_scene(scene_id: str, folder: str, cache_whole_in_memory: bool = True):
     cam_pose = _read_cam_calib(scene_id, folder)
     lidar_metadata = _read_lidar_metadata(scene_id, folder)
     ego_poses = _read_pose(scene_id, folder)
+    lidar_boxes = _read_all(scene_id, folder, 'lidar_box').compute()
+    camera_boxes = _read_all(scene_id, folder, 'camera_box').compute()
+
     frame_id_to_frame: dict[str, BasicFrame] = {}
     for idx, row in ego_poses.iterrows():
         frame_id = row['key.frame_timestamp_micros']
@@ -447,6 +615,8 @@ def load_scene(scene_id: str, folder: str, cache_whole_in_memory: bool = True):
                 distortion=distortion,
                 image_rc=image_rc,
                 seg_label_rc=seg_rc,
+                # waymo camera x is front, z is up, use opencv cam (2, 0, 1) as reference.
+                axes_front_u_v=(0, -1, -2),
             ))
     for idx, row in lidar_metadata.iterrows():
         frame_id = row['key.frame_timestamp_micros']
@@ -510,101 +680,53 @@ def load_scene(scene_id: str, folder: str, cache_whole_in_memory: bool = True):
                 data_coord = CoordSystem.VEHICLE, # xyz loader load pc to vehicle
 
             ))
+    for idx, row in lidar_boxes.iterrows():
+        frame_id = row['key.frame_timestamp_micros']
+        frame = frame_id_to_frame[frame_id]
+        root_key = "[LiDARBoxComponent]"
+        center_x = row[f"{root_key}.box.center.x"]
+        center_y = row[f"{root_key}.box.center.y"]
+        center_z = row[f"{root_key}.box.center.z"]
+        size_x = row[f"{root_key}.box.size.x"]
+        size_y = row[f"{root_key}.box.size.y"]
+        size_z = row[f"{root_key}.box.size.z"]
+        speed_x = row[f"{root_key}.speed.x"]
+        speed_y = row[f"{root_key}.speed.y"]
+        speed_z = row[f"{root_key}.speed.z"]
+        acceleration_x = row[f"{root_key}.acceleration.x"]
+        acceleration_y = row[f"{root_key}.acceleration.y"]
+        acceleration_z = row[f"{root_key}.acceleration.z"]
+        heading = row[f"{root_key}.box.heading"]
+        type = row[f"{root_key}.type"]
+        obj_id = row[f"key.laser_object_id"]
+        box_to_veh = np.eye(4)
+        rot = get_rotation_matrix_np(0, 0, heading)
+        box_to_veh[:3, :3] = rot
+        box_to_veh[:3, 3] = [center_x, center_y, center_z]
+        veh_to_world = frame.pose.to_world
+        box_to_world = veh_to_world @ box_to_veh
+        pose = Pose(to_world=box_to_world, to_vehicle=box_to_veh,
+            velocity=np.array([speed_x, speed_y, speed_z], dtype=np.float32),
+            acceleration=np.array([acceleration_x, acceleration_y, acceleration_z], dtype=np.float32))
+        o3d = Object3d(track_id=obj_id, type=type, pose=pose, size=np.array([size_x, size_y, size_z], dtype=np.float32))
+        frame.objects.append(o3d)
+    for idx, row in camera_boxes.iterrows():
+        frame_id = row['key.frame_timestamp_micros']
+        frame = frame_id_to_frame[frame_id]
+        root_key = "[CameraBoxComponent]"
+        center_x = row[f"{root_key}.box.center.x"]
+        center_y = row[f"{root_key}.box.center.y"]
+        size_x = row[f"{root_key}.box.size.x"]
+        size_y = row[f"{root_key}.box.size.y"]
+        type = row[f"{root_key}.type"]
+        obj_id = row[f"key.camera_object_id"]
+        cam_name = row[f"key.camera_name"]
+        bbox_xywh = np.array([center_x - size_x / 2, center_y - size_y / 2, size_x, size_y], dtype=np.float32)
+        obj_2d = Object2d(track_id=obj_id, type=type, bbox_xywh=bbox_xywh)
+        cam = frame.get_camera_by_id(f"camera_{cam_name}")
+        cam.objects.append(obj_2d)
+
     frames = list(frame_id_to_frame.values())
     scene: Scene[BasicFrame] = Scene(id=scene_id, frames=frames)
     return scene
 
-
-def __read(scene_id: str, folder: str, tag: str) -> dd.DataFrame:
-    path = Path(f"{folder}/{tag}/{scene_id}.parquet")
-
-    return dd.read_parquet(path)
-
-def _dev_lidar():
-    scene_id = "13207915841618107559_2980_000_3000_000"
-    folder = "/Users/yanyan/Downloads/waymo/training"
-    "/Users/yanyan/Downloads/waymo/training/camera_calibration/13196796799137805454_3036_940_3056_940.parquet"
-    # breakpoint()
-    # print(cam_seg.columns, cam_seg.shape)
-    # breakpoint()
-    scene = load_scene(scene_id, folder)
-    scene = scene.apply_world_transform_inplace(np.linalg.inv(scene.frames[0].pose.vehicle_to_world))
-
-    frames = scene.frames
-    # print(scene.frames[0].get_lidar_xyz("lidar_1", CoordSystem.VEHICLE))
-    # scene = scene.apply_world_transform_inplace(np.linalg.inv(frames[0].pose.vehicle_to_world))
-    all_pc = []
-    for frame in tqdm.tqdm(scene.frames):
-        all_pc.append(frame.get_lidar_xyz("lidar_1", CoordSystem.WORLD))
-    all_pc = np.concatenate(all_pc)
-    all_pc_th = torch.from_numpy(all_pc).to(D3SIM_DEFAULT_DEVICE)
-    t = time.time()
-    all_pc_down = downsample_indices(all_pc_th, 0.2)
-    print(time.time() - t)
-    print(all_pc.shape, all_pc_down.shape)
-    return 
-    lidar_obj = frames[0].get_sensors_by_type(WaymoLidar)[0]
-    print(lidar_obj.id)
-    print(lidar_obj.xyz.shape, lidar_obj.xyz.shape)
-    for frame in frames:
-        lidar = frame.get_sensors_by_type(WaymoLidar)[0] 
-        pc = lidar.xyz 
-        print("???", pc.shape)
-        down_pc_inds = downsample_indices(torch.from_numpy(pc).to(D3SIM_DEFAULT_DEVICE), 0.2)
-        print(pc.shape, down_pc_inds.shape)
-        break
-        # seg = frame.get_sensors_by_type(WaymoLidar)[0].segmentation
-        # if seg is not None:
-        #     print(seg.shape, seg.dtype)
-        #     print(frame.get_sensors_by_type(WaymoLidar)[0].xyz.shape)
-        #     break
-        for cam in frame.get_sensors_by_type(WaymoCamera):
-            breakpoint()
-            if cam.segmentation is not None:
-                print(frame.id, cam.id, cam.segmentation.shape, cam.segmentation.dtype)
-
-def test_lidar():
-    from d3sim.data.datasets.waymo import v2
-
-    scene_id = "13207915841618107559_2980_000_3000_000"
-    folder = "/Users/yanyan/Downloads/waymo/training"
-    scene = load_scene(scene_id, folder)
-    frames = scene.frames
-    lidar_obj = frames[0].get_sensors_by_type(WaymoLidar)[0]
-    pc_my = lidar_obj.xyz
-    num_pc = pc_my.shape[0] // 2
-    pc_my = pc_my[:num_pc][lidar_obj.mask[:num_pc]]
-    lidar_calib_df = __read(scene_id, folder, 'lidar_calibration').compute()
-    xyzm = lidar_obj.xyz_masked()
-    print(pc_my[:5], xyzm)
-
-    lidar_pose_df = __read(scene_id, folder, 'lidar_pose')
-    lidar_df = __read(scene_id, folder, 'lidar')
-
-    lidar_df = v2.merge(lidar_df, lidar_pose_df)
-    vehicle_pose_df = __read(scene_id, folder, 'vehicle_pose')
-
-    df = v2.merge(lidar_df, vehicle_pose_df)
-    _, row = next(iter(df.iterrows()))
-    print(row.keys())
-    lidar = v2.LiDARComponent.from_dict(row)
-    lidar_pose = v2.LiDARPoseComponent.from_dict(row)
-    lidar_calib = v2.LiDARCalibrationComponent.from_dict(lidar_calib_df.iloc[4])
-    frame_pose = v2.VehiclePoseComponent.from_dict(row)
-    print(lidar.range_image_return1.shape)
-    pc_ref_tf = v2.convert_range_image_to_point_cloud(lidar.range_image_return1, lidar_calib, lidar_pose.range_image_return1, frame_pose)
-    pc_ref = pc_ref_tf.numpy()
-    print(lidar_calib.key, lidar_pose.key)
-    # print(lidar_obj.pose.vehicle_to_world, frame_pose.world_from_vehicle.transform)
-    print(pc_ref[:5])
-    print(np.linalg.norm(lidar_obj.point_pose_rc.data.reshape(-1) - lidar_pose.range_image_return1.values.reshape(-1)))
-    print(np.linalg.norm(pc_my - pc_ref))
-
-    breakpoint()
-    print("?")
-
-    # print(lidar.key, pc_ref.shape, pc_my.shape)
-    # print(pc_my[:5])
-
-if __name__ == "__main__":
-    _dev_lidar()

@@ -9,10 +9,11 @@ from cumm import tensorview as tv
 
 @observe_function
 def downsample_indices(points: torch.Tensor, voxel_size: float, hash_scale: float = 1.3):
-    """Downsample points, we convert points to unsigned int with 20bit precision,
+    """Downsample points, we convert points to unsigned int with 21bit precision,
+    encode them in a 64bit unsigned number (21bit for each axis).
     so value of points must in range (-2 ** 20 * voxel_size, 2 ** 20 * voxel_size),
-    if voxel_size is 0.05, the range is (-1048576, 1048576).
-    if voxel_size is 0.01, the range is (-209715, 209715).
+    if voxel_size is 0.05, the range is (-52428.8, 52428.8).
+    if voxel_size is 0.01, the range is (-10485.76, 10485.76).
 
     WARNING: in apple silicon, the range of z is (-2 ** 19 * voxel_size, 2 ** 19 * voxel_size)
         due to apple silicon don't support 64bit atomic cas, we can only use 62bit key, not 64bit.
@@ -39,9 +40,11 @@ def downsample_indices(points: torch.Tensor, voxel_size: float, hash_scale: floa
         auto stride = $points_stride;
         auto vsize = $voxel_size;
         uint32_t xc, yc, zc;
-        xc = math_op_t::floor(($points[i * stride + 0]) / (vsize)) + (1u << 20);
-        yc = math_op_t::floor(($points[i * stride + 1]) / (vsize)) + (1u << 20);
-        zc = math_op_t::floor(($points[i * stride + 2]) / (vsize)) + (1u << 20);
+        // we can use 21bit for x and y, so we shift 20bit here.
+        xc = (math_op_t::floor(($points[i * stride + 0]) / (vsize))) + (1u << 20);
+        yc = (math_op_t::floor(($points[i * stride + 1]) / (vsize))) + (1u << 20);
+        // we can only use 20bit in apple metal, so we shift 19bit here,
+        zc = (math_op_t::floor(($points[i * stride + 2]) / (vsize))) + (1u << 19);
         table.insert({{xc, yc, zc}}, int(i));
         """)
         INLINER.kernel_1d(f"insert_table", points.shape[0], 0, code)
