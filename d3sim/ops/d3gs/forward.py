@@ -106,7 +106,7 @@ class GaussianSplatForward:
             auto point_cam = op::slice<0, 3>(cam2world_T).op<op::mv_rowmajor>(point - cam2world_T[3]);
             auto ndc_unified_and_z = CameraOps::pos_cam_to_ndc_uv_no_distort<{axis_front_u_v[0]}, {axis_front_u_v[1]}, {axis_front_u_v[2]}>(
                 point_cam, principal_point, focal_xy / resolution_wh.cast<float>());
-            auto ndc_unified = std::get<0>(ndc_unified_and_z);
+            // auto ndc_unified = std::get<0>(ndc_unified_and_z);
             auto uv = (std::get<0>(ndc_unified_and_z) + 1.0f) * resolution_wh.cast<float>() / 2.0f - 0.5f;
             auto z_in_cam = std::get<1>(ndc_unified_and_z);
             auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
@@ -315,15 +315,17 @@ class GaussianSplatForward:
             """)
 
         with code_render_fwd.for_(f"int i = 0; i < rounds; ++i, toDo -= {block_size}"):
-            if not IsAppleSiliconMacOs:
-            #     code_render_fwd.raw(f"""
-            #     tv::parallel::block_sync();
-            #     int num_done = 0;
-            #     for (int j = 0; j < ({block_size}u / tv::parallel::warp_size()); ++j){{
-            #         num_done += num_done_shared[j];
-            #     }}
-            #     """)
-            # else:
+            if IsAppleSiliconMacOs:
+                code_render_fwd.raw(f"""
+                int num_done_simd = metal::simd_sum(int(done));
+                num_done_shared[tv::parallel::warp_index()] = num_done_simd;
+                tv::parallel::block_sync();
+                int num_done = 0;
+                for (uint32_t j = 0; j < ({block_size}u / tv::parallel::warp_size()); ++j){{
+                    num_done += num_done_shared[j];
+                }}
+                """)
+            else:
                 code_render_fwd.raw(f"""
                 int num_done = __syncthreads_count(done);
                 if (num_done == {block_size}){{
@@ -356,9 +358,9 @@ class GaussianSplatForward:
 
             #     """)
             # else:
-            #     code_render_fwd.raw(f"""
-            #     tv::parallel::block_sync();
-            #     """)
+                # code_render_fwd.raw(f"""
+                # tv::parallel::block_sync();
+                # """)
             code_render_fwd.raw(f"""
             tv::parallel::block_sync();
             """)
@@ -425,5 +427,5 @@ class GaussianSplatForward:
             INLINER.kernel_raw(kernel_unique_name, launch_param, code_render_fwd)
         # print(INLINER.get_nvrtc_kernel_attrs(kernel_unique_name))
         # print(INLINER.get_nvrtc_module(kernel_unique_name).get_ptx())
-
+        # print(n_contrib.float().mean())
         return final_T, n_contrib, out_color
