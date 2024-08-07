@@ -8,6 +8,7 @@ from d3sim.core.thtools import np_to_torch_dev
 from d3sim.csrc.inliner import INLINER
 from ccimport import compat 
 def check_cov3d_grad(num_check: int = 5, delta: float = 1e-4):
+    np.random.seed(50051)
     dtype = np.float64
     tv_dtype = torch.float64
     dtype_str = "double"

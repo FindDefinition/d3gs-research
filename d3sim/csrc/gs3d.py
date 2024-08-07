@@ -265,26 +265,23 @@ class Gaussian3D(pccm.Class):
         code.raw(f"""
         namespace op = tv::arrayops;
         using math_op_t = tv::arrayops::MathScalarOp<T>;
-        // auto S = scale.template op<op::from_diagonal>();
+        auto S = scale.template op<op::from_diagonal>();
         auto R = quat.template op<op::uqmat_colmajor>(); // .template op<op::transpose>();
         // auto M = R.template op<op::mm_nnn>(S);
         auto M = R * op::reshape<-1, 1>(scale);
-        // dM_dscale[i] = R.col(i).sum()
-        // auto dcov_dm = T(2) * M.template op<op::transpose>();
-
         tv::array_nd<T, 3, 3> dL_dsigma{{
             tv::array<T, 3>{{dcov3d_vec[0], T(0.5) * dcov3d_vec[1], T(0.5) * dcov3d_vec[2]}},
             tv::array<T, 3>{{T(0.5) * dcov3d_vec[1], dcov3d_vec[3], T(0.5) * dcov3d_vec[4]}},
             tv::array<T, 3>{{T(0.5) * dcov3d_vec[2], T(0.5) * dcov3d_vec[4], dcov3d_vec[5]}}
         }};
-        auto dL_dM_T = T(2) * M.template op<op::mm_nnn>(dL_dsigma);
+        auto dL_dM_T = T(2) * dL_dsigma.template op<op::mm_nnn>(M);
         tv::array<T, 3> dL_dscale{{
             dL_dM_T[0].template op<op::dot>(R.template op<op::row>(0)),
             dL_dM_T[1].template op<op::dot>(R.template op<op::row>(1)),
             dL_dM_T[2].template op<op::dot>(R.template op<op::row>(2))
         }};
         // 
-        auto dL_dquat = dL_dM_T.template op<op::uqmat_colmajor_grad>(quat);
+        auto dL_dquat = (dL_dM_T * op::reshape<-1, 1>(scale)).template op<op::uqmat_colmajor_grad>(quat);
         return std::make_tuple(dL_dscale, dL_dquat);
         """)
         return code.ret("std::tuple<tv::array<T, 3>, tv::array<T, 4>>")
