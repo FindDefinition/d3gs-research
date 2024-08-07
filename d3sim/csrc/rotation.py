@@ -45,7 +45,7 @@ class RotationMath(pccm.Class):
 
         """)
         code.raw(f"""
-        return {seq[0]}.template op<op::mm_tt>({seq[1]}.template op<op::mm_tt>({seq[2]}));
+        return {seq[0]}.template op<op::mm_ttt>({seq[1]}.template op<op::mm_ttt>({seq[2]}));
         """)
         return code.ret("tv::array_nd<T, 3, 3>")
 

@@ -11,6 +11,20 @@ from d3sim.constants import IsAppleSiliconMacOs
 import cumm.tensorview as tv
 from d3sim.ops.d3gs.data.utils.general_utils import strip_symmetric, build_scaling_rotation
 from cumm.inliner import torch_tensor_to_tv, measure_and_print_torch
+
+def _validate_color_sh(color_sh: torch.Tensor, xyz: torch.Tensor, rgb_gaussian: torch.Tensor, cam2world_T_np: np.ndarray):
+    from d3sim.ops.d3gs.data.utils.sh_utils import eval_sh
+    shs_view = color_sh.transpose(1, 2).view(-1, 3, (3+1)**2)
+    dir_pp = (xyz - torch.from_numpy(cam2world_T_np[3]).cuda().repeat(color_sh.shape[0], 1))
+    dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+    sh2rgb = eval_sh(3, shs_view, dir_pp_normalized)
+    colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+    print(torch.linalg.norm(colors_precomp - rgb_gaussian))
+
+    # print(INLINER.get_nvrtc_module(prep_kernel_name).params.debug_code)
+    # breakpoint()
+
+
 def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
     L = build_scaling_rotation(scaling_modifier * scaling, rotation)
     actual_covariance = L @ L.transpose(1, 2)
@@ -29,7 +43,7 @@ class GaussianSplatConfig:
     eps: float = 1e-6
     cov2d_radii_eigen_eps: float = 0.1
     projected_clamp_factor: float = 1.3
-    gaussian_std_sigma: float = 3.0
+    gaussian_std_sigma: float = 2.0
     gaussian_lowpass_filter: float = 0.3
     alpha_eps: float = 1.0 / 255.0
     transmittance_eps: float = 0.0001
@@ -44,7 +58,7 @@ class GaussianSplatForward:
     def forward(self, model: GaussianModelBase, intrinsic: np.ndarray,
                    cam2world: np.ndarray, image_shape_wh: tuple[int, int],
                    axis_front_u_v: tuple[int, int, int], scale_global: float = 1.0,
-                   enable_32bit_sort: bool = False):
+                   enable_32bit_sort: bool = True):
         num = len(model)
         enable_verbose = False
 
@@ -112,7 +126,7 @@ class GaussianSplatForward:
             auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
             auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[i];
 
-            auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale, $scale_global, quat);
+            auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale * $scale_global, quat);
             auto cov2d_vec = Gaussian3D::project_gaussian_to_2d(point_cam, focal_xy, tan_fov, cam2world_T, cov3d_vec, $(self.cfg.projected_clamp_factor));
             
             cov2d_vec[0] += $(self.cfg.gaussian_lowpass_filter);
@@ -147,13 +161,8 @@ class GaussianSplatForward:
             tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], $opacity[i]}};
             op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
             auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1)};
-            op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{degree}>(sh_ptr, (point - cam2world_T[3]).op<op::normalize>());
-
+            op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr).op<op::maximum>(0.0f);
             """)
-            # print(INLINER.get_nvrtc_kernel_attrs(prep_kernel_name))
-
-            # print(INLINER.get_nvrtc_module(prep_kernel_name).params.debug_code)
-            # breakpoint()
         with measure_and_print_torch("2", enable=enable_verbose):
             tiles_touched.cumsum_(0)
             num_rendered = int(tiles_touched[-1].item())
@@ -172,12 +181,11 @@ class GaussianSplatForward:
             constexpr auto tile_size_xy = tv::array<int, 2>{{{self.cfg.tile_size[0]}, {self.cfg.tile_size[1]}}};
             auto tile_num_xy = $tile_num_xy_np;
             auto tile_size_xy_float = tile_size_xy.cast<float>();
-
             """)
             with code.if_("radii_val > 0"):
                 if enable_32bit_sort:
                     code.raw(f"""
-                    auto depth_uint = uint32_t($depths[i] / $(self.cfg.depth_32bit_prec));
+                    auto depth_uint = uint32_t($depths[i] / $(self.cfg.depth_32bit_prec)) & 0x3FFFF;
                     """)
                 else:
                     code.raw(f"""
@@ -191,45 +199,30 @@ class GaussianSplatForward:
                 """)
                 with code.for_("int y = gaussian_rect_min[1]; y < gaussian_rect_max[1]; ++y"):
                     with code.for_("int x = gaussian_rect_min[0]; x < gaussian_rect_max[0]; ++x"):
+                        shift_bits = 32 if not enable_32bit_sort else 18
                         if enable_32bit_sort:
                             code.raw(f"""
                             uint32_t key = y * tile_num_xy[0] + x;
-                            key <<= 18;
-                            key |= depth_uint; // assume depth always > 0
-                            $keys_tile_idx_depth[offset] = key;
-                            $gaussian_idx[offset] = i;
-                            ++offset;
                             """)
                         else:
                             code.raw(f"""
                             uint64_t key = y * tile_num_xy[0] + x;
-                            key <<= 32;
-                            key |= depth_uint; // assume depth always > 0
-                            $keys_tile_idx_depth[offset] = key;
-                            $gaussian_idx[offset] = i;
-                            ++offset;
                             """)
-            INLINER.kernel_1d(f"prepare_sort_data_{enable_32bit_sort}", num, 0, code)
-        # print(debug_ten.min(), debug_ten.max(), debug_ten)
+                        code.raw(f"""
+                        key <<= {shift_bits};
+                        key |= depth_uint; // assume depth always > 0
+                        $keys_tile_idx_depth[offset] = key;
+                        $gaussian_idx[offset] = i;
+                        ++offset;
+                        """)
 
+            INLINER.kernel_1d(f"prepare_sort_data_{enable_32bit_sort}", num, 0, code)
         # TODO use radix sort with trunated bits (faster) for cuda
         # TODO use 32bit sort, for 1920x1080 tile, the max tile idx is 8100, 13 bits
-        # so we can use 18bit for depth.
-        # with measure_and_print_torch("4", enable=enable_verbose):
-        #     keys_tile_idx_depth_cpu = keys_tile_idx_depth.cpu()
-
-        #     sorted_vals, indices = torch.sort(keys_tile_idx_depth_cpu)
-        #     sorted_vals = sorted_vals.to(keys_tile_idx_depth.device)
-        #     indices = indices.to(keys_tile_idx_depth.device)
-        #     gaussian_idx_sorted = torch.gather(gaussian_idx, 0, indices)
+        # so we can use 18bit for depth. (19bit if torch support uint32, true in torch >= 2.3)
         with measure_and_print_torch("4", enable=enable_verbose):
             sorted_vals, indices = torch.sort(keys_tile_idx_depth)
             gaussian_idx_sorted = torch.gather(gaussian_idx, 0, indices)
-
-        # keys_tile_idx_depth_cpu = gaussian_idx.cpu()
-        # with measure_and_print_torch("4.1", enable=enable_verbose):
-
-        #     sorted_vals_, indices_ = torch.sort(gaussian_idx)
 
         with measure_and_print_torch("4.2", enable=enable_verbose):
             workload_ranges = torch.empty([tile_num_x * tile_num_y, 2], dtype=torch.int32, device=xyz.device)
@@ -261,6 +254,7 @@ class GaussianSplatForward:
         conic_opacity_tv = torch_tensor_to_tv(conic_opacity, to_const=True)
         gaussian_idx_sorted_tv = torch_tensor_to_tv(gaussian_idx_sorted, to_const=True)
         rgb_gaussian_tv = torch_tensor_to_tv(rgb_gaussian, to_const=True)
+
         code_render_fwd = pccm.code()
         code_render_fwd.raw(f"""
         namespace op = tv::arrayops;
@@ -268,11 +262,13 @@ class GaussianSplatForward:
         """)
         if IsAppleSiliconMacOs:
             # metal nonuniform group, metal divide grid automatically.
-            launch_param = tv.LaunchParam((width, height, 1), (self.cfg.tile_size[0], self.cfg.tile_size[1], 1))
+            # launch_param = tv.LaunchParam((width, height, 1), (self.cfg.tile_size[0], self.cfg.tile_size[1], 1))
+            launch_param = tv.LaunchParam((tile_num_x, tile_num_y, 1), (self.cfg.tile_size[0], self.cfg.tile_size[1], 1))
+
             code_render_fwd.raw(f"""
             tv::array<uint32_t, 2> pixel_idx_xy{{threadPositionInGrid.x, threadPositionInGrid.y}};
             tv::array<uint32_t, 2> tile_idx_xy{{threadgroupPositionInGrid.x, threadgroupPositionInGrid.y}};
-            bool inside = true;
+            bool inside = pixel_idx_xy[0] < $width && pixel_idx_xy[1] < $height;
             // keep in mind that metal only have 32KB shared memory
             threadgroup int collected_id[{self.cfg.tile_size[0] * self.cfg.tile_size[1]}];
             threadgroup float2 collected_xy[{self.cfg.tile_size[0] * self.cfg.tile_size[1]}];
@@ -307,7 +303,6 @@ class GaussianSplatForward:
         float T = 1.0f;
         uint32_t contributor = 0;
         uint32_t last_contributor = 0;
-
         """)
         if num_custom_feat > 0:
             code_render_fwd.raw(f"""
@@ -341,26 +336,6 @@ class GaussianSplatForward:
                 collected_conic_opacity[thread_rank] = reinterpret_cast<TV_METAL_DEVICE const float4*>($conic_opacity_tv)[gaussian_id];
             }}
             """)
-            # if IsAppleSiliconMacOs:
-            #     code_render_fwd.raw(f"""
-            #     int num_done_simd = metal::simd_sum(int(done));
-            #     num_done_shared[tv::parallel::warp_index()] = num_done_simd;
-
-            #     tv::parallel::block_sync();
-            #     int num_done = 0;
-
-            #     for (int j = 0; j < ({block_size}u / tv::parallel::warp_size()); ++j){{
-            #         num_done += num_done_shared[j];
-            #     }}
-            #     if (num_done == {block_size}){{
-            #         break;
-            #     }}
-
-            #     """)
-            # else:
-                # code_render_fwd.raw(f"""
-                # tv::parallel::block_sync();
-                # """)
             code_render_fwd.raw(f"""
             tv::parallel::block_sync();
             """)

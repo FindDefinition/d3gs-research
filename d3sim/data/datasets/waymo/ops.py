@@ -94,7 +94,7 @@ def range_image_to_point_cloud(ri: torch.Tensor, extrinsic: torch.Tensor, inclin
         tv::array<float, 3> pixel_pose_xyz = {{pixel_pose_6[3], pixel_pose_6[4], pixel_pose_6[5]}};
         auto pixel_pose_mat = pixel_pose_rot.op<op::transform_matrix>(pixel_pose_xyz);
         auto frame_pose_mat = op::reinterpret_cast_array_nd<float, 4, 4>($frame_pose)[batch_idx];
-        auto final_mat = frame_pose_mat.op<op::inverse>().op<op::mm_tt>(pixel_pose_transform_mat.op<op::mm_tt>(pixel_pose_mat.op<op::mm_tt>(ext_matrix)));        
+        auto final_mat = frame_pose_mat.op<op::inverse>().op<op::mm_ttt>(pixel_pose_transform_mat.op<op::mm_ttt>(pixel_pose_mat.op<op::mm_ttt>(ext_matrix)));        
         """)
     else:
         code.raw(f"""
@@ -193,7 +193,7 @@ def range_image_to_point_cloud_v2(ri: torch.Tensor, extrinsic: np.ndarray, incli
         auto pixel_pose_mat = pixel_pose_rot.op<op::transform_matrix>(pixel_pose_xyz);
         auto frame_pose_mat = $frame_pose;
         // auto frame_pose_mat = op::reinterpret_cast_array_nd<float, 4, 4>($frame_pose)[batch_idx];
-        auto final_mat = frame_pose_mat.op<op::inverse>().op<op::mm_tt>(pixel_pose_transform_mat.op<op::mm_tt>(pixel_pose_mat.op<op::mm_tt>(ext_matrix)));        
+        auto final_mat = frame_pose_mat.op<op::inverse>().op<op::mm_ttt>(pixel_pose_transform_mat.op<op::mm_ttt>(pixel_pose_mat.op<op::mm_ttt>(ext_matrix)));        
         """)
     else:
         code.raw(f"""
