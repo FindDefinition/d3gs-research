@@ -1,10 +1,14 @@
 
+import sys
 from typing import Any, Sequence
 from d3sim.core import dataclass_dispatch as dataclasses
 from pydantic import field_validator, model_validator
 from typing_extensions import Self 
 import torch
 import numpy as np 
+import typing 
+import types
+from typing import Optional, Type 
 from typing_extensions import Literal, Annotated, NotRequired, get_origin, get_args, get_type_hints
 
 from d3sim.core.arrcheck.tensor import ArrayCheckBase, ArrayValidator, check_shape_of_meta_shape
@@ -17,6 +21,18 @@ def is_annotated(ann_type: Any) -> bool:
     # https://github.com/pydantic/pydantic/blob/35144d05c22e2e38fe093c533ff3a05ce9a30116/pydantic/_internal/_typing_extra.py#L99C1-L104C1
     origin = get_origin(ann_type)
     return origin is not None and lenient_issubclass(origin, Annotated)
+if sys.version_info < (3, 10):
+
+    def origin_is_union(tp: Optional[Type[Any]]) -> bool:
+        return tp is typing.Union
+
+else:
+    def origin_is_union(tp: Optional[Type[Any]]) -> bool:
+        return tp is typing.Union or tp is types.UnionType  # noqa: E721
+
+def is_optional(ann_type: Any) -> bool:
+    origin = get_origin(ann_type)
+    return origin is not None and origin_is_union(origin) and type(None) in get_args(ann_type)
 
 def extract_annotated_type_and_meta(ann_type: Any) -> tuple[Any, Any]:
     if is_annotated(ann_type):
@@ -38,10 +54,11 @@ class DataClassWithArrayCheck:
                 anno = annos[field.name]
                 _, annometa = extract_annotated_type_and_meta(anno)
                 if annometa is not None:
+                    ten = getattr(self, field.name)
                     for meta in annometa:
-                        if isinstance(meta, ArrayValidator):
+                        if isinstance(meta, ArrayValidator) and ten is not None:
                             all_metas.append(meta.meta) 
-                            all_real_shapes.append(getattr(self, field.name).shape)
+                            all_real_shapes.append(ten.shape)
         check_shape_of_meta_shape([meta.shape for meta in all_metas], all_real_shapes)
         return self
 

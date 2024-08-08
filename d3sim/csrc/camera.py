@@ -47,6 +47,9 @@ class CameraOps(pccm.Class):
         code.nontype_targ("AxisFront", "int", "2")
         code.nontype_targ("AxisU", "int", "0")
         code.nontype_targ("AxisV", "int", "1")
+        code.nontype_targ("AxisFrontSign", "int", "1")
+        code.nontype_targ("AxisUSign", "int", "1")
+        code.nontype_targ("AxisVSign", "int", "1")
 
         code.arg("pos", "tv::array<float, 3>")
         code.arg("resolution", "tv::array<float, 2>")
@@ -60,10 +63,6 @@ class CameraOps(pccm.Class):
         namespace op = tv::arrayops;
         using math_op_t = op::MathScalarOp<float>;
         using math_op_int_t = op::MathScalarOp<int>;
-
-        float AxisFrontSign = math_op_t::copysign(1.0f, AxisFront);
-        float AxisUSign = math_op_t::copysign(1.0f, AxisU);
-        float AxisVSign = math_op_t::copysign(1.0f, AxisV);
         constexpr int AxisFrontAbs = AxisFront > 0 ? AxisFront : -AxisFront;
         constexpr int AxisUAbs = AxisU > 0 ? AxisU : -AxisU;
         constexpr int AxisVAbs = AxisV > 0 ? AxisV : -AxisV;
@@ -99,33 +98,33 @@ class CameraOps(pccm.Class):
     @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
     def pos_to_uv_no_distort(self):
         code = pccm.code()
+        code.targ("T")
         code.nontype_targ("AxisFront", "int", "2")
         code.nontype_targ("AxisU", "int", "0")
         code.nontype_targ("AxisV", "int", "1")
+        code.nontype_targ("AxisFrontSign", "int", "1")
+        code.nontype_targ("AxisUSign", "int", "1")
+        code.nontype_targ("AxisVSign", "int", "1")
 
-        code.arg("pos", "tv::array<float, 3>")
-        code.arg("principal_point", "tv::array<float, 2>")
-        code.arg("focal_length_unified", "tv::array<float, 2>")
-        code.arg("cam2world_T", "const TV_METAL_THREAD tv::array<tv::array<float, 3>, 4>&")
+        code.arg("pos", "tv::array<T, 3>")
+        code.arg("principal_point", "tv::array<T, 2>")
+        code.arg("focal_length_unified", "tv::array<T, 2>")
+        code.arg("cam2world_T", "const TV_METAL_THREAD tv::array<tv::array<T, 3>, 4>&")
         code.raw(f"""
         namespace op = tv::arrayops;
-
-        constexpr int AxisFrontSign = AxisFront > 0 ? 1 : -1;
-        constexpr int AxisUSign = AxisU > 0 ? 1 : -1;
-        constexpr int AxisVSign = AxisV > 0 ? 1 : -1;
         constexpr int AxisFrontAbs = AxisFront > 0 ? AxisFront : -AxisFront;
         constexpr int AxisUAbs = AxisU > 0 ? AxisU : -AxisU;
         constexpr int AxisVAbs = AxisV > 0 ? AxisV : -AxisV;
 
-        using vec3 = tv::array<float, 3>;
-        using vec2 = tv::array<float, 2>;
+        using vec3 = tv::array<T, 3>;
+        using vec2 = tv::array<T, 2>;
         vec3 dir = pos - cam2world_T[3];
-        dir = op::slice<0, 3>(cam2world_T).op<op::mv_rowmajor>(dir);
+        dir = op::slice<0, 3>(cam2world_T).template op<op::mv_rowmajor>(dir);
         vec2 uv{{AxisUSign * dir[AxisUAbs] / dir[AxisFrontAbs], AxisVSign * dir[AxisVAbs] / dir[AxisFrontAbs]}};
         uv = uv * focal_length_unified + principal_point;
         return std::make_tuple(uv, AxisFrontSign * dir[AxisFrontAbs]);
         """)
-        return code.ret("std::tuple<tv::array<float, 2>, float>")
+        return code.ret("std::tuple<tv::array<T, 2>, T>")
 
     @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
     def pos_cam_to_uv_no_distort(self):
@@ -133,27 +132,65 @@ class CameraOps(pccm.Class):
         code.nontype_targ("AxisFront", "int", "2")
         code.nontype_targ("AxisU", "int", "0")
         code.nontype_targ("AxisV", "int", "1")
+        code.nontype_targ("AxisFrontSign", "int", "1")
+        code.nontype_targ("AxisUSign", "int", "1")
+        code.nontype_targ("AxisVSign", "int", "1")
+        code.targ("T")
 
-        code.arg("pos_cam", "tv::array<float, 3>")
-        code.arg("principal_point", "tv::array<float, 2>")
-        code.arg("focal_length_unified", "tv::array<float, 2>")
+        code.arg("pos_cam", "tv::array<T, 3>")
+        code.arg("principal_point", "tv::array<T, 2>")
+        code.arg("focal_length_unified", "tv::array<T, 2>")
         code.raw(f"""
         namespace op = tv::arrayops;
-        constexpr int AxisFrontSign = AxisFront > 0 ? 1 : -1;
-        constexpr int AxisUSign = AxisU > 0 ? 1 : -1;
-        constexpr int AxisVSign = AxisV > 0 ? 1 : -1;
         constexpr int AxisFrontAbs = AxisFront > 0 ? AxisFront : -AxisFront;
         constexpr int AxisUAbs = AxisU > 0 ? AxisU : -AxisU;
         constexpr int AxisVAbs = AxisV > 0 ? AxisV : -AxisV;
 
-        using vec3 = tv::array<float, 3>;
-        using vec2 = tv::array<float, 2>;
+        using vec3 = tv::array<T, 3>;
+        using vec2 = tv::array<T, 2>;
         vec2 uv{{AxisUSign * pos_cam[AxisUAbs] / pos_cam[AxisFrontAbs], AxisVSign * pos_cam[AxisVAbs] / pos_cam[AxisFrontAbs]}};
         uv = uv * focal_length_unified + principal_point;
         return std::make_tuple(uv, AxisFrontSign * pos_cam[AxisFrontAbs]);
         """)
-        return code.ret("std::tuple<tv::array<float, 2>, float>")
+        return code.ret("std::tuple<tv::array<T, 2>, T>")
 
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def pos_cam_to_uv_no_distort_grad(self):
+        code = pccm.code()
+        code.nontype_targ("AxisFront", "int", "2")
+        code.nontype_targ("AxisU", "int", "0")
+        code.nontype_targ("AxisV", "int", "1")
+        code.nontype_targ("AxisFrontSign", "int", "1")
+        code.nontype_targ("AxisUSign", "int", "1")
+        code.nontype_targ("AxisVSign", "int", "1")
+        code.arg("duv", "tv::array<T, 2>")
+        code.arg("dz", "T")
+        code.targ("T")
+
+        code.arg("pos_cam", "tv::array<T, 3>")
+        code.arg("principal_point", "tv::array<T, 2>")
+        code.arg("focal_length", "tv::array<T, 2>")
+        code.raw(f"""
+        namespace op = tv::arrayops;
+        constexpr int AxisFrontAbs = AxisFront > 0 ? AxisFront : -AxisFront;
+        constexpr int AxisUAbs = AxisU > 0 ? AxisU : -AxisU;
+        constexpr int AxisVAbs = AxisV > 0 ? AxisV : -AxisV;
+
+        duv = duv * focal_length;
+        auto origin_z_inv = 1.0f / (pos_cam[AxisFrontAbs]);
+
+        auto origin_z_inv2 = 1.0f / (pos_cam[AxisFrontAbs] * pos_cam[AxisFrontAbs]);
+
+        tv::array<T, 3> res;
+        res[AxisUAbs] = AxisUSign * duv[0] * origin_z_inv;
+        res[AxisVAbs] = AxisVSign * duv[1] * origin_z_inv;
+        res[AxisFrontAbs] = (AxisFrontSign * dz + 
+            -AxisUSign * duv[0] * pos_cam[AxisUAbs] * origin_z_inv2 +
+            -AxisVSign * duv[1] * pos_cam[AxisVAbs] * origin_z_inv2);
+        
+        return res;
+        """)
+        return code.ret("tv::array<T, 3>")
 
     @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
     def pos_cam_to_ndc_uv_no_distort(self):
@@ -164,20 +201,21 @@ class CameraOps(pccm.Class):
         code.nontype_targ("AxisFrontSign", "int", "1")
         code.nontype_targ("AxisUSign", "int", "1")
         code.nontype_targ("AxisVSign", "int", "1")
+        code.targ("T")
 
-        code.arg("pos_cam", "tv::array<float, 3>")
-        code.arg("principal_point", "tv::array<float, 2>")
-        code.arg("focal_length_unified", "tv::array<float, 2>")
+        code.arg("pos_cam", "tv::array<T, 3>")
+        code.arg("principal_point", "tv::array<T, 2>")
+        code.arg("focal_length_unified", "tv::array<T, 2>")
         code.raw(f"""
         namespace op = tv::arrayops;
         constexpr int AxisFrontAbs = AxisFront > 0 ? AxisFront : -AxisFront;
         constexpr int AxisUAbs = AxisU > 0 ? AxisU : -AxisU;
         constexpr int AxisVAbs = AxisV > 0 ? AxisV : -AxisV;
 
-        using vec3 = tv::array<float, 3>;
-        using vec2 = tv::array<float, 2>;
+        using vec3 = tv::array<T, 3>;
+        using vec2 = tv::array<T, 2>;
         vec2 uv{{AxisUSign * pos_cam[AxisUAbs] / pos_cam[AxisFrontAbs], AxisVSign * pos_cam[AxisVAbs] / pos_cam[AxisFrontAbs]}};
         uv = uv * 2 * focal_length_unified;
         return std::make_tuple(uv, AxisFrontSign * pos_cam[AxisFrontAbs]);
         """)
-        return code.ret("std::tuple<tv::array<float, 2>, float>")
+        return code.ret("std::tuple<tv::array<T, 2>, T>")

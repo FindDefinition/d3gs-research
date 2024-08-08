@@ -63,3 +63,22 @@ class GaussianModelOrigin(GaussianModelBase):
     def opacity_act(self) -> torch.Tensor:
         return torch.sigmoid(self.opacity)
 
+    @staticmethod 
+    def empty(N: int, num_degree: int):
+        return GaussianModelOrigin(
+            xyz=torch.empty(N, 3),
+            quaternion_xyzw=torch.empty(N, 4),
+            scale=torch.empty(N, 3),
+            opacity=torch.empty(N),
+            color_sh=torch.empty(N, (num_degree + 1) * (num_degree + 1), 3)
+        )
+
+    @staticmethod 
+    def zeros(N: int, num_degree: int):
+        return GaussianModelOrigin(
+            xyz=torch.zeros(N, 3),
+            quaternion_xyzw=torch.zeros(N, 4),
+            scale=torch.zeros(N, 3),
+            opacity=torch.zeros(N),
+            color_sh=torch.zeros(N, (num_degree + 1) * (num_degree + 1), 3)
+        )

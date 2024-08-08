@@ -92,7 +92,9 @@ def _check_thten_by_tensor_meta(meta: ArrayCheckBase, arr: torch.Tensor):
             assert arr.device.type == "cpu", "expected cpu tensor"
     return  arr
 
-def _check_arr_or_tensor_by_tensor_meta(meta: ArrayCheckBase, arr: np.ndarray | torch.Tensor):
+def _check_arr_or_tensor_by_tensor_meta(meta: ArrayCheckBase, arr: np.ndarray | torch.Tensor | None):
+    if arr is None:
+        return
     if isinstance(arr, np.ndarray):
         return _check_nparray_by_tensor_meta(meta, arr)
     if isinstance(arr, torch.Tensor):
