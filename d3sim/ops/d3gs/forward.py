@@ -52,7 +52,7 @@ class GaussianSplatConfig:
     alpha_eps: float = 1.0 / 255.0
     transmittance_eps: float = 0.0001
     depth_32bit_prec: float = 0.001
-
+    
     bg_color: np.ndarray = dataclasses.field(default_factory=lambda: np.zeros((3), np.float32))
 
     @property 
@@ -69,8 +69,8 @@ class GaussianSplatForwardContext(DataClassWithArrayCheck):
     gaussian_idx_sorted: Annotated[torch.Tensor, ac.ArrayCheck([-1], ac.I32)]
     workload_ranges: Annotated[torch.Tensor, ac.ArrayCheck([-1, 2], ac.I32)]
     image_shape_wh: tuple[int, int]
+    depths: Annotated[torch.Tensor, ac.ArrayCheck([-1], ac.F32)]
     cov3d_vecs: Annotated[torch.Tensor | None, ac.ArrayCheck([-1, 6], ac.F32)] = None
-
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatOutput(DataClassWithArrayCheck):
     final_custom_features: Annotated[torch.Tensor | None, ac.ArrayCheck([-1, "H", "W"], ac.F32)]
@@ -94,13 +94,15 @@ class GaussianSplatGradients(DataClassWithArrayCheck):
     ddepth: Annotated[torch.Tensor | None, ac.ArrayCheck(["H", "W"], ac.F32)]
     dcustom_features: Annotated[torch.Tensor | None, ac.ArrayCheck([-1, "H", "W"], ac.F32)]
 
+_DEFAULT_ENABLE_32BIT_SORT = True if IsAppleSiliconMacOs else False
 
 class GaussianSplatForward:
     def __init__(self, cfg: GaussianSplatConfig) -> None:
         self.cfg = cfg
 
     def forward(self, model: GaussianModelBase, cameras: list[BasicPinholeCamera], scale_global: float = 1.0,
-                   enable_32bit_sort: bool = True if IsAppleSiliconMacOs else False, training: bool = True):
+                   enable_32bit_sort: bool = _DEFAULT_ENABLE_32BIT_SORT, training: bool = False,
+                   render_depth: bool = False):
         num = len(model)
         enable_verbose = False
         if len(cameras) > 1:
@@ -230,7 +232,7 @@ class GaussianSplatForward:
             tiles_touched.cumsum_(0)
             num_rendered = int(tiles_touched[-1].item())
         if (num_rendered == 0):
-            return
+            return None, None
         keys_tile_idx_depth = torch.empty(num_rendered, dtype=torch.int64 if not enable_32bit_sort else torch.int32, device=xyz.device)
         gaussian_idx = torch.empty(num_rendered, dtype=torch.int32, device=xyz.device)
         with measure_and_print_torch(f"3 {num_rendered}", enable=enable_verbose):
@@ -312,182 +314,30 @@ class GaussianSplatForward:
         n_contrib = torch.empty([height, width], dtype=torch.int32, device=xyz.device)
         out_color = torch.empty([3, height, width], dtype=torch.float32, device=xyz.device)
         out_custom_feat = torch.empty([num_custom_feat, height, width], dtype=torch.float32, device=xyz.device)
+        final_depth = None 
+        if render_depth:
+            final_depth = torch.zeros([height, width], dtype=torch.float32, device=xyz.device)
         output_dc = GaussianSplatOutput(
-            final_custom_features=out_custom_feat, final_T=final_T, final_color=out_color, final_depth=None,
+            final_custom_features=out_custom_feat, final_T=final_T, final_color=out_color, final_depth=final_depth,
             final_n_contrib=n_contrib
         )
         ctx = GaussianSplatForwardContext(
             conic_opacity=conic_opacity, tiles_touched=tiles_touched, uvs=uvs, rgb_gaussian=rgb_gaussian,
             gaussian_idx_sorted=gaussian_idx_sorted, workload_ranges=workload_ranges, 
-            image_shape_wh=image_shape_wh, cov3d_vecs=cov3d_vecs
+            image_shape_wh=image_shape_wh, cov3d_vecs=cov3d_vecs,
+            depths=depths
         )
-
-        self.rasterize_forward_backward(model, ctx, output_dc)
+        self.rasterize_forward_backward(model, ctx, output_dc, training=training, render_depth=render_depth)
         if not training:
             ctx = None
 
-        return output_dc, ctx
-        workload_ranges_tv = torch_tensor_to_tv(workload_ranges, to_const=True)
-        uvs_tv = torch_tensor_to_tv(uvs, to_const=True)
-        conic_opacity_tv = torch_tensor_to_tv(conic_opacity, to_const=True)
-        gaussian_idx_sorted_tv = torch_tensor_to_tv(gaussian_idx_sorted, to_const=True)
-        rgb_gaussian_tv = torch_tensor_to_tv(rgb_gaussian, to_const=True)
-
-        code_render_fwd = pccm.code()
-        code_render_fwd.raw(f"""
-        namespace op = tv::arrayops;
-        using math_op_t = tv::arrayops::MathScalarOp<float>;
-        """)
-        if IsAppleSiliconMacOs:
-            # metal nonuniform group, metal divide grid automatically.
-            # launch_param = tv.LaunchParam((width, height, 1), (self.cfg.tile_size[0], self.cfg.tile_size[1], 1))
-            launch_param = tv.LaunchParam((tile_num_x, tile_num_y, 1), (self.cfg.tile_size[0], self.cfg.tile_size[1], 1))
-
-            code_render_fwd.raw(f"""
-            tv::array<uint32_t, 2> pixel_idx_xy{{threadPositionInGrid.x, threadPositionInGrid.y}};
-            tv::array<uint32_t, 2> tile_idx_xy{{threadgroupPositionInGrid.x, threadgroupPositionInGrid.y}};
-            bool inside = pixel_idx_xy[0] < $width && pixel_idx_xy[1] < $height;
-            // keep in mind that metal only have 32KB shared memory
-            threadgroup int collected_id[{block_size}];
-            threadgroup float2 collected_xy[{block_size}];
-            threadgroup float4 collected_conic_opacity[{block_size}];
-            threadgroup int num_done_shared[32];
-            uint thread_rank = threadPositionInThreadgroup.y * {self.cfg.tile_size[0]} + threadPositionInThreadgroup.x;
-            """)
-        else:
-            launch_param = tv.LaunchParam((tile_num_x, tile_num_y, 1), (self.cfg.tile_size[0], self.cfg.tile_size[1], 1))
-            code_render_fwd.raw(f"""
-            tv::array<uint32_t, 2> pixel_idx_xy{{blockIdx.x * {self.cfg.tile_size[0]} + threadIdx.x, blockIdx.y * {self.cfg.tile_size[1]} + threadIdx.y}};
-            tv::array<uint32_t, 2> tile_idx_xy{{blockIdx.x, blockIdx.y}};
-            bool inside = pixel_idx_xy[0] < $width && pixel_idx_xy[1] < $height;
-            __shared__ int collected_id[{block_size}];
-            __shared__ float2 collected_xy[{block_size}];
-            __shared__ float4 collected_conic_opacity[{block_size}];
-            uint32_t thread_rank = threadIdx.y * {self.cfg.tile_size[0]} + threadIdx.x;
-            """)
-        code_render_fwd.raw(f"""
-        uint32_t pixel_id = $width * pixel_idx_xy[1] + pixel_idx_xy[0];
-        auto pixel_idx_xy_fp = pixel_idx_xy.cast<float>();
-
-        // Check if this thread is associated with a valid pixel or outside.
-        // Done threads can help with fetching, but don't rasterize
-        bool done = !inside;
-
-        auto range = op::reinterpret_cast_array_nd<2>($workload_ranges)[tile_idx_xy[1] * $tile_num_x + tile_idx_xy[0]];
-        int rounds = tv::div_up(range[1] - range[0], {block_size});
-        int toDo = range[1] - range[0];
-
-        tv::array<float, 3> rgb{{}};
-        float T = 1.0f;
-        uint32_t contributor = 0;
-        uint32_t last_contributor = 0;
-        """)
-        if num_custom_feat > 0:
-            code_render_fwd.raw(f"""
-            tv::array<float, {num_custom_feat}> custom_feature{{}};
-            """)
-
-        with code_render_fwd.for_(f"int i = 0; i < rounds; ++i, toDo -= {block_size}"):
-            if IsAppleSiliconMacOs:
-                code_render_fwd.raw(f"""
-                int num_done_simd = metal::simd_sum(int(done));
-                num_done_shared[tv::parallel::warp_index()] = num_done_simd;
-                tv::parallel::block_sync();
-                int num_done = 0;
-                for (uint32_t j = 0; j < ({block_size}u / tv::parallel::warp_size()); ++j){{
-                    num_done += num_done_shared[j];
-                }}
-                """)
-            else:
-                code_render_fwd.raw(f"""
-                int num_done = __syncthreads_count(done);
-                if (num_done == {block_size}){{
-                    break;
-                }}
-                """)
-            code_render_fwd.raw(f"""
-            int progress = i * {block_size} + thread_rank;
-            if (range[0] + progress < range[1]){{
-                int gaussian_id = $gaussian_idx_sorted_tv[range[0] + progress];
-                collected_id[thread_rank] = gaussian_id;
-                collected_xy[thread_rank] = reinterpret_cast<TV_METAL_DEVICE const float2*>($uvs_tv)[gaussian_id];
-                collected_conic_opacity[thread_rank] = reinterpret_cast<TV_METAL_DEVICE const float4*>($conic_opacity_tv)[gaussian_id];
-            }}
-            """)
-            code_render_fwd.raw(f"""
-            tv::parallel::block_sync();
-            """)
-
-            with code_render_fwd.for_(f"int j = 0; !done && j < std::min({block_size}, toDo); ++j"):
-                code_render_fwd.raw(f"""
-                ++contributor;
-                auto uv = collected_xy[j];
-                auto conic_opacity_vec = collected_conic_opacity[j];
-                tv::array<float, 2> dist{{uv.x - pixel_idx_xy_fp[0], uv.y - pixel_idx_xy_fp[1]}};
-                float power = (-0.5f * (conic_opacity_vec.x * dist[0] * dist[0] + 
-                                       conic_opacity_vec.z * dist[1] * dist[1]) - 
-                                        conic_opacity_vec.y * dist[0] * dist[1]);
-                if (power > 0.0f){{
-                    continue;
-                }}
-                float alpha = math_op_t::min(0.99f, conic_opacity_vec.w * math_op_t::exp(power));
-                // TODO if remove the 'f', this kernel runs 4x slower.
-                if (alpha < 1.0f / 255.0f){{
-                    continue;
-                }}
-                float next_T = T * (1.0f - alpha);
-                if (next_T < {self.cfg.transmittance_eps}f){{
-                    done = true;
-                    continue;
-                }}
-                float weight = alpha * T;
-                T = next_T;
-                last_contributor = contributor;
-                auto gaussian_id = collected_id[j];
-                auto rgb_val = op::reinterpret_cast_array_nd<3>($rgb_gaussian_tv)[gaussian_id];
-                rgb += weight * rgb_val;
-                """) 
-                if num_custom_feat > 0:
-                    code_render_fwd.raw(f"""
-                    for (int channel_idx = 0; channel_idx < {num_custom_feat}; ++channel_idx){{
-                        custom_feature[channel_idx] += weight * $custom_feat[gaussian_id * {num_custom_feat} + channel_idx];
-                    }}
-                    """)
-        code_render_fwd.raw(f"""
-        auto bg_color_val = $(self.cfg.bg_color);
-        if (inside)
-        {{
-            $final_T[pixel_id] = T;
-            $n_contrib[pixel_id] = last_contributor;
-            $out_color[0 * $height * $width + pixel_id] = rgb[0] + T * bg_color_val[0];
-            $out_color[1 * $height * $width + pixel_id] = rgb[1] + T * bg_color_val[1];
-            $out_color[2 * $height * $width + pixel_id] = rgb[2] + T * bg_color_val[2];
-        }}
-        """)
-        if num_custom_feat:
-            code_render_fwd.raw(f"""
-            if (inside)
-            {{
-                for (int channel_idx = 0; channel_idx < {num_custom_feat}; ++channel_idx){{
-                    $out_custom_feat[channel_idx * $height * $width + pixel_id] = custom_feature[channel_idx];
-                }}
-            }}
-            """) 
-
-        kernel_unique_name = (f"render_forward_{self.cfg.tile_size}_{num_custom_feat}_"
-            f"{self.cfg.alpha_eps}_{self.cfg.transmittance_eps}")
-        with measure_and_print_torch("5", enable=enable_verbose):
-            INLINER.kernel_raw(kernel_unique_name, launch_param, code_render_fwd)
-        # print(INLINER.get_nvrtc_kernel_attrs(kernel_unique_name))
-        # print(INLINER.get_nvrtc_module(kernel_unique_name).get_ptx())
-        # print(n_contrib.float().mean())
-        if not training:
-            ctx = None
         return output_dc, ctx
 
     def rasterize_forward_backward(self, model: GaussianModelBase, ctx: GaussianSplatForwardContext, 
             out: GaussianSplatOutput, 
-            grad: GaussianSplatGradients | None = None):
+            grad: GaussianSplatGradients | None = None,
+            training: bool = False,
+            render_depth: bool = False):
         """if grad is not None, run backward mode, otherwise run forward mode.
         rasterize backward share many code with forward, so we use a single function to handle both.
         """
@@ -497,6 +347,8 @@ class GaussianSplatForward:
         block_size = self.cfg.block_size
         width = image_shape_wh[0]
         height = image_shape_wh[1]
+
+        depths = ctx.depths
 
         tile_num_x = div_up(width, self.cfg.tile_size[0])
         tile_num_y = div_up(height, self.cfg.tile_size[1])
@@ -512,6 +364,10 @@ class GaussianSplatForward:
         final_color = out.final_color
         final_custom_features = out.final_custom_features
         final_n_contrib = out.final_n_contrib
+        final_depth = out.final_depth
+        if render_depth:
+            assert final_depth is not None
+
         grad_out: RasterizeGradientOutput | None = None
         color_use_smem = is_bwd # TODO why bwd use smem for color?
         if is_bwd:
@@ -549,6 +405,11 @@ class GaussianSplatForward:
                 code_render_fwd.raw(f"""
                 threadgroup float collected_rgb_gaussian[{block_size * 3}];
                 """)
+            if render_depth:
+                code_render_fwd.raw(f"""
+                threadgroup float collected_depth[{block_size}];
+                """)
+
         else:
             launch_param = tv.LaunchParam((tile_num_x, tile_num_y, 1), (self.cfg.tile_size[0], self.cfg.tile_size[1], 1))
             code_render_fwd.raw(f"""
@@ -564,6 +425,11 @@ class GaussianSplatForward:
                 code_render_fwd.raw(f"""
                 __shared__ float collected_rgb_gaussian[{block_size * 3}];
                 """)
+            if render_depth:
+                code_render_fwd.raw(f"""
+                __shared__ float collected_depth[{block_size}];
+                """)
+
 
         code_render_fwd.raw(f"""
         uint32_t pixel_id = $width * pixel_idx_xy[1] + pixel_idx_xy[0];
@@ -580,8 +446,12 @@ class GaussianSplatForward:
         tv::array<float, 3> rgb{{}};
         float T = 1.0f;
         uint32_t contributor = 0;
-
+        float weight_sum = 0.0f;
         """)
+        if render_depth:
+            code_render_fwd.raw(f"""
+            float depth_accum = 0.0f;
+            """)
         if is_bwd:
             code_render_fwd.raw(f"""
             float render_T = $(out.final_T)[pixel_id];
@@ -589,6 +459,11 @@ class GaussianSplatForward:
             auto drgb_array = op::reinterpret_cast_array_nd<3>($(grad.drgb))[pixel_id];
             auto dT = $(grad.dT)[pixel_id];
             """)
+            if render_depth:
+                code_render_fwd.raw(f"""
+                auto render_depth = $final_depth[pixel_id];
+                auto ddepth = $(grad.ddepth)[pixel_id];
+                """)
         # if num_custom_feat > 0:
         #     code_render_fwd.raw(f"""
         #     tv::array<float, {num_custom_feat}> custom_feature{{}};
@@ -630,6 +505,10 @@ class GaussianSplatForward:
                     collected_rgb_gaussian[thread_rank * 3 + 1] = rgb_gaussian_val[1];
                     collected_rgb_gaussian[thread_rank * 3 + 2] = rgb_gaussian_val[2];
                     """)
+                if render_depth:
+                    code_render_fwd.raw(f"""
+                    collected_depth[thread_rank] = $depths[gaussian_id];
+                    """)
             code_render_fwd.raw(f"""
             tv::parallel::block_sync();
             """)
@@ -658,6 +537,7 @@ class GaussianSplatForward:
                     continue;
                 }}
                 float weight = alpha * T;
+                weight_sum += weight;
                 T = next_T;
                 // last_contributor = contributor;
                 auto gaussian_id = collected_id[j];
@@ -672,12 +552,23 @@ class GaussianSplatForward:
                     auto rgb_val = op::reinterpret_cast_array_nd<3>($rgb_gaussian_tv)[gaussian_id];
                     rgb += weight * rgb_val;
                     """)
+                if render_depth:
+                    code_render_fwd.raw(f"""
+                    auto depth_val = collected_depth[j];
+                    depth_accum += weight * depth_val;
+                    """)
                 if is_bwd:
                     code_render_fwd.raw(f"""
                     auto suffix = render_rgb - rgb;
                     auto dL_dalpha_without_div = (drgb_array.op<op::dot>(T * rgb_val - suffix));
                     // grad from T, we don't apply background when training, apply it in torch side.
                     dL_dalpha_without_div += -dT * render_T;
+                    """)
+                    if render_depth:
+                        code_render_fwd.raw(f"""
+                        dL_dalpha_without_div += ddepth * (T * depth_val - (render_depth - depth_accum));
+                        """)
+                    code_render_fwd.raw(f"""
                     auto dL_dalpha = dL_dalpha_without_div / (1 - alpha);
                     auto dL_drgb = weight * drgb_array;
                     const float dL_dG = conic_opacity_vec.w * dL_dalpha;
@@ -716,18 +607,40 @@ class GaussianSplatForward:
                 #     }}
                 #     """)
         if not is_bwd:
-            code_render_fwd.raw(f"""
-            auto bg_color_val = $(self.cfg.bg_color);
-            if (inside)
-            {{
+            if not training:
+                code_render_fwd.raw(f"""
+                auto bg_color_val = $(self.cfg.bg_color);
+                """)
+            with code_render_fwd.if_("inside"):
+                code_render_fwd.raw(f"""
                 $final_T[pixel_id] = T;
-                $final_color[0 * $height * $width + pixel_id] = rgb[0] + T * bg_color_val[0];
-                $final_color[1 * $height * $width + pixel_id] = rgb[1] + T * bg_color_val[1];
-                $final_color[2 * $height * $width + pixel_id] = rgb[2] + T * bg_color_val[2];
-
                 $final_n_contrib[pixel_id] = contributor;
-            }}
-            """)
+                """)
+                if render_depth:
+                    if not training:
+                        code_render_fwd.raw(f"""
+                        $final_depth[pixel_id] = depth_accum / (1e-6f + weight_sum);
+                        """)
+                    else:
+                        code_render_fwd.raw(f"""
+                        $final_depth[pixel_id] = depth_accum;
+                        """)
+
+                if not training:
+                    # use fused background color on inference.
+                    code_render_fwd.raw(f"""
+                    $final_color[0 * $height * $width + pixel_id] = rgb[0] + T * bg_color_val[0];
+                    $final_color[1 * $height * $width + pixel_id] = rgb[1] + T * bg_color_val[1];
+                    $final_color[2 * $height * $width + pixel_id] = rgb[2] + T * bg_color_val[2];
+
+                    """)
+                else:
+                    code_render_fwd.raw(f"""
+                    $final_color[0 * $height * $width + pixel_id] = rgb[0];
+                    $final_color[1 * $height * $width + pixel_id] = rgb[1];
+                    $final_color[2 * $height * $width + pixel_id] = rgb[2];
+
+                    """)
         # if num_custom_feat:
         #     code_render_fwd.raw(f"""
         #     if (inside)
@@ -814,6 +727,9 @@ class GaussianSplatForward:
         auto point = op::reinterpret_cast_array_nd<3>($xyz)[i];
         auto point_cam = op::slice<0, 3>(cam2world_T).op<op::mv_colmajor>(point - cam2world_T[3]);
         auto conic_arr = op::reinterpret_cast_array_nd<3>($conic_opacity + i * 4)[0];
+        conic_arr[0] += $(self.cfg.gaussian_lowpass_filter);
+        conic_arr[2] += $(self.cfg.gaussian_lowpass_filter);
+        
         auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, 0, point_cam, principal_point, focal_xy);
         auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad(conic_grad, conic_arr);
         auto proj_grad_res = Gaussian3D::project_gaussian_to_2d_grad(dcov2d, point_cam, focal_xy, tan_fov, cam2world_T, cov3d_vec);

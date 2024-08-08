@@ -153,8 +153,8 @@ def depth_map_to_jet_rgb(
     width = depth_map.shape[1]
     height = depth_map.shape[0]
     image_res = torch.zeros([height, width, 3], dtype=torch.uint8, device=depth_map.device)
-    range_upper = val_range[1]
-    range_lower = val_range[0]
+    range_upper = float(val_range[1])
+    range_lower = float(val_range[0])
     INLINER.kernel_1d(
         "depth_map_to_jet_rgb", height * width, 0, f"""
     namespace op = tv::arrayops;

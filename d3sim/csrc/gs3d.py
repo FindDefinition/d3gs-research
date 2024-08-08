@@ -423,7 +423,7 @@ class Gaussian3D(pccm.Class):
         code.arg("dcov2d_inv_vec", "tv::array<T, 3>")
 
         code.arg("cov2d_vec", "tv::array<T, 3>")
-        code.arg("eps", "T", "1e-6")
+        code.arg("eps", "T", "1e-8")
         code.raw(f"""
         namespace op = tv::arrayops;
         using math_op_t = tv::arrayops::MathScalarOp<T>;
@@ -432,10 +432,14 @@ class Gaussian3D(pccm.Class):
         auto c = cov2d_vec[2];
         T det = a * c - b * b;
         T det2_inv = T(1) / (det * det + eps);
+        // ddet_inv/da = -1 / (det ^ 2) * c
+        // dL/da = ddet_inv/da * c * g[0] - ddet_inv/da * b * g[1] + (det_inv + a * ddet_inv/da) * g[2]
+        // = -det2_inv * c * c * g[0] + det2_inv * b * c * g[1] + (det * det2_inv - a * c * det2_inv) * g[2]
         tv::array<T, 3> ret{{
             det2_inv * (-c * c * dcov2d_inv_vec[0] + 2 * b * c * dcov2d_inv_vec[1] + (det - a * c) * dcov2d_inv_vec[2]),
-            det2_inv * (-a * a * dcov2d_inv_vec[2] + 2 * a * b * dcov2d_inv_vec[1] + (det - a * c) * dcov2d_inv_vec[0]),
             det2_inv * 2 * (b * c * dcov2d_inv_vec[0] - (det + 2 * b * b) * dcov2d_inv_vec[1] + a * b * dcov2d_inv_vec[2]),
+            det2_inv * (-a * a * dcov2d_inv_vec[2] + 2 * a * b * dcov2d_inv_vec[1] + (det - a * c) * dcov2d_inv_vec[0]),
+
         }};
         return ret;
         """)
