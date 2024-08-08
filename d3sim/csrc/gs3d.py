@@ -276,9 +276,9 @@ class Gaussian3D(pccm.Class):
         }};
         auto dL_dM_T = T(2) * dL_dsigma.template op<op::mm_nnn>(M);
         tv::array<T, 3> dL_dscale{{
-            dL_dM_T[0].template op<op::dot>(R.template op<op::row>(0)),
-            dL_dM_T[1].template op<op::dot>(R.template op<op::row>(1)),
-            dL_dM_T[2].template op<op::dot>(R.template op<op::row>(2))
+            dL_dM_T[0].template op<op::dot>(R[0]),
+            dL_dM_T[1].template op<op::dot>(R[1]),
+            dL_dM_T[2].template op<op::dot>(R[2])
         }};
         // 
         auto dL_dquat = (dL_dM_T * op::reshape<-1, 1>(scale)).template op<op::uqmat_colmajor_grad>(quat);
@@ -328,12 +328,74 @@ class Gaussian3D(pccm.Class):
         // Vrk.T = Vrk
         // Projected Cov = J @ W @ Cov @ W.T @ J.T
         // = W_T_matmul_J_T_cm.T @ Vrk @ W_T_matmul_J_T_cm
-        // auto cov_projected = W_T_matmul_J_T_cm.template op<op::transpose>().template op<op::mm_nnn>(Vrk.op<op::transpose>()).op<op::mm_nnn>(W_T_matmul_J_T_cm);
+        // auto cov_projected = W_T_matmul_J_T_cm.template op<op::transpose>().template op<op::mm_nnn>(Vrk).template op<op::mm_nnn>(W_T_matmul_J_T_cm);
         
-        auto cov_projected = W_T_matmul_J_T_cm.template op<op::mm_tnt>(Vrk).template op<op::mm_nnn>(W_T_matmul_J_T_cm);
+        auto cov_projected = W_T_matmul_J_T_cm.template op<op::mm_tnn>(Vrk).template op<op::mm_nnn>(W_T_matmul_J_T_cm);
         return {{cov_projected[0][0], cov_projected[0][1], cov_projected[1][1]}};
         """)
         return code.ret("tv::array<T, 3>")
+
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def project_gaussian_to_2d_grad(self):
+        code = pccm.code()
+        code.targ("T")
+        code.arg("dcov2d", "tv::array<T, 3>")
+
+        code.arg("mean_camera", "tv::array<T, 3>")
+        code.arg("focal_length, tan_fov", "tv::array<T, 2>")
+        code.arg("cam2world_T", "tv::array_nd<T, 4, 3>")
+        code.arg("cov3d_vec", "tv::array_nd<T, 6>")
+
+        code.arg("clamp_factor", "T", "1.3f")
+
+        code.raw(f"""
+        namespace op = tv::arrayops;
+        using math_op_t = tv::arrayops::MathScalarOp<T>;
+        auto limit = tan_fov * clamp_factor * mean_camera[2];
+        auto txylimit_focal = op::slice<0, 2>(mean_camera).template op<op::clamp>(-limit, limit) * focal_length;
+
+        T x_limit_grad = (mean_camera[0] < -limit[0] || mean_camera[0] > limit[0]) ? T(0) : T(1);
+        T y_limit_grad = (mean_camera[1] < -limit[1] || mean_camera[1] > limit[1]) ? T(0) : T(1);
+        auto tz_square = mean_camera[2] * mean_camera[2];
+        auto tz_square_inv = T(1) / tz_square;
+        auto tz_3 = mean_camera[2] * mean_camera[2] * mean_camera[2];
+        tv::array_nd<T, 2, 2> dcov_2d{{
+            tv::array<T, 2>{{dcov2d[0], T(0.5) * dcov2d[1]}},
+            tv::array<T, 2>{{T(0.5) * dcov2d[1], dcov2d[2]}},
+        }};
+        tv::array_nd<T, 2, 3> J_T_cm{{
+            tv::array<T, 3>{{focal_length[0] / mean_camera[2], 0, -txylimit_focal[0] * tz_square_inv}},
+            tv::array<T, 3>{{0, focal_length[1] / mean_camera[2], -txylimit_focal[1] * tz_square_inv}},
+        }};
+        auto world2cam_T_cm = op::slice<0, 3>(cam2world_T);
+        
+        tv::array_nd<T, 2, 3> W_T_matmul_J_T_cm = world2cam_T_cm.template op<op::mm_nnn>(J_T_cm);
+        tv::array_nd<T, 3, 3> Vrk{{
+            tv::array<T, 3>{{cov3d_vec[0], cov3d_vec[1], cov3d_vec[2]}},
+            tv::array<T, 3>{{cov3d_vec[1], cov3d_vec[3], cov3d_vec[4]}},
+            tv::array<T, 3>{{cov3d_vec[2], cov3d_vec[4], cov3d_vec[5]}}
+        }};
+        // Vrk.T = Vrk
+        // Projected Cov = J @ W @ Cov @ W.T @ J.T
+        // = W_T_matmul_J_T_cm.T @ Vrk @ W_T_matmul_J_T_cm
+        auto dVrk = dcov_2d.template op<op::variance_transform_nnn_grad_rfs>(W_T_matmul_J_T_cm.template op<op::transpose>(), Vrk);
+        
+        tv::array<T, 6> dcov3d_vec{{
+            dVrk[0][0], T(2) * dVrk[0][1], T(2) * dVrk[0][2],
+            dVrk[1][1], T(2) * dVrk[1][2], dVrk[2][2]
+        }};
+        tv::array_nd<T, 2, 3> dW_T_matmul_J_T_cm = dcov_2d.template op<op::variance_transform_nnn_grad_lfs>(W_T_matmul_J_T_cm.template op<op::transpose>(), Vrk).template op<op::transpose>();
+        auto dJ_T_cm = dW_T_matmul_J_T_cm.template op<op::mm_nnn_grad_rfs>(world2cam_T_cm, J_T_cm);
+        tv::array<T, 3> dmean{{
+            -dJ_T_cm[0][2] * focal_length[0] * tz_square_inv * x_limit_grad,
+            -dJ_T_cm[1][2] * focal_length[1] * tz_square_inv * y_limit_grad,
+            (-(focal_length[0] * dJ_T_cm[0][0] + focal_length[1] * dJ_T_cm[1][1]) * tz_square_inv + 
+             2 * (dJ_T_cm[0][2] * txylimit_focal[0] + dJ_T_cm[1][2] * txylimit_focal[1]) / tz_3)
+        }};
+        return std::make_tuple(dmean, dcov3d_vec);
+        """)
+        return code.ret("std::tuple<tv::array<T, 3>, tv::array_nd<T, 6>>")
+
 
     @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
     def gaussian_2d_inverse_and_det(self):
