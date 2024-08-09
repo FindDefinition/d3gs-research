@@ -163,9 +163,9 @@ class CameraOps(pccm.Class):
         code.nontype_targ("AxisFrontSign", "int", "1")
         code.nontype_targ("AxisUSign", "int", "1")
         code.nontype_targ("AxisVSign", "int", "1")
+        code.targ("T")
         code.arg("duv", "tv::array<T, 2>")
         code.arg("dz", "T")
-        code.targ("T")
 
         code.arg("pos_cam", "tv::array<T, 3>")
         code.arg("principal_point", "tv::array<T, 2>")

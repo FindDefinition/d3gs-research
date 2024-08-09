@@ -1,11 +1,8 @@
-import time
 from plyfile import PlyData
 import torch 
-from d3sim.constants import D3SIM_DEFAULT_DEVICE
+from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT
 from d3sim.ops.d3gs.base import GaussianModelOrigin
-from d3sim.ops.d3gs.forward import GaussianSplatConfig, GaussianSplatForward
-from d3sim.ops.d3gs.data.scene.dataset_readers import readColmapSceneInfo
-import numpy as np 
+import numpy as np
 
 def load_3dgs_origin_model(ply_path: str):
     ply = PlyData.read(ply_path)
@@ -18,8 +15,9 @@ def load_3dgs_origin_model(ply_path: str):
     rest_vecs = []
     for i in range(45):
         rest_vecs.append(vertex[f"f_rest_{i}"])
-    f_rest = np.stack(rest_vecs, axis=1)
+    f_rest = np.stack(rest_vecs, axis=1).reshape(-1, 3, 15).transpose(0, 2, 1).reshape(f_dc.shape[0], -1)
     sh_coeffs = np.concatenate([f_dc, f_rest], axis=1).astype(np.float32) 
+    sh_coeffs = np.ascontiguousarray(sh_coeffs)
     rot_vecs = []
     for i in range(4):
         rot_vecs.append(vertex[f"rot_{i}"])
@@ -37,44 +35,3 @@ def load_3dgs_origin_model(ply_path: str):
     opacity_th = torch.from_numpy(opacity).to(D3SIM_DEFAULT_DEVICE)
     model = GaussianModelOrigin(xyz=positions_th, quaternion_xyzw=rots_th, scale=scales_th, opacity=opacity_th, color_sh=sh_coeffs_th)
     return model
-
-class _Args:
-    def __init__(self):
-        self.resolution = -1
-        self.data_device = "cuda"
-
-def _main():
-    from d3sim.ops.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, camera_to_JSON
-
-    data_path = "/Users/yanyan/Downloads/360_v2/garden"
-    data_path = "/root/autodl-tmp/garden_scene/garden"
-
-    scene_info = readColmapSceneInfo(data_path, "images_4", True)
-    train_camera_infos = scene_info.train_cameras
-    print(len(scene_info.train_cameras), len(scene_info.test_cameras))
-    train_camera_first = next(cameraList_from_camInfos_gen(train_camera_infos, 1, _Args()))
-    intrinsic = train_camera_first.get_intrinsic()
-    world2cam = np.eye(4, dtype=np.float32)
-    world2cam[:3, :3] = train_camera_first.R.T
-    world2cam[:3, 3] = train_camera_first.T
-    image_shape_wh = (train_camera_first.image_width, train_camera_first.image_height)
-    # breakpoint()
-    print("REF", train_camera_first.FoVx, train_camera_first.FoVy)
-    path = "/Users/yanyan/Downloads/models/garden/point_cloud/iteration_30000/point_cloud.ply"
-    path = "/root/autodl-tmp/garden_model/garden/point_cloud/iteration_30000/point_cloud.ply"
-
-    mod = load_3dgs_origin_model(path)
-    cfg = GaussianSplatConfig()
-    fwd = GaussianSplatForward(cfg)
-    for j in range(5):
-        # t = time.time()
-        _, _, out_color = fwd.forward(mod, intrinsic, np.linalg.inv(world2cam),image_shape_wh, axis_front_u_v=(2, 0, 1))
-        out_color_u8 = (out_color.permute(1, 2, 0) * 255).to(torch.uint8).cpu().numpy()
-        import cv2 
-        cv2.imwrite("test.png", out_color_u8[..., ::-1])
-        # breakpoint()
-
-        # torch.cuda.synchronize()
-        # print(time.time() - t)
-if __name__ == "__main__":
-    _main()

@@ -149,7 +149,6 @@ class Gaussian3D(pccm.Class):
         T z = dir[2];
 
         dsh_ptr[0] = T(SH_C0) * drgb;
-        tv::array<T, 3> result = T(SH_C0) * sh[0];
         if (Degree > 0)
         {{
             T dRGBdsh1 = -T({SHConstants.C1}) * y;
@@ -427,19 +426,20 @@ class Gaussian3D(pccm.Class):
         code.raw(f"""
         namespace op = tv::arrayops;
         using math_op_t = tv::arrayops::MathScalarOp<T>;
-        auto a = cov2d_vec[0];
-        auto b = cov2d_vec[1];
-        auto c = cov2d_vec[2];
+        T a = cov2d_vec[0];
+        T b = cov2d_vec[1];
+        T c = cov2d_vec[2];
         T det = a * c - b * b;
         T det2_inv = T(1) / (det * det + eps);
-        // ddet_inv/da = -1 / (det ^ 2) * c
-        // dL/da = ddet_inv/da * c * g[0] - ddet_inv/da * b * g[1] + (det_inv + a * ddet_inv/da) * g[2]
-        // = -det2_inv * c * c * g[0] + det2_inv * b * c * g[1] + (det * det2_inv - a * c * det2_inv) * g[2]
+        // in original code, the dcov2d_inv_vec[1] is multipled by 2.
+        // this is due to original code treat dcov2d_inv_vec as 2x2 symmetric matrix,
+        // dcov2d_inv_vec is [da, db; db, dc]
+        // so dcov2d_inv_vec[2] need to be multiplied by 2.
+        // in our implementation, we treat dcov2d_inv_vec as a regular vector.
         tv::array<T, 3> ret{{
-            det2_inv * (-c * c * dcov2d_inv_vec[0] + 2 * b * c * dcov2d_inv_vec[1] + (det - a * c) * dcov2d_inv_vec[2]),
-            det2_inv * 2 * (b * c * dcov2d_inv_vec[0] - (det + 2 * b * b) * dcov2d_inv_vec[1] + a * b * dcov2d_inv_vec[2]),
-            det2_inv * (-a * a * dcov2d_inv_vec[2] + 2 * a * b * dcov2d_inv_vec[1] + (det - a * c) * dcov2d_inv_vec[0]),
-
+            det2_inv * (-c * c * dcov2d_inv_vec[0] + b * c * dcov2d_inv_vec[1] + (det - a * c) * dcov2d_inv_vec[2]),
+            det2_inv * T(2) * (b * c * dcov2d_inv_vec[0] - (det / T(2) + b * b) * dcov2d_inv_vec[1] + a * b * dcov2d_inv_vec[2]),
+            det2_inv * (-a * a * dcov2d_inv_vec[2] + a * b * dcov2d_inv_vec[1] + (det - a * c) * dcov2d_inv_vec[0]),
         }};
         return ret;
         """)

@@ -71,7 +71,7 @@ def check_cov2d_grad(num_check: int = 10, delta: float = 1e-4):
         dtype_str = "float"
     grad_scale_np = np.random.uniform(0.5, 1.5, size=[3]).astype(dtype)
     eulers = np.random.uniform(-1, 1, size=[num_check, 3]).astype(dtype)
-    cam2world_Ts = np.zeros((num_check, 4, 3), np.float32)
+    cam2world_Ts = np.zeros((num_check, 4, 3), dtype=dtype)
     for j in range(num_check):
         cam2world_Ts[j, :3, :3] = euler_to_rotmat_np(*eulers[j], order=EulerIntrinsicOrder.ZYX)
 
@@ -182,7 +182,6 @@ def check_gaussian_2d_inverse_grad(num_check: int = 5, delta: float = 1e-4):
     grad_scale_np = np.random.uniform(0.5, 1.5, size=[3]).astype(dtype)
     cov2d_vec = np.random.uniform(0.5, 3.5, size=[num_check, 3]).astype(dtype)
     cov2d_vec_th = np_to_torch_dev(cov2d_vec)
-    
     inputs_th = cov2d_vec_th
     input_ndim = inputs_th.shape[1]
     my_val_tv = torch.zeros([num_check], dtype= inputs_th.dtype, device=inputs_th.device)
@@ -222,4 +221,5 @@ def check_gaussian_2d_inverse_grad(num_check: int = 5, delta: float = 1e-4):
 
 
 if __name__ == "__main__":
+    check_to_uv_grad()
     check_gaussian_2d_inverse_grad()
