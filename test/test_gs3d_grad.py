@@ -52,7 +52,7 @@ def check_cov3d_grad(num_check: int = 5, delta: float = 1e-4):
         $my_val_tv[i] = op::reshape<-1>(grad_res_cat)[$index];
         $ref_val_tv[i] = out_arr_with_delta_sum / op::reshape<-1>(inp_delta_val)[$index];
         """)
-
+        print("------", i, "------")
         my_val = my_val_tv.cpu().numpy()
         ref_val = ref_val_tv.cpu().numpy()
         # currently only double can get high precision result,
@@ -100,11 +100,14 @@ def check_cov2d_grad(num_check: int = 10, delta: float = 1e-4):
         auto inp_delta_val = $inp_delta;
         
         auto inp_with_delta = inp_arr + inp_delta_val;
-        auto res = Gaussian3D::project_gaussian_to_2d(op::slice<0, 3>(inp_arr), {{2.f, 2.f}}, {{1.f, 1.f}}, c2w_T, op::slice<3, 9>(inp_arr)) * grad_scale;
-        auto res_with_delta = Gaussian3D::project_gaussian_to_2d(op::slice<0, 3>(inp_with_delta), {{2.f, 2.f}}, {{1.f, 1.f}}, c2w_T, op::slice<3, 9>(inp_with_delta)) * grad_scale;
+        auto res = Gaussian3D::project_gaussian_to_2d(op::slice<0, 3>(inp_arr), 
+            tv::array<{dtype_str}, 2>{{1.f, 1.f}}, tv::array<{dtype_str}, 2>{{1.f, 1.f}}, c2w_T, op::slice<3, 9>(inp_arr)) * grad_scale;
+        auto res_with_delta = Gaussian3D::project_gaussian_to_2d(op::slice<0, 3>(inp_with_delta), 
+            tv::array<{dtype_str}, 2>{{1.f, 1.f}}, tv::array<{dtype_str}, 2>{{1.f, 1.f}}, c2w_T, op::slice<3, 9>(inp_with_delta)) * grad_scale;
         auto out_arr_with_delta_sum = op::reshape<-1>(res_with_delta - res).op<op::sum>(); 
         
-        auto grad_res = Gaussian3D::project_gaussian_to_2d_grad(grad_scale, op::slice<0, 3>(inp_arr), {{2.f, 2.f}}, {{1.f, 1.f}}, c2w_T, op::slice<3, 9>(inp_arr));
+        auto grad_res = Gaussian3D::project_gaussian_to_2d_grad(grad_scale, op::slice<0, 3>(inp_arr),
+            tv::array<{dtype_str}, 2>{{1.f, 1.f}}, tv::array<{dtype_str}, 2>{{1.f, 1.f}}, c2w_T, op::slice<3, 9>(inp_arr));
         auto grad_res_cat = op::concat(std::get<0>(grad_res), std::get<1>(grad_res));
         $my_val_tv[i] = op::reshape<-1>(grad_res_cat)[$index];
         $ref_val_tv[i] = out_arr_with_delta_sum / op::reshape<-1>(inp_delta_val)[$index];
@@ -150,10 +153,10 @@ def check_to_uv_grad(num_check: int = 10, delta: float = 1e-4):
         
         auto inp_with_delta = inp_arr + inp_delta_val;
         auto res_tuple = CameraOps::pos_cam_to_uv_no_distort(inp_arr, {{500.f, 440.f}}, {{960.f, 960.f}});
-        auto res = op::concat(std::get<0>(res_tuple), tv::array<float, 1>{{std::get<1>(res_tuple)}}) * grad_scale;
+        auto res = op::concat(std::get<0>(res_tuple), tv::array<{dtype_str}, 1>{{std::get<1>(res_tuple)}}) * grad_scale;
         
         auto res_with_delta_tuple = CameraOps::pos_cam_to_uv_no_distort(inp_with_delta, {{500.f, 440.f}}, {{960.f, 960.f}});
-        auto res_with_delta = op::concat(std::get<0>(res_with_delta_tuple), tv::array<float, 1>{{std::get<1>(res_with_delta_tuple)}}) * grad_scale;
+        auto res_with_delta = op::concat(std::get<0>(res_with_delta_tuple), tv::array<{dtype_str}, 1>{{std::get<1>(res_with_delta_tuple)}}) * grad_scale;
         
         auto out_arr_with_delta_sum = op::reshape<-1>(res_with_delta - res).op<op::sum>(); 
         
@@ -221,5 +224,7 @@ def check_gaussian_2d_inverse_grad(num_check: int = 5, delta: float = 1e-4):
 
 
 if __name__ == "__main__":
-    check_to_uv_grad()
-    check_gaussian_2d_inverse_grad()
+    check_cov3d_grad()
+    # check_cov2d_grad()
+    # check_to_uv_grad()
+    # check_gaussian_2d_inverse_grad()

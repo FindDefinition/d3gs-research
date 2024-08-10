@@ -15,7 +15,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 class _Args:
     def __init__(self):
         self.resolution = -1
-        self.data_device = "mps"
+        self.data_device = "mps" if IsAppleSiliconMacOs else "cuda"
 
 def sync():
     if IsAppleSiliconMacOs:
@@ -26,10 +26,10 @@ def sync():
 def _load_model_and_cam():
     from d3sim.ops.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, camera_to_JSON
 
-    data_path = "/Users/yanyan/Downloads/360_v2/garden"
-    # data_path = "/root/autodl-tmp/garden_scene/garden"
-    path = "/Users/yanyan/Downloads/models/garden/point_cloud/iteration_30000/point_cloud.ply"
-    # path = "/root/autodl-tmp/garden_model/garden/point_cloud/iteration_30000/point_cloud.ply"
+    # data_path = "/Users/yanyan/Downloads/360_v2/garden"
+    data_path = "/root/autodl-tmp/garden_scene/garden"
+    # path = "/Users/yanyan/Downloads/models/garden/point_cloud/iteration_30000/point_cloud.ply"
+    path = "/root/autodl-tmp/garden_model/garden/point_cloud/iteration_30000/point_cloud.ply"
 
     test_data_path = PACKAGE_ROOT.parent / "scripts/d3gs_cam.pkl"
     if test_data_path.exists():
@@ -64,8 +64,9 @@ def _main_bwd():
     cfg = GaussianSplatConfig()
     fwd = GaussianSplatForward(cfg)
     mod.set_requires_grad(True)
-
-    for j in range(3):
+    grads = torch.load("/root/Projects/3dgs/gaussian-splatting/grads.pt")
+    (xyz_grads, opacity_grads, scale_grads, rotation_grads, feature_grads) = grads
+    for j in range(5):
         mod.clear_grad()
         t = time.time()
         # with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
@@ -73,44 +74,59 @@ def _main_bwd():
         res = rasterize_gaussians(mod, [cam], training=True)
         sync()
         print("FWD", time.time() - t)
-        t = time.time()
         assert res is not None 
         out_color = res.final_color
+        torch.manual_seed(50051)
         dout_color = torch.rand(out_color.shape, device=out_color.device)
+        sync()
+
+        t = time.time()
+
         out_color.backward(dout_color)
         sync()
         print("BWD", time.time() - t)
+        assert not mod.act_applied
+        print(dout_color.reshape(3, -1)[:, 1])
+        print(mod.opacity.grad[1], res.final_T.reshape(-1)[1].item())
+        print(opacity_grads.shape, mod.scale.grad.shape)
+        print(torch.linalg.norm(mod.opacity.grad.reshape(opacity_grads.shape) - opacity_grads))
+        print(torch.linalg.norm(mod.scale.grad - scale_grads))
+        print(torch.linalg.norm(mod.quaternion_xyzw.grad - rotation_grads[:, [1, 2, 3, 0]]))
 
+        # print(torch.linalg.norm(mod.color_sh.grad - feature_grads))
+        print(mod.xyz.grad[1])
+        print(xyz_grads[1])
+        print(torch.linalg.norm(mod.xyz.grad - xyz_grads))
+        breakpoint()
 
 def _main():
     mod, cam = _load_model_and_cam()
-    with torch.mps.profiler.profile("interval,event"):
 
-        for j in range(3):
-            import torchvision
-            torchvision.utils.save_image
-            t = time.time()
-            # with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
-            # res, _ = fwd.forward(mod, [cam])
-            res = rasterize_gaussians(mod, [cam])
-            assert res is not None 
-            out_color = res.final_color
-            if j == 0:
-                out_color_u8 = out_color.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
-                out_color_u8 = out_color_u8[..., ::-1]
-                if res.final_depth is not None:
-                    depth = res.final_depth
-                    depth_rgb = depth_map_to_jet_rgb(depth, (0.2, 25.0)).cpu().numpy()
-                    out_color_u8 = np.concatenate([out_color_u8, depth_rgb], axis=0)
+    for j in range(15):
+        import torchvision
+        torchvision.utils.save_image
+        t = time.time()
+        # with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
+        # res, _ = fwd.forward(mod, [cam])
+        res = rasterize_gaussians(mod, [cam])
+        assert res is not None 
+        out_color = res.final_color
+        if j == 0:
+            out_color_u8 = out_color.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
+            out_color_u8 = out_color_u8[..., ::-1]
+            if res.final_depth is not None:
+                depth = res.final_depth
+                depth_rgb = depth_map_to_jet_rgb(depth, (0.2, 25.0)).cpu().numpy()
+                out_color_u8 = np.concatenate([out_color_u8, depth_rgb], axis=0)
 
-                # out_color_u8 = (out_color.permute(1, 2, 0) * 255).to(torch.uint8).cpu().numpy()
-                import cv2 
-                cv2.imwrite("test.png", out_color_u8)
-                # breakpoint()
-            # else:
-            #     print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
-            sync()
-            print(time.time() - t)
+            # out_color_u8 = (out_color.permute(1, 2, 0) * 255).to(torch.uint8).cpu().numpy()
+            import cv2 
+            cv2.imwrite("test.png", out_color_u8)
+            # breakpoint()
+        # else:
+        #     print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+        # sync()
+        print(time.time() - t)
 
     
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 from pyexpat import model
 import time
-from typing import Annotated
+from typing import Annotated, Literal
 from d3sim.core import dataclass_dispatch as dataclasses
 from d3sim.core.arrcheck.dcbase import DataClassWithArrayCheck
 import d3sim.core.arrcheck as ac
@@ -70,8 +70,16 @@ class GaussianSplatConfig:
     bg_color: np.ndarray = dataclasses.field(
         default_factory=lambda: np.zeros((3), np.float32))
     scale_global: float = 1.0
+    use_nchw: bool = True
+    render_rgba: bool = False
 
+    transmittance_is_double = False
     _bg_color_device: torch.Tensor | None = None
+    backward_reduction: Literal["none", "warp", "block"] = "none"
+
+    @property 
+    def num_channels(self):
+        return 4 if self.render_rgba else 3
 
     @property
     def block_size(self):
@@ -85,7 +93,7 @@ class GaussianSplatConfig:
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatForwardContext(DataClassWithArrayCheck):
     conic_opacity: Annotated[torch.Tensor, ac.ArrayCheck([-1, 4], ac.F32)]
-    tiles_touched: Annotated[torch.Tensor, ac.ArrayCheck([-1], ac.I32)]
+    radii: Annotated[torch.Tensor, ac.ArrayCheck([-1], ac.I32)]
     uvs: Annotated[torch.Tensor, ac.ArrayCheck([-1, 2], ac.F32)]
     rgb_gaussian: Annotated[torch.Tensor, ac.ArrayCheck([-1, 3], ac.F32)]
     gaussian_idx_sorted: Annotated[torch.Tensor, ac.ArrayCheck([-1], ac.I32)]
@@ -94,6 +102,10 @@ class GaussianSplatForwardContext(DataClassWithArrayCheck):
     depths: Annotated[torch.Tensor, ac.ArrayCheck([-1], ac.F32)]
     cov3d_vecs: Annotated[torch.Tensor | None,
                           ac.ArrayCheck([-1, 6], ac.F32)] = None
+    cov2d_vecs: Annotated[torch.Tensor | None,
+                          ac.ArrayCheck([-1, 3], ac.F32)] = None
+    sh_to_rgb_ne_0: Annotated[torch.Tensor | None,
+                          ac.ArrayCheck([-1], ac.U8)] = None
 
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
@@ -165,7 +177,9 @@ class GaussianSplatForward:
         focal_xy_np = np.array([focal_x, focal_y], np.float32)
         principal_point_np = np.array([intrinsic[0, 2], intrinsic[1, 2]],
                                       np.float32)
-
+        # TODO for original code only
+        principal_point_np[0] = width / 2
+        principal_point_np[1] = height / 2
         principal_point_unified_np = principal_point_np / resolution_wh_np.astype(
             np.float32)
         tanfov_xy_np = np.array([tanfov_x, tanfov_y], np.float32)
@@ -193,12 +207,17 @@ class GaussianSplatForward:
                                     dtype=torch.float32,
                                     device=xyz.device)
         cov3d_vecs = None
+        cov2d_vecs = None
+        sh_to_rgb_ne_0 = None 
         if training:
             # for backward only
             cov3d_vecs = torch.empty([num, 6],
                                      dtype=torch.float32,
                                      device=xyz.device)
-
+            cov2d_vecs = torch.empty([num, 3],
+                                        dtype=torch.float32,
+                                        device=xyz.device)
+            sh_to_rgb_ne_0 = torch.empty([num], dtype=torch.uint8, device=xyz.device)
         tiles_touched = torch.empty(num, dtype=torch.int32, device=xyz.device)
         rgb_gaussian = torch.empty([num, 3],
                                    dtype=torch.float32,
@@ -227,24 +246,22 @@ class GaussianSplatForward:
             // auto uv = (std::get<0>(ndc_unified_and_z) + 1.0f) * resolution_wh.cast<float>() / 2.0f - 0.5f;
             
             auto ndc_unified_and_z = CameraOps::pos_cam_to_uv_no_distort<2, 0, 1>(point_cam, principal_point, focal_xy);
-            auto uv = std::get<0>(ndc_unified_and_z) + 0.5f;
+            auto uv = std::get<0>(ndc_unified_and_z) - 0.5f;
             auto z_in_cam = std::get<1>(ndc_unified_and_z);
             auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
             auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[i];
 
             auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale * $scale_global, quat);
-            auto cov2d_vec = Gaussian3D::project_gaussian_to_2d(point_cam, focal_xy, tan_fov, cam2world_T, cov3d_vec, $(self.cfg.projected_clamp_factor));
+            auto cov2d_vec = Gaussian3D::project_gaussian_to_2d<float, 4>(point_cam, focal_xy, tan_fov, cam2world_T, cov3d_vec, $(self.cfg.projected_clamp_factor));
             
             cov2d_vec[0] += $(self.cfg.gaussian_lowpass_filter);
             cov2d_vec[2] += $(self.cfg.gaussian_lowpass_filter);
 
-            // tv::printf2_once<' ', 1>(cov2d_vec[0], cov2d_vec[1], cov2d_vec[2], "CONV2D");
             auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det(cov2d_vec, $(self.cfg.eps));
             auto cov2d_inv = std::get<0>(cov2d_inv_and_det);
             auto det = std::get<1>(cov2d_inv_and_det);
             auto radii_fp = math_op_t::ceil(Gaussian3D::get_gaussian_2d_ellipse(cov2d_vec, det, 
                 $(self.cfg.cov2d_radii_eigen_eps), $(self.cfg.gaussian_std_sigma)));
-            // op::reinterpret_cast_array_nd<3>($debug_cov2d)[i] = cov2d_vec;
             constexpr auto tile_size_xy = tv::array<int, 2>{{{self.cfg.tile_size[0]}, {self.cfg.tile_size[1]}}};
             auto tile_num_xy = tv::div_up(resolution_wh, tile_size_xy);
             auto tile_size_xy_float = tile_size_xy.cast<float>();
@@ -267,16 +284,30 @@ class GaussianSplatForward:
             tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], $opacity[i]}};
             op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
             auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1)};
-            op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr).op<op::maximum>(0.0f);
+            
             """)
             if (training):
                 code_prep.raw(f"""
+                auto rgb = Gaussian3D::sh_dir_to_rgb<{degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr);
+                uint8_t ne_0_packed = (uint8_t(rgb[0] < 0) << 2) | (uint8_t(rgb[1] < 0) << 1) | uint8_t(rgb[2] < 0);
+                op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = rgb.op<op::maximum>(0.0f);
+                $sh_to_rgb_ne_0[i] = ne_0_packed;
+
                 op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i] = cov3d_vec;
+                op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i] = cov2d_vec;
                 """)
+            else:
+                code_prep.raw(f"""
+                op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr).op<op::maximum>(0.0f);
+                """)
+
             INLINER.kernel_1d(prep_kernel_name, num, 0, code_prep)
         with measure_and_print_torch("2", enable=enable_verbose):
             tiles_touched.cumsum_(0)
             num_rendered = int(tiles_touched[-1].item())
+        
+        out_img_shape = [self.cfg.num_channels, height, width] if self.cfg.use_nchw else [height, width, self.cfg.num_channels]
+        out_custom_feat_shape = [num_custom_feat, height, width] if self.cfg.use_nchw else [height, width, num_custom_feat]
         if (num_rendered == 0):
             final_T = torch.empty([height, width],
                                   dtype=torch.float32,
@@ -284,10 +315,10 @@ class GaussianSplatForward:
             n_contrib = torch.empty([height, width],
                                     dtype=torch.int32,
                                     device=xyz.device)
-            out_color = torch.empty([3, height, width],
+            out_color = torch.empty(out_img_shape,
                                     dtype=torch.float32,
                                     device=xyz.device)
-            out_custom_feat = torch.empty([num_custom_feat, height, width],
+            out_custom_feat = torch.empty(out_custom_feat_shape,
                                           dtype=torch.float32,
                                           device=xyz.device)
             final_depth = None
@@ -394,15 +425,15 @@ class GaussianSplatForward:
             """)
         # workload_ranges_tv = torch_tensor_to_tv(workload_ranges, to_const=True)
         final_T = torch.empty([height, width],
-                              dtype=torch.float32,
+                              dtype=torch.float64 if self.cfg.transmittance_is_double else torch.float32,
                               device=xyz.device)
         n_contrib = torch.empty([height, width],
                                 dtype=torch.int32,
                                 device=xyz.device)
-        out_color = torch.empty([3, height, width],
+        out_color = torch.empty(out_img_shape,
                                 dtype=torch.float32,
                                 device=xyz.device)
-        out_custom_feat = torch.empty([num_custom_feat, height, width],
+        out_custom_feat = torch.empty(out_custom_feat_shape,
                                       dtype=torch.float32,
                                       device=xyz.device)
         final_depth = None
@@ -417,13 +448,15 @@ class GaussianSplatForward:
                                         final_n_contrib=n_contrib)
         ctx = GaussianSplatForwardContext(
             conic_opacity=conic_opacity,
-            tiles_touched=tiles_touched,
+            radii=radii,
             uvs=uvs,
             rgb_gaussian=rgb_gaussian,
             gaussian_idx_sorted=gaussian_idx_sorted,
             workload_ranges=workload_ranges,
             image_shape_wh=image_shape_wh,
             cov3d_vecs=cov3d_vecs,
+            cov2d_vecs=cov2d_vecs,
+            sh_to_rgb_ne_0=sh_to_rgb_ne_0,
             depths=depths)
         self.rasterize_forward_backward(model,
                                         ctx,
@@ -470,12 +503,16 @@ class GaussianSplatForward:
         final_color = out.final_color
         final_custom_features = out.final_custom_features
         final_n_contrib = out.final_n_contrib
+        assert final_n_contrib is not None 
         final_depth = out.final_depth
         if render_depth:
             assert final_depth is not None
 
         grad_out: RasterizeGradientOutput | None = None
         color_use_smem = is_bwd  # TODO why bwd use smem for color?
+        if grad is not None:
+            drgb = grad.drgb 
+            dT = grad.dT
         if is_bwd:
             duv = torch.zeros([num, 2],
                               dtype=torch.float32,
@@ -498,7 +535,8 @@ class GaussianSplatForward:
                 dopacity=dopacity,
                 dcolor=dcolor,
                 dcustom_features=dcustom_features)
-
+        # print(final_n_contrib.max(), final_n_contrib.float().mean())
+        t_dtype = "double" if self.cfg.transmittance_is_double else "float"
         code_rasterize = pccm.code()
         code_rasterize.raw(f"""
         namespace op = tv::arrayops;
@@ -562,25 +600,64 @@ class GaussianSplatForward:
         bool done = !inside;
 
         auto range = op::reinterpret_cast_array_nd<2>($workload_ranges)[tile_idx_xy[1] * $tile_num_x + tile_idx_xy[0]];
-        int rounds = tv::div_up(range[1] - range[0], {block_size});
-        int toDo = range[1] - range[0];
-
-        tv::array<float, 3> rgb{{}};
-        float T = 1.0f;
-        uint32_t contributor = 0;
-        float weight_sum = 0.0f;
+        
+        {t_dtype} T = 1.0f;
         """)
+        if not is_bwd:
+            code_rasterize.raw(f"""
+            tv::array<float, 3> rgb{{}};
+            int toDo = range[1] - range[0];
+            int rounds = tv::div_up(range[1] - range[0], {block_size});
+            float weight_sum = 0.0f;    
+            uint32_t contributor = 0;
+            """)
+        else:
+            code_rasterize.raw(f"""
+            int contributor = inside ? $final_n_contrib[pixel_id] + 1 : 0;
+            """)
+            code_rasterize.raw(f"""
+            // range[1] = min(range[1], range[0] + real_todo);
+            // tv::printf2_once<' ', 1>(contributor, range[1] - range[0]); 
+            int toDo = contributor;
+            // toDo = range[1] - range[0];
+            int rounds = tv::div_up(range[1] - range[0], {block_size});
+            """)
+
+            if self.cfg.backward_reduction == "warp":
+                code_rasterize.raw(f"""
+                int max_num_contributor = tv::parallel::warp_max(contributor);
+                """)
+            # elif self.cfg.backward_reduction == "block":
+            #     code_rasterize.raw(f"""
+            #     contributor = tv::parallel::warp_sum(contributor);
+            #     """)
+
         if render_depth:
             code_rasterize.raw(f"""
             float depth_accum = 0.0f;
             """)
         if is_bwd:
             code_rasterize.raw(f"""
-            float render_T = $(out.final_T)[pixel_id];
-            tv::array<float, 3> render_rgb = op::reinterpret_cast_array_nd<3>($final_color)[pixel_id];
-            auto drgb_array = op::reinterpret_cast_array_nd<3>($(grad.drgb))[pixel_id];
-            auto dT = $(grad.dT)[pixel_id];
+            decltype(T) render_T = $final_T[pixel_id];
+            auto dT_val = $dT[pixel_id];
             """)
+            if self.cfg.use_nchw:
+                code_rasterize.raw(f"""
+                tv::array<float, 3> render_rgb, drgb_array;
+                render_rgb[0] = $final_color[0 * $height * $width + pixel_id];
+                render_rgb[1] = $final_color[1 * $height * $width + pixel_id];
+                render_rgb[2] = $final_color[2 * $height * $width + pixel_id];
+
+                drgb_array[0] = $drgb[0 * $height * $width + pixel_id];
+                drgb_array[1] = $drgb[1 * $height * $width + pixel_id];
+                drgb_array[2] = $drgb[2 * $height * $width + pixel_id];
+                """)
+            else:
+                code_rasterize.raw(f"""
+                tv::array<float, 3> render_rgb = op::reinterpret_cast_array_nd<3>($final_color)[pixel_id];
+                auto drgb_array = op::reinterpret_cast_array_nd<3>($drgb)[pixel_id];
+                """)
+
             if render_depth:
                 code_rasterize.raw(f"""
                 auto render_depth = $final_depth[pixel_id];
@@ -597,7 +674,7 @@ class GaussianSplatForward:
                 code_rasterize.raw(f"""
                 int num_done_simd = metal::simd_sum(int(done));
                 num_done_shared[tv::parallel::warp_index()] = num_done_simd;
-                tv::parallel::block_sync();
+                tv::parallel::block_sync_shared_io();
                 int num_done = 0;
                 for (uint32_t j = 0; j < ({block_size}u / tv::parallel::warp_size()); ++j){{
                     num_done += num_done_shared[j];
@@ -633,48 +710,76 @@ class GaussianSplatForward:
                     collected_depth[thread_rank] = $depths[gaussian_id];
                     """)
             code_rasterize.raw(f"""
-            tv::parallel::block_sync();
+            tv::parallel::block_sync_shared_io();
             """)
+            # if not is_bwd:
+            for_stmt = f"int j = 0; !done && j < std::min({block_size}, toDo); ++j"
+            if is_bwd:
+                for_stmt = f"int j = 0; j < std::min({block_size}, toDo); ++j"
 
-            with code_rasterize.for_(
-                    f"int j = 0; !done && j < std::min({block_size}, toDo); ++j"
-            ):
+            # else:
+            #     for_stmt = f"int j = 0; j < contributer; ++j"
+
+            with code_rasterize.for_(for_stmt):
+                # if not is_bwd:
+                #     code_rasterize.raw(f"""
+                #     ++contributor;
+                #     """)
                 code_rasterize.raw(f"""
-                ++contributor;
                 auto uv = collected_xy[j];
                 auto conic_opacity_vec = collected_conic_opacity[j];
                 tv::array<float, 2> dist{{uv.x - pixel_idx_xy_fp[0], uv.y - pixel_idx_xy_fp[1]}};
                 float power = (-0.5f * (conic_opacity_vec.x * dist[0] * dist[0] + 
                                        conic_opacity_vec.z * dist[1] * dist[1]) - 
                                         conic_opacity_vec.y * dist[0] * dist[1]);
-                if (power > 0.0f){{
-                    continue;
-                }}
-                float G = math_op_t::exp(power); // used in backward
+                float G = math_op_t::fast_exp(power); // used in backward
                 float alpha = math_op_t::min(0.99f, conic_opacity_vec.w * G);
                 // TODO if remove the 'f', this kernel runs 4x slower.
                 if (alpha < 1.0f / 255.0f){{
                     continue;
                 }}
                 float next_T = T * (1.0f - alpha);
-                if (next_T < {self.cfg.transmittance_eps}f){{
-                    done = true;
-                    continue;
-                }}
+                """)
+                # if is_bwd:
+                #     code_rasterize.raw(f"""
+                #     bool should_done = i * {block_size} + j > contributor;
+                #     should_done = false;
+                #     // should_done = next_T < {self.cfg.transmittance_eps}f;
+
+                #     """)
+                if not is_bwd:
+                    code_rasterize.raw(f"""
+                    bool should_done = next_T < {self.cfg.transmittance_eps}f;
+                    if (power > 0.0f || should_done){{
+                        done = should_done;
+                        continue;
+                    }}
+                    """)
+                code_rasterize.raw(f"""
                 float weight = alpha * T;
-                weight_sum += weight;
                 T = next_T;
                 // last_contributor = contributor;
                 auto gaussian_id = collected_id[j];
                 """)
+                if not is_bwd:
+                    code_rasterize.raw(f"""
+                    weight_sum += weight;
+                    contributor = i * {block_size} + j;
+                    """)
                 if color_use_smem:
                     code_rasterize.raw(f"""
                     auto rgb_val = op::reinterpret_cast_array_nd<3>(collected_rgb_gaussian)[j];
-                    rgb += weight * rgb_val;
                     """)
                 else:
                     code_rasterize.raw(f"""
                     auto rgb_val = op::reinterpret_cast_array_nd<3>($rgb_gaussian_tv)[gaussian_id];
+                    """)
+                if is_bwd:
+                    code_rasterize.raw(f"""
+                    render_rgb -= weight * rgb_val;
+                    """)
+                if not is_bwd:
+                    code_rasterize.raw(f"""
                     rgb += weight * rgb_val;
                     """)
                 if render_depth:
@@ -685,18 +790,22 @@ class GaussianSplatForward:
                 if is_bwd:
                     # TODO warp reduce
                     code_rasterize.raw(f"""
-                    auto suffix = render_rgb - rgb;
-                    auto dL_dalpha_without_div = (drgb_array.op<op::dot>(T * rgb_val - suffix));
+                    // auto suffix = render_rgb - rgb;
+                    float dL_dalpha_without_div = (drgb_array.op<op::dot>(T * rgb_val - render_rgb));
                     // grad from T, we don't apply background when training, apply it in torch side.
-                    dL_dalpha_without_div += -dT * render_T;
+                    dL_dalpha_without_div += -dT_val * render_T;
                     """)
                     if render_depth:
                         code_rasterize.raw(f"""
                         dL_dalpha_without_div += ddepth * (T * depth_val - (render_depth - depth_accum));
                         """)
                     code_rasterize.raw(f"""
-                    auto dL_dalpha = dL_dalpha_without_div / (1 - alpha);
+                    auto dL_dalpha = dL_dalpha_without_div / (1.0f - alpha);
                     auto dL_drgb = weight * drgb_array;
+                    tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 0, dL_drgb[0]);
+                    tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 1, dL_drgb[1]);
+                    tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 2, dL_drgb[2]);
+
                     const float dL_dG = conic_opacity_vec.w * dL_dalpha;
                     const float gdx = G * dist[0];
                     const float gdy = G * dist[1];
@@ -727,13 +836,7 @@ class GaussianSplatForward:
                     tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 0, dL_dcov2d[0]);
                     tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 1, dL_dcov2d[1]);
                     tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 2, dL_dcov2d[2]);
-
                     tv::parallel::atomicAdd($dopacity + gaussian_id, dL_dopacity);
-
-                    tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 0, dL_drgb[0]);
-                    tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 1, dL_drgb[1]);
-                    tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 2, dL_drgb[2]);
-
                     """)
                 # if num_custom_feat > 0:
                 #     code_rasterize.raw(f"""
@@ -774,7 +877,6 @@ class GaussianSplatForward:
                     $final_color[0 * $height * $width + pixel_id] = rgb[0];
                     $final_color[1 * $height * $width + pixel_id] = rgb[1];
                     $final_color[2 * $height * $width + pixel_id] = rgb[2];
-
                     """)
         # if num_custom_feat:
         #     code_rasterize.raw(f"""
@@ -787,10 +889,13 @@ class GaussianSplatForward:
         #     """)
         kernel_unique_name = (
             f"rasterize_{is_bwd}_{self.cfg.tile_size}"
-            f"_{num_custom_feat}_{self.cfg.render_depth}_"
-            f"{self.cfg.alpha_eps}_{self.cfg.transmittance_eps}"
-            f"_{final_n_contrib is None}")
-        INLINER.kernel_raw(kernel_unique_name, launch_param, code_rasterize)
+            f"_{num_custom_feat}_{self.cfg.render_depth}"
+            f"_{self.cfg.use_nchw}_{self.cfg.render_rgba}"
+            f"_{final_n_contrib is None}_{t_dtype}")
+        with tv.measure_and_print("BWD-rasterize"):
+            INLINER.kernel_raw(kernel_unique_name, launch_param, code_rasterize)
+        if is_bwd:
+            print(INLINER.get_nvrtc_kernel_attrs(kernel_unique_name))
         return grad_out
 
     def backward(self, model: GaussianModelBase,
@@ -811,7 +916,7 @@ class GaussianSplatForward:
 
         tile_num_x = div_up(width, self.cfg.tile_size[0])
         tile_num_y = div_up(height, self.cfg.tile_size[1])
-        tiles_touched = ctx.tiles_touched
+        radii = ctx.radii
         grad_out = self.rasterize_forward_backward(model, ctx, out, grad)
         assert grad_out is not None
         duv = grad_out.duv
@@ -828,15 +933,19 @@ class GaussianSplatForward:
 
         tanfov_xy_np = np.array([tanfov_x, tanfov_y], np.float32)
         cam2world_T_np = np.ascontiguousarray(cam2world[:3].T)
+        cam2world_R_np = cam2world_T_np[:3]
         conic_opacity = ctx.conic_opacity
         cam2world_center_np = cam2world_T_np[3]
         cov3d_vecs = ctx.cov3d_vecs
-        assert cov3d_vecs is not None
+        cov2d_vecs = ctx.cov2d_vecs
+        sh_to_rgb_ne_0 = ctx.sh_to_rgb_ne_0
+        assert cov3d_vecs is not None and cov2d_vecs is not None
+        assert sh_to_rgb_ne_0 is not None 
         dxyz_res = torch.zeros_like(model.xyz)
         dscale_res = torch.zeros_like(model.scale)
         dquat_res = torch.zeros_like(model.quaternion_xyzw)
         dcolor_sh_res = torch.zeros_like(model.color_sh)
-        dopacity = torch.zeros_like(model.opacity)
+        # dopacity = torch.zeros_like(model.opacity)
         grad_model = GaussianModelOrigin(xyz=dxyz_res,
                                          color_sh=dcolor_sh_res,
                                          scale=dscale_res,
@@ -848,53 +957,70 @@ class GaussianSplatForward:
         color_sh = model.color_sh
         degree = model.color_sh_degree
         prep_kernel_name = f"gs3d_preprocess_bwd_{axis_front_u_v}_{self.cfg.tile_size}_{degree}"
-        INLINER.kernel_1d(
-            prep_kernel_name, num, 0, f"""
-        namespace op = tv::arrayops;
-        using math_op_t = tv::arrayops::MathScalarOp<float>;
-        if ($tiles_touched[i] == 0){{
-            return;
-        }}
-        auto uv_grad = op::reinterpret_cast_array_nd<2>($duv)[i];
-        auto conic_grad = op::reinterpret_cast_array_nd<3>($dconic)[i];
-        auto color_grad = op::reinterpret_cast_array_nd<3>($dcolor)[i];
-        auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i];
-        auto cam2world_T = $cam2world_T_np;
+        with tv.measure_and_print("BWD-2"):
 
-        auto focal_xy = $focal_xy_np;
-        auto principal_point = $principal_point_np;
-        auto tan_fov = $tanfov_xy_np;
-        auto resolution_wh = $resolution_wh_np;
-        auto point = op::reinterpret_cast_array_nd<3>($xyz)[i];
-        auto point_cam = op::slice<0, 3>(cam2world_T).op<op::mv_colmajor>(point - cam2world_T[3]);
-        auto conic_arr = op::reinterpret_cast_array_nd<3>($conic_opacity + i * 4)[0];
-        conic_arr[0] += $(self.cfg.gaussian_lowpass_filter);
-        conic_arr[2] += $(self.cfg.gaussian_lowpass_filter);
-        
-        auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, 0.0f, point_cam, principal_point, focal_xy);
-        auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad(conic_grad, conic_arr);
-        auto proj_grad_res = Gaussian3D::project_gaussian_to_2d_grad(dcov2d, point_cam, focal_xy, tan_fov, cam2world_T, cov3d_vec);
-        dpoint_cam += std::get<0>(proj_grad_res);
-        auto dxyz = op::slice<0, 3>(cam2world_T).op<op::mv_colmajor>(dpoint_cam);
+            INLINER.kernel_1d(
+                prep_kernel_name, num, 0, f"""
+            namespace op = tv::arrayops;
+            using math_op_t = tv::arrayops::MathScalarOp<float>;
+            if ($radii[i] == 0){{
+                return;
+            }}
+            auto uv_grad = op::reinterpret_cast_array_nd<2>($duv)[i];
+            auto conic_grad = op::reinterpret_cast_array_nd<3>($dconic)[i];
+            auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i];
+            auto cam2world_R_T = $cam2world_R_np;
+            auto cam2world_center = $cam2world_center_np;
 
-        auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
-        auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[i];
+            auto focal_xy = $focal_xy_np;
+            auto principal_point = $principal_point_np;
+            auto tan_fov = $tanfov_xy_np;
+            auto resolution_wh = $resolution_wh_np;
+            auto point = op::reinterpret_cast_array_nd<3>($xyz)[i] - cam2world_center;
 
-        auto cov3d_grad_res = Gaussian3D::scale_quat_to_cov3d_grad(std::get<1>(proj_grad_res), scale, quat);
-        auto dscale = std::get<0>(cov3d_grad_res);
-        auto dquat = std::get<1>(cov3d_grad_res);
-        auto normed_dir = (point - cam2world_T[3]).op<op::normalize>();
-        auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1)};
-        auto dsh_ptr = op::reinterpret_cast_array_nd<3>($dcolor_sh_res) + i * {(degree + 1) * (degree + 1)};
-        auto dnormed_dir = Gaussian3D::sh_dir_to_rgb_grad<{degree}>(color_grad, dsh_ptr,
-            normed_dir, sh_ptr);
-        dxyz += dnormed_dir.op<op::normalize_grad>(normed_dir);
+            auto point_cam = cam2world_R_T.op<op::mv_rowmajor>(point);
+            auto cov2d_arr = op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i];
+            // conic_arr[0] += $(self.cfg.gaussian_lowpass_filter);
+            // conic_arr[2] += $(self.cfg.gaussian_lowpass_filter);
+            
+            auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, 0.0f, point_cam, principal_point, focal_xy);
+            auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad(conic_grad, cov2d_arr);
+            
+            auto proj_grad_res = Gaussian3D::project_gaussian_to_2d_grad<float, 3>(dcov2d, point_cam, focal_xy, tan_fov, cam2world_R_T, cov3d_vec);
+            auto dmean = std::get<0>(proj_grad_res);
+            dpoint_cam += std::get<0>(proj_grad_res);
+            auto dLdcov = std::get<1>(proj_grad_res);
 
-        op::reinterpret_cast_array_nd<3>($dxyz_res)[i] = dxyz;
-        op::reinterpret_cast_array_nd<3>($dscale_res)[i] = dscale;
-        op::reinterpret_cast_array_nd<4>($dquat_res)[i] = dquat;
+            auto dxyz = cam2world_R_T.op<op::mv_colmajor>(dpoint_cam);
 
-        """)
+            auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
+            auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[i];
+
+            auto cov3d_grad_res = Gaussian3D::scale_quat_to_cov3d_grad(std::get<1>(proj_grad_res), scale, quat);
+            auto dscale = std::get<0>(cov3d_grad_res);
+            auto dquat = std::get<1>(cov3d_grad_res);
+            op::reinterpret_cast_array_nd<3>($dscale_res)[i] = dscale;
+            op::reinterpret_cast_array_nd<4>($dquat_res)[i] = dquat;
+
+            auto normed_dir = (point).op<op::normalize>();
+            auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1)};
+            auto dsh_ptr = op::reinterpret_cast_array_nd<3>($dcolor_sh_res) + i * {(degree + 1) * (degree + 1)};
+            auto color_grad = op::reinterpret_cast_array_nd<3>($dcolor)[i];
+
+            uint8_t nn_packed = $sh_to_rgb_ne_0[i];
+            bool rgb0_ne_0 = nn_packed & 0x1;
+            bool rgb1_ne_0 = nn_packed & 0x2;
+            bool rgb2_ne_0 = nn_packed & 0x4;
+            color_grad[0] *= rgb0_ne_0 ? 0.0f : 1.0f;
+            color_grad[1] *= rgb1_ne_0 ? 0.0f : 1.0f;
+            color_grad[2] *= rgb2_ne_0 ? 0.0f : 1.0f;
+            
+            auto dnormed_dir = Gaussian3D::sh_dir_to_rgb_grad<{degree}>(color_grad, dsh_ptr,
+                normed_dir, sh_ptr);
+            dxyz += dnormed_dir.op<op::normalize_grad>(point);
+            op::reinterpret_cast_array_nd<3>($dxyz_res)[i] = dxyz;
+
+            """)
         return grad_model
 
 
@@ -929,12 +1055,14 @@ class _RasterizeGaussians(torch.autograd.Function):
             ctx.save_for_backward(
                 # ctx tensors
                 fwd_ctx.conic_opacity,
-                fwd_ctx.tiles_touched,
+                fwd_ctx.radii,
                 fwd_ctx.uvs,
                 fwd_ctx.rgb_gaussian,
                 fwd_ctx.gaussian_idx_sorted,
                 fwd_ctx.workload_ranges,
                 fwd_ctx.cov3d_vecs,
+                fwd_ctx.cov2d_vecs,
+                fwd_ctx.sh_to_rgb_ne_0,
                 fwd_ctx.depths,
                 # model tensors
                 xyz,
@@ -943,6 +1071,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 quaternion_xyzw,
                 opacity,
                 # outputs
+                out.final_n_contrib,
                 out.final_color,
                 out.final_depth,
                 out.final_custom_features,
@@ -967,37 +1096,43 @@ class _RasterizeGaussians(torch.autograd.Function):
             return (None, ) * 8
 
         out = GaussianSplatOutput(
+            final_n_contrib=ctx.saved_tensors[-5],
             final_color=ctx.saved_tensors[-4],
             final_depth=ctx.saved_tensors[-3],
             final_custom_features=ctx.saved_tensors[-2],
             final_T=ctx.saved_tensors[-1],
+            
         )
         fwd_ctx = GaussianSplatForwardContext(
             conic_opacity=ctx.saved_tensors[0],
-            tiles_touched=ctx.saved_tensors[1],
+            radii=ctx.saved_tensors[1],
             uvs=ctx.saved_tensors[2],
             rgb_gaussian=ctx.saved_tensors[3],
             gaussian_idx_sorted=ctx.saved_tensors[4],
             workload_ranges=ctx.saved_tensors[5],
             image_shape_wh=ctx.image_shape_wh,
             cov3d_vecs=ctx.saved_tensors[6],
-            depths=ctx.saved_tensors[7],
+            cov2d_vecs=ctx.saved_tensors[7],
+            sh_to_rgb_ne_0=ctx.saved_tensors[8],
+            depths=ctx.saved_tensors[9],
         )
         model = GaussianModelOrigin(
-            xyz=ctx.saved_tensors[8],
-            color_sh=ctx.saved_tensors[9],
-            scale=ctx.saved_tensors[10],
-            quaternion_xyzw=ctx.saved_tensors[11],
-            opacity=ctx.saved_tensors[12],
+            xyz=ctx.saved_tensors[10],
+            color_sh=ctx.saved_tensors[11],
+            scale=ctx.saved_tensors[12],
+            quaternion_xyzw=ctx.saved_tensors[13],
+            opacity=ctx.saved_tensors[14],
             act_applied=True,
         )
+        op: GaussianSplatForward = ctx.op
+        if op.cfg.transmittance_is_double:
+            dT = dT.float()
         gradient = GaussianSplatGradients(
             drgb=drgb,
             ddepth=ddepth,
             dcustom_features=dcustom_features,
-            dT=dT,
+            dT=dT # .float(),
         )
-        op: GaussianSplatForward = ctx.op
         cams: list[BasicPinholeCamera] = ctx.cams
         grad_out = op.backward(model, cams, fwd_ctx, out, gradient)
         return grad_out.xyz, grad_out.color_sh, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, None

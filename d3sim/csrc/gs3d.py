@@ -35,48 +35,48 @@ class Gaussian3D(pccm.Class):
     def __init__(self):
         super().__init__()
         self.add_dependency(TensorViewArrayLinalg, TensorViewNVRTC)
-        if compat.IsAppleSiliconMacOs:
-            self.add_code_before_class("""
-            constant float SH_C0 = 0.28209479177387814f;
-            constant float SH_C1 = 0.4886025119029199f;
-            constant float SH_C2[5] = {
-                1.0925484305920792f,
-                -1.0925484305920792f,
-                0.31539156525252005f,
-                -1.0925484305920792f,
-                0.5462742152960396f
-            };
-            constant float SH_C3[7] = {
-                -0.5900435899266435f,
-                2.890611442640554f,
-                -0.4570457994644658f,
-                0.3731763325901154f,
-                -0.4570457994644658f,
-                1.445305721320277f,
-                -0.5900435899266435f
-            };
-            """)
-        else:
-            self.add_code_before_class("""
-            __device__ const float SH_C0 = 0.28209479177387814f;
-            __device__ const float SH_C1 = 0.4886025119029199f;
-            __device__ const float SH_C2[5] = {
-                1.0925484305920792f,
-                -1.0925484305920792f,
-                0.31539156525252005f,
-                -1.0925484305920792f,
-                0.5462742152960396f
-            };
-            __device__ const float SH_C3[7] = {
-                -0.5900435899266435f,
-                2.890611442640554f,
-                -0.4570457994644658f,
-                0.3731763325901154f,
-                -0.4570457994644658f,
-                1.445305721320277f,
-                -0.5900435899266435f
-            };
-            """)
+        # if compat.IsAppleSiliconMacOs:
+        #     self.add_code_before_class("""
+        #     constant float SH_C0 = 0.28209479177387814f;
+        #     constant float SH_C1 = 0.4886025119029199f;
+        #     constant float SH_C2[5] = {
+        #         1.0925484305920792f,
+        #         -1.0925484305920792f,
+        #         0.31539156525252005f,
+        #         -1.0925484305920792f,
+        #         0.5462742152960396f
+        #     };
+        #     constant float SH_C3[7] = {
+        #         -0.5900435899266435f,
+        #         2.890611442640554f,
+        #         -0.4570457994644658f,
+        #         0.3731763325901154f,
+        #         -0.4570457994644658f,
+        #         1.445305721320277f,
+        #         -0.5900435899266435f
+        #     };
+        #     """)
+        # else:
+        #     self.add_code_before_class("""
+        #     __device__ const float SH_C0 = 0.28209479177387814f;
+        #     __device__ const float SH_C1 = 0.4886025119029199f;
+        #     __device__ const float SH_C2[5] = {
+        #         1.0925484305920792f,
+        #         -1.0925484305920792f,
+        #         0.31539156525252005f,
+        #         -1.0925484305920792f,
+        #         0.5462742152960396f
+        #     };
+        #     __device__ const float SH_C3[7] = {
+        #         -0.5900435899266435f,
+        #         2.890611442640554f,
+        #         -0.4570457994644658f,
+        #         0.3731763325901154f,
+        #         -0.4570457994644658f,
+        #         1.445305721320277f,
+        #         -0.5900435899266435f
+        #     };
+        #     """)
     
     @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
     def sh_dir_to_rgb(self):
@@ -148,7 +148,7 @@ class Gaussian3D(pccm.Class):
         T y = dir[1];
         T z = dir[2];
 
-        dsh_ptr[0] = T(SH_C0) * drgb;
+        dsh_ptr[0] = T({SHConstants.C0}) * drgb;
         if (Degree > 0)
         {{
             T dRGBdsh1 = -T({SHConstants.C1}) * y;
@@ -230,6 +230,108 @@ class Gaussian3D(pccm.Class):
         """)
         return code.ret("tv::array<T, 3>")
 
+    # @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def sh_dir_to_rgb_grad_v2(self):
+        code = pccm.code()
+        code.nontype_targ("Degree", "int")
+        code.arg("drgb", "tv::array<float, 3>")
+        code.arg("dsh_ptr", "TV_METAL_DEVICE tv::array<float, 3>*")
+        code.arg("dir", "tv::array<float, 3>")
+        code.arg("sh_ptr", "TV_METAL_DEVICE const tv::array<float, 3>*")
+        code.raw(f"""
+        namespace op = tv::arrayops;
+        // op::PointerValueReader<TV_METAL_DEVICE const tv::array<float, 3>> sh(sh_ptr);
+        auto sh = sh_ptr;
+        static_assert(Degree >= 0 && Degree <= 3, "Degree must be in [0, 3]");
+        tv::array<float, 3> dRGBdx{{}};
+        tv::array<float, 3> dRGBdy{{}};
+        tv::array<float, 3> dRGBdz{{}};
+
+        float x = dir[0];
+        float y = dir[1];
+        float z = dir[2];
+
+        dsh_ptr[0] = (SH_C0) * drgb;
+        if (Degree > 0)
+        {{
+            float dRGBdsh1 = -(SH_C1) * y;
+            float dRGBdsh2 = (SH_C1) * z;
+            float dRGBdsh3 = -(SH_C1) * x;
+            dsh_ptr[1] = dRGBdsh1 * drgb;
+            dsh_ptr[2] = dRGBdsh2 * drgb;
+            dsh_ptr[3] = dRGBdsh3 * drgb;
+
+            dRGBdx = -(SH_C1) * sh[3];
+            dRGBdy = -(SH_C1) * sh[1];
+            dRGBdz = (SH_C1) * sh[2];
+
+            if (Degree > 1)
+            {{
+                float xx = x * x, yy = y * y, zz = z * z;
+                float xy = x * y, yz = y * z, xz = x * z;
+                float dRGBdsh4 = (SH_C2[0]) * xy;
+                float dRGBdsh5 = (SH_C2[1]) * yz;
+                float dRGBdsh6 = (SH_C2[2]) * (2.0f * zz - xx - yy);
+                float dRGBdsh7 = (SH_C2[3]) * xz;
+                float dRGBdsh8 = (SH_C2[4]) * (xx - yy);
+                dsh_ptr[4] = dRGBdsh4 * drgb;
+                dsh_ptr[5] = dRGBdsh5 * drgb;
+                dsh_ptr[6] = dRGBdsh6 * drgb;
+                dsh_ptr[7] = dRGBdsh7 * drgb;
+                dsh_ptr[8] = dRGBdsh8 * drgb;
+
+                dRGBdx += (SH_C2[0]) * y * sh[4] + (SH_C2[2]) * 2.0f * -x * sh[6] + (SH_C2[3]) * z * sh[7] + (SH_C2[4]) * 2.0f * x * sh[8];
+                dRGBdy += (SH_C2[0]) * x * sh[4] + (SH_C2[1]) * z * sh[5] + (SH_C2[2]) * 2.0f * -y * sh[6] + (SH_C2[4]) * 2.0f * -y * sh[8];
+                dRGBdz += (SH_C2[1]) * y * sh[5] + (SH_C2[2]) * 2.0f * 2.0f * z * sh[6] + (SH_C2[3]) * x * sh[7];
+                
+                if (Degree > 2)
+                {{
+                    float dRGBdsh9 = (SH_C3[0]) * y * (3.0f * xx - yy);
+                    float dRGBdsh10 = (SH_C3[1]) * xy * z;
+                    float dRGBdsh11 = (SH_C3[2]) * y * (4.0f * zz - xx - yy);
+                    float dRGBdsh12 = (SH_C3[3]) * z * (2.0f * zz - 3.0f * xx - 3.0f * yy);
+                    float dRGBdsh13 = (SH_C3[4]) * x * (4.0f * zz - xx - yy);
+                    float dRGBdsh14 = (SH_C3[5]) * z * (xx - yy);
+                    float dRGBdsh15 = (SH_C3[6]) * x * (xx - 3.0f * yy);
+                    dsh_ptr[9] = dRGBdsh9 * drgb;
+                    dsh_ptr[10] = dRGBdsh10 * drgb;
+                    dsh_ptr[11] = dRGBdsh11 * drgb;
+                    dsh_ptr[12] = dRGBdsh12 * drgb;
+                    dsh_ptr[13] = dRGBdsh13 * drgb;
+                    dsh_ptr[14] = dRGBdsh14 * drgb;
+                    dsh_ptr[15] = dRGBdsh15 * drgb;
+
+                    dRGBdx += (
+                        (SH_C3[0]) * sh[9] * 3.0f * 2.0f * xy +
+                        (SH_C3[1]) * sh[10] * yz +
+                        (SH_C3[2]) * sh[11] * -2.0f * xy +
+                        (SH_C3[3]) * sh[12] * -3.0f * 2.0f * xz +
+                        (SH_C3[4]) * sh[13] * (-3.0f * xx + 4.0f * zz - yy) +
+                        (SH_C3[5]) * sh[14] * 2.0f * xz +
+                        (SH_C3[6]) * sh[15] * 3.0f * (xx - yy));
+
+                    dRGBdy += (
+                        (SH_C3[0]) * sh[9] * 3.0f * (xx - yy) +
+                        (SH_C3[1]) * sh[10] * xz +
+                        (SH_C3[2]) * sh[11] * (-3.0f * yy + 4.0f * zz - xx) +
+                        (SH_C3[3]) * sh[12] * -3.0f * 2.0f * yz +
+                        (SH_C3[4]) * sh[13] * -2.0f * xy +
+                        (SH_C3[5]) * sh[14] * -2.0f * yz +
+                        (SH_C3[6]) * sh[15] * -3.0f * 2.0f * xy);
+
+                    dRGBdz += (
+                        (SH_C3[1]) * sh[10] * xy +
+                        (SH_C3[2]) * sh[11] * 4.0f * 2.0f * yz +
+                        (SH_C3[3]) * sh[12] * 3.0f * (2.0f * zz - xx - yy) +
+                        (SH_C3[4]) * sh[13] * 4.0f * 2.0f * xz +
+                        (SH_C3[5]) * sh[14] * (xx - yy));
+                }}
+            }}
+        }}
+        tv::array<float, 3> ddir{{dRGBdx.template op<op::dot>(drgb), dRGBdy.template op<op::dot>(drgb), dRGBdz.template op<op::dot>(drgb)}};
+        return ddir;
+        """)
+        return code.ret("tv::array<float, 3>")
 
     @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
     def scale_quat_to_cov3d(self):
@@ -288,9 +390,11 @@ class Gaussian3D(pccm.Class):
     def project_gaussian_to_2d(self):
         code = pccm.code()
         code.targ("T")
+        code.nontype_targ("C2wRows", "size_t")
+
         code.arg("mean_camera", "tv::array<T, 3>")
         code.arg("focal_length, tan_fov", "tv::array<T, 2>")
-        code.arg("cam2world_T", "tv::array_nd<T, 4, 3>")
+        code.arg("cam2world_T", "tv::array_nd<T, C2wRows, 3>")
         code.arg("cov3d_vec", "tv::array_nd<T, 6>")
 
         code.arg("clamp_factor", "T", "1.3f")
@@ -298,11 +402,10 @@ class Gaussian3D(pccm.Class):
         code.raw(f"""
         namespace op = tv::arrayops;
         using math_op_t = tv::arrayops::MathScalarOp<T>;
-        auto limit = tan_fov * clamp_factor * mean_camera[2];
+        auto limit = (tan_fov * clamp_factor * mean_camera[2]).template op<op::abs>();
         auto txylimit = op::slice<0, 2>(mean_camera).template op<op::clamp>(-limit, limit);
         auto txylimit_focal = txylimit * focal_length;
         auto tz_square = mean_camera[2] * mean_camera[2];
-
         // we need T = W.T @ J.T, if @ is colmajor, we need 
         // W.T stored as colmajor and J.T stored as colmajor,
         // so store W as rowmajor and J as rowmajor.
@@ -337,11 +440,13 @@ class Gaussian3D(pccm.Class):
     def project_gaussian_to_2d_grad(self):
         code = pccm.code()
         code.targ("T")
+        code.nontype_targ("C2wRows", "size_t")
+
         code.arg("dcov2d", "tv::array<T, 3>")
 
         code.arg("mean_camera", "tv::array<T, 3>")
         code.arg("focal_length, tan_fov", "tv::array<T, 2>")
-        code.arg("cam2world_T", "tv::array_nd<T, 4, 3>")
+        code.arg("cam2world_T", "tv::array_nd<T, C2wRows, 3>")
         code.arg("cov3d_vec", "tv::array_nd<T, 6>")
 
         code.arg("clamp_factor", "T", "1.3f")
@@ -349,7 +454,7 @@ class Gaussian3D(pccm.Class):
         code.raw(f"""
         namespace op = tv::arrayops;
         using math_op_t = tv::arrayops::MathScalarOp<T>;
-        auto limit = tan_fov * clamp_factor * mean_camera[2];
+        auto limit = (tan_fov * clamp_factor * mean_camera[2]).template op<op::abs>();
         auto txylimit_focal = op::slice<0, 2>(mean_camera).template op<op::clamp>(-limit, limit) * focal_length;
 
         T x_limit_grad = (mean_camera[0] < -limit[0] || mean_camera[0] > limit[0]) ? T(0) : T(1);
@@ -366,7 +471,7 @@ class Gaussian3D(pccm.Class):
             tv::array<T, 3>{{0, focal_length[1] / mean_camera[2], -txylimit_focal[1] * tz_square_inv}},
         }};
         auto world2cam_T_cm = op::slice<0, 3>(cam2world_T);
-        
+    
         tv::array_nd<T, 2, 3> W_T_matmul_J_T_cm = world2cam_T_cm.template op<op::mm_nnn>(J_T_cm);
         tv::array_nd<T, 3, 3> Vrk{{
             tv::array<T, 3>{{cov3d_vec[0], cov3d_vec[1], cov3d_vec[2]}},
@@ -377,18 +482,17 @@ class Gaussian3D(pccm.Class):
         // Projected Cov = J @ W @ Cov @ W.T @ J.T
         // = W_T_matmul_J_T_cm.T @ Vrk @ W_T_matmul_J_T_cm
         auto dVrk = dcov_2d.template op<op::variance_transform_nnn_grad_rfs>(W_T_matmul_J_T_cm.template op<op::transpose>(), Vrk);
-        
         tv::array<T, 6> dcov3d_vec{{
             dVrk[0][0], T(2) * dVrk[0][1], T(2) * dVrk[0][2],
             dVrk[1][1], T(2) * dVrk[1][2], dVrk[2][2]
         }};
         tv::array_nd<T, 2, 3> dW_T_matmul_J_T_cm = dcov_2d.template op<op::symmetric_variance_transform_nnn_grad_lfs>(W_T_matmul_J_T_cm.template op<op::transpose>(), Vrk).template op<op::transpose>();
-        auto dJ_T_cm = dW_T_matmul_J_T_cm.template op<op::mm_nnn_grad_rfs>(world2cam_T_cm, J_T_cm);
+        tv::array_nd<T, 2, 3> dJ_T_cm = dW_T_matmul_J_T_cm.template op<op::mm_nnn_grad_rfs>(world2cam_T_cm, J_T_cm);
         tv::array<T, 3> dmean{{
-            -dJ_T_cm[0][2] * focal_length[0] * tz_square_inv * x_limit_grad,
-            -dJ_T_cm[1][2] * focal_length[1] * tz_square_inv * y_limit_grad,
+            x_limit_grad * -dJ_T_cm[0][2] * focal_length[0] * tz_square_inv,
+            y_limit_grad * -dJ_T_cm[1][2] * focal_length[1] * tz_square_inv,
             (-(focal_length[0] * dJ_T_cm[0][0] + focal_length[1] * dJ_T_cm[1][1]) * tz_square_inv + 
-             2 * (dJ_T_cm[0][2] * txylimit_focal[0] + dJ_T_cm[1][2] * txylimit_focal[1]) / tz_3)
+             T(2) * (dJ_T_cm[0][2] * txylimit_focal[0] + dJ_T_cm[1][2] * txylimit_focal[1]) / tz_3)
         }};
         return std::make_tuple(dmean, dcov3d_vec);
         """)
