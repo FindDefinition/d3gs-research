@@ -380,7 +380,6 @@ class Gaussian3D(pccm.Class):
             dL_dM_T[1].template op<op::dot>(R[1]),
             dL_dM_T[2].template op<op::dot>(R[2])
         }};
-        // 
         auto dL_dquat = (dL_dM_T * op::reshape<-1, 1>(scale)).template op<op::uqmat_colmajor_grad>(quat);
         return std::make_tuple(dL_dscale, dL_dquat);
         """)
@@ -413,7 +412,6 @@ class Gaussian3D(pccm.Class):
         tv::array_nd<T, 2, 3> J_T_cm{{
             tv::array<T, 3>{{focal_length[0] / mean_camera[2], 0, -txylimit_focal[0] / tz_square}},
             tv::array<T, 3>{{0, focal_length[1] / mean_camera[2], -txylimit_focal[1] / tz_square}},
-            // tv::array<T, 3>{{0, 0, 0}},
         }};
         // world2cam_T = cam2world_T.inverse() = cam2world_T.T
         // so world2cam_T_cm = cam2world_T

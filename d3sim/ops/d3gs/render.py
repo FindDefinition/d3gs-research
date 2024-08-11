@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from pyexpat import model
+from tabnanny import verbose
 import time
 from typing import Annotated, Literal
 from d3sim.core import dataclass_dispatch as dataclasses
@@ -51,7 +52,7 @@ def focal2fov(focal: float, length: int):
     return 2 * math.atan(float(length) / (2 * focal))
 
 
-_DEFAULT_ENABLE_32BIT_SORT = True if IsAppleSiliconMacOs else False
+_DEFAULT_ENABLE_32BIT_SORT = False if IsAppleSiliconMacOs else False
 
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
@@ -60,7 +61,7 @@ class GaussianSplatConfig:
     eps: float = 1e-6
     cov2d_radii_eigen_eps: float = 0.1
     projected_clamp_factor: float = 1.3
-    gaussian_std_sigma: float = 2.0 if IsAppleSiliconMacOs else 3.0
+    gaussian_std_sigma: float = 3.0 if IsAppleSiliconMacOs else 3.0
     gaussian_lowpass_filter: float = 0.3
     alpha_eps: float = 1.0 / 255.0
     transmittance_eps: float = 0.0001
@@ -75,8 +76,10 @@ class GaussianSplatConfig:
     render_rgba: bool = False
 
     transmittance_is_double = False
-    _bg_color_device: torch.Tensor | None = None
     backward_reduction: Literal["none", "warp", "block"] = "warp"
+    verbose: bool = False
+
+    _bg_color_device: torch.Tensor | None = None
 
     @property 
     def num_channels(self):
@@ -153,7 +156,7 @@ class GaussianSplatForward:
         assert model.act_applied, "model must be activated before render"
         num = len(model)
         scale_global = self.cfg.scale_global
-        enable_verbose = False
+        enable_verbose = self.cfg.verbose
         enable_32bit_sort = self.cfg.enable_32bit_sort
         if len(cameras) > 1:
             raise NotImplementedError("multi camera not supported yet")
@@ -537,10 +540,8 @@ class GaussianSplatForward:
                 dcolor=dcolor,
                 dcustom_features=dcustom_features)
         bwd_reduce_method = self.cfg.backward_reduction
-        # print(final_n_contrib.max(), final_n_contrib.float().mean())
         t_dtype = "double" if self.cfg.transmittance_is_double else "float"
         use_bwd_reduce = bwd_reduce_method != "none"
-        # with tv.measure_and_print("BWD-rasterize-outer"):
         kernel_unique_name = (
             f"rasterize_{is_bwd}_{self.cfg.tile_size}"
             f"_{num_custom_feat}_{self.cfg.render_depth}"
@@ -552,13 +553,12 @@ class GaussianSplatForward:
         namespace op = tv::arrayops;
         using math_op_t = tv::arrayops::MathScalarOp<float>;
         """)
+        # when use raw kernel, we don't use nonuniform grid to
+        # keep logic same as cuda.
+        launch_param = tv.LaunchParam(
+            (tile_num_x, tile_num_y, 1),
+            (self.cfg.tile_size[0], self.cfg.tile_size[1], 1))
         if IsAppleSiliconMacOs:
-            # metal nonuniform group, metal divide grid automatically.
-            # launch_param = tv.LaunchParam((width, height, 1), (self.cfg.tile_size[0], self.cfg.tile_size[1], 1))
-            launch_param = tv.LaunchParam(
-                (tile_num_x, tile_num_y, 1),
-                (self.cfg.tile_size[0], self.cfg.tile_size[1], 1))
-
             code_rasterize.raw(f"""
             tv::array<uint32_t, 2> pixel_idx_xy{{threadPositionInGrid.x, threadPositionInGrid.y}};
             tv::array<uint32_t, 2> tile_idx_xy{{threadgroupPositionInGrid.x, threadgroupPositionInGrid.y}};
@@ -566,7 +566,6 @@ class GaussianSplatForward:
             threadgroup int num_done_shared[32];
             uint thread_rank = threadPositionInThreadgroup.y * {self.cfg.tile_size[0]} + threadPositionInThreadgroup.x;
             """)
-
         else:
             launch_param = tv.LaunchParam(
                 (tile_num_x, tile_num_y, 1),
@@ -689,11 +688,6 @@ class GaussianSplatForward:
                 auto render_depth = $final_depth[pixel_id];
                 auto ddepth = $(grad.ddepth)[pixel_id];
                 """)
-        # if num_custom_feat > 0:
-        #     code_rasterize.raw(f"""
-        #     tv::array<float, {num_custom_feat}> custom_feature{{}};
-        #     """)
-
         with code_rasterize.for_(
                 f"int i = 0; i < rounds; ++i, toDo -= {block_size}"):
             if IsAppleSiliconMacOs:
@@ -777,13 +771,14 @@ class GaussianSplatForward:
                     elif bwd_reduce_method == "block":
                         # don't support block reduce for metal
                         # block reduce currently greatly slower
-                        # than warp reduce, so we don't need to use it.
-                        code_rasterize.raw(f"""
-                        // avoid empty atomic write
-                        if (!__syncthreads_or(valid)){{
-                            continue;
-                        }}
-                        """)
+                        # than warp reduce, so we don't need to support it.
+                        if not IsAppleSiliconMacOs:
+                            code_rasterize.raw(f"""
+                            // avoid empty atomic write
+                            if (!__syncthreads_or(valid)){{
+                                continue;
+                            }}
+                            """)
                 else:
                     if is_bwd:
                         code_rasterize.raw(f"""
@@ -855,7 +850,6 @@ class GaussianSplatForward:
                         """)
                     if is_bwd:
                         code_rasterize.raw(f"""
-                        // auto suffix = render_rgb - rgb;
                         float dL_dalpha_without_div = (drgb_array.op<op::dot>(T * rgb_val - render_rgb));
                         // grad from T, we don't apply background when training, apply it in torch side.
                         dL_dalpha_without_div += -dT_val * render_T;
@@ -1010,7 +1004,7 @@ class GaussianSplatForward:
         #         }}
         #     }}
         #     """)
-        with tv.measure_and_print(f"BWD-rasterize-{gaussian_idx_sorted_tv.shape[0]}"):
+        with measure_and_print_torch(f"BWD-rasterize-{gaussian_idx_sorted_tv.shape[0]}", enable=self.cfg.verbose):
             INLINER.kernel_raw(kernel_unique_name, launch_param, code_rasterize)
         # if is_bwd:
         #     # print(INLINER.get_nvrtc_module(kernel_unique_name).params.debug_code)
@@ -1021,7 +1015,8 @@ class GaussianSplatForward:
     def backward(self, model: GaussianModelBase,
                  cameras: list[BasicPinholeCamera],
                  ctx: GaussianSplatForwardContext, out: GaussianSplatOutput,
-                 grad: GaussianSplatGradients):
+                 grad: GaussianSplatGradients,
+                 return_uv_grad: bool = False):
         if len(cameras) > 1:
             raise NotImplementedError("multi camera not supported yet")
         num = model.xyz.shape[0]
@@ -1096,12 +1091,11 @@ class GaussianSplatForward:
             auto principal_point = $principal_point_np;
             auto tan_fov = $tanfov_xy_np;
             auto resolution_wh = $resolution_wh_np;
-            auto point = op::reinterpret_cast_array_nd<3>($xyz)[i] - cam2world_center;
+            auto point = op::reinterpret_cast_array_nd<3>($xyz)[i];
+            point = point - cam2world_center;
 
             auto point_cam = cam2world_R_T.op<op::mv_rowmajor>(point);
             auto cov2d_arr = op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i];
-            // conic_arr[0] += $(self.cfg.gaussian_lowpass_filter);
-            // conic_arr[2] += $(self.cfg.gaussian_lowpass_filter);
             
             auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, 0.0f, point_cam, principal_point, focal_xy);
             auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad(conic_grad, cov2d_arr);
@@ -1141,7 +1135,9 @@ class GaussianSplatForward:
             op::reinterpret_cast_array_nd<3>($dxyz_res)[i] = dxyz;
 
             """)
-        return grad_model
+        if return_uv_grad:
+            return grad_model, duv
+        return grad_model, None
 
 
 class _RasterizeGaussians(torch.autograd.Function):
@@ -1159,6 +1155,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         # options
         training,
         gaussian_cfg: GaussianSplatConfig,
+        uv_grad_holder=None,
     ):
         op = GaussianSplatForward(gaussian_cfg)
         model = GaussianModelOrigin(
@@ -1201,6 +1198,7 @@ class _RasterizeGaussians(torch.autograd.Function):
 
         ctx.op = op
         ctx.cams = cameras
+        ctx.return_uv_grad = uv_grad_holder is not None
         # else:
         #     ctx.save_for_backward()
         # torch autograd func only support tuple output
@@ -1213,7 +1211,7 @@ class _RasterizeGaussians(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, drgb, ddepth, dcustom_features, dT, dn_contrib):
         if len(ctx.saved_tensors) == 0:
-            return (None, ) * 8
+            return (None, ) * 9
         with tv.measure_and_print("BWD-torch"):
 
             out = GaussianSplatOutput(
@@ -1254,8 +1252,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 dT=dT # .float(),
             )
             cams: list[BasicPinholeCamera] = ctx.cams
-        grad_out = op.backward(model, cams, fwd_ctx, out, gradient)
-        return grad_out.xyz, grad_out.color_sh, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, None
+        grad_out, duv = op.backward(model, cams, fwd_ctx, out, gradient, ctx.return_uv_grad)
+        return grad_out.xyz, grad_out.color_sh, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, None, duv
 
 
 def rasterize_gaussians(
@@ -1264,6 +1262,7 @@ def rasterize_gaussians(
         training=False,
         gaussian_cfg: GaussianSplatConfig = GaussianSplatConfig(),
         background_tensor: torch.Tensor | None = None,
+        uv_grad_holder: torch.Tensor | None = None,
 ):
     if not training:
         assert background_tensor is None, "background_tensor is only used in training mode"
@@ -1277,6 +1276,7 @@ def rasterize_gaussians(
         cameras,
         training,
         gaussian_cfg,
+        uv_grad_holder,
     )
     out = GaussianSplatOutput(
         final_color=res[0],
