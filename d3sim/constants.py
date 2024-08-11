@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import platform 
 
@@ -15,3 +16,5 @@ IsAppleSiliconMacOs = InMacOS and platform.machine() == "arm64"
 D3SIM_DEFAULT_DEVICE = "cuda"
 if IsAppleSiliconMacOs:
     D3SIM_DEFAULT_DEVICE = "mps"
+
+D3SIM_DISABLE_ARRAY_CHECK = os.getenv("D3SIM_DISABLE_ARRAY_CHECK", "0") == "1"

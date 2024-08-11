@@ -86,18 +86,18 @@ def _main_bwd():
         sync()
         print("BWD", time.time() - t)
         assert not mod.act_applied
-        print(dout_color.reshape(3, -1)[:, 1])
-        print(mod.opacity.grad[1], res.final_T.reshape(-1)[1].item())
-        print(opacity_grads.shape, mod.scale.grad.shape)
-        print(torch.linalg.norm(mod.opacity.grad.reshape(opacity_grads.shape) - opacity_grads))
-        print(torch.linalg.norm(mod.scale.grad - scale_grads))
-        print(torch.linalg.norm(mod.quaternion_xyzw.grad - rotation_grads[:, [1, 2, 3, 0]]))
+        # print(dout_color.reshape(3, -1)[:, 1])
+        # print(mod.opacity.grad[1], res.final_T.reshape(-1)[1].item())
+        # print(opacity_grads.shape, mod.scale.grad.shape)
+        # print(torch.linalg.norm(mod.opacity.grad.reshape(opacity_grads.shape) - opacity_grads))
+        # print(torch.linalg.norm(mod.scale.grad - scale_grads))
+        # print(torch.linalg.norm(mod.quaternion_xyzw.grad - rotation_grads[:, [1, 2, 3, 0]]))
 
-        # print(torch.linalg.norm(mod.color_sh.grad - feature_grads))
-        print(mod.xyz.grad[1])
-        print(xyz_grads[1])
-        print(torch.linalg.norm(mod.xyz.grad - xyz_grads))
-        breakpoint()
+        # # print(torch.linalg.norm(mod.color_sh.grad - feature_grads))
+        # print(mod.xyz.grad[1])
+        # print(xyz_grads[1])
+        # print(torch.linalg.norm(mod.xyz.grad - xyz_grads))
+        # breakpoint()
 
 def _main():
     mod, cam = _load_model_and_cam()
@@ -130,4 +130,4 @@ def _main():
 
     
 if __name__ == "__main__":
-    _main_bwd()
+    _main()

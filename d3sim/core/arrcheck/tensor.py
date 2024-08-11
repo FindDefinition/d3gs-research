@@ -1,6 +1,7 @@
 from types import EllipsisType, UnionType
 from typing import Annotated, Any, Generic, Literal, Sequence, TypeAlias, TypeVar, Union, get_args, get_type_hints, Type
 import numpy as np 
+from d3sim.constants import D3SIM_DISABLE_ARRAY_CHECK
 from d3sim.core import dataclass_dispatch as dataclasses
 from d3sim.core.arrcheck.dtypes import DType, Float32, Float64, get_dtype_to_np_dtype, get_dtype_to_th_dtype
 from pydantic import (
@@ -105,8 +106,10 @@ def _check_arr_or_tensor_by_tensor_meta(meta: ArrayCheckBase, arr: np.ndarray | 
 class ArrayValidator(AfterValidator):
     meta: ArrayCheckBase 
 
-def ArrayCheck(shape: Sequence[int | str | EllipsisType], dtypes: DType, device: Literal["cpu", "gpu"] | None = None) -> AfterValidator:
+def ArrayCheck(shape: Sequence[int | str | EllipsisType], dtypes: DType, device: Literal["cpu", "gpu"] | None = None) -> AfterValidator | None:
     meta = ArrayCheckBase(shape, dtypes, device)
+    if D3SIM_DISABLE_ARRAY_CHECK:
+        return None 
     return ArrayValidator(lambda x: _check_arr_or_tensor_by_tensor_meta(meta, x), meta)
 
 

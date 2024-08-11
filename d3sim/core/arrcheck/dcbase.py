@@ -1,6 +1,7 @@
 
 import sys
 from typing import Any, Sequence
+from d3sim.constants import D3SIM_DISABLE_ARRAY_CHECK
 from d3sim.core import dataclass_dispatch as dataclasses
 from pydantic import field_validator, model_validator
 from typing_extensions import Self 
@@ -43,9 +44,11 @@ def extract_annotated_type_and_meta(ann_type: Any) -> tuple[Any, Any]:
 
 
 @dataclasses.dataclass
-class DataClassWithArrayCheck:
+class DataClassWithArrayCheck:    
     @model_validator(mode='after')
     def _validator_post(self) -> Self:
+        if D3SIM_DISABLE_ARRAY_CHECK:
+            return self
         annos = get_type_hints(type(self), include_extras=True)
         all_metas: list[ArrayCheckBase] = []
         all_real_shapes: list[Sequence[int]] = []

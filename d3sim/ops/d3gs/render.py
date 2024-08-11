@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from pyexpat import model
 import time
 from typing import Annotated, Literal
@@ -75,7 +76,7 @@ class GaussianSplatConfig:
 
     transmittance_is_double = False
     _bg_color_device: torch.Tensor | None = None
-    backward_reduction: Literal["none", "warp", "block"] = "none"
+    backward_reduction: Literal["none", "warp", "block"] = "warp"
 
     @property 
     def num_channels(self):
@@ -535,8 +536,17 @@ class GaussianSplatForward:
                 dopacity=dopacity,
                 dcolor=dcolor,
                 dcustom_features=dcustom_features)
+        bwd_reduce_method = self.cfg.backward_reduction
         # print(final_n_contrib.max(), final_n_contrib.float().mean())
         t_dtype = "double" if self.cfg.transmittance_is_double else "float"
+        use_bwd_reduce = bwd_reduce_method != "none"
+        # with tv.measure_and_print("BWD-rasterize-outer"):
+        kernel_unique_name = (
+            f"rasterize_{is_bwd}_{self.cfg.tile_size}"
+            f"_{num_custom_feat}_{self.cfg.render_depth}"
+            f"_{self.cfg.use_nchw}_{self.cfg.render_rgba}"
+            f"_{final_n_contrib is None}_{t_dtype}_{self.cfg.backward_reduction}")
+
         code_rasterize = pccm.code()
         code_rasterize.raw(f"""
         namespace op = tv::arrayops;
@@ -552,22 +562,10 @@ class GaussianSplatForward:
             code_rasterize.raw(f"""
             tv::array<uint32_t, 2> pixel_idx_xy{{threadPositionInGrid.x, threadPositionInGrid.y}};
             tv::array<uint32_t, 2> tile_idx_xy{{threadgroupPositionInGrid.x, threadgroupPositionInGrid.y}};
-            bool inside = pixel_idx_xy[0] < $width && pixel_idx_xy[1] < $height;
             // keep in mind that metal only have 32KB shared memory
-            threadgroup int collected_id[{block_size}];
-            threadgroup float2 collected_xy[{block_size}];
-            threadgroup float4 collected_conic_opacity[{block_size}];
             threadgroup int num_done_shared[32];
             uint thread_rank = threadPositionInThreadgroup.y * {self.cfg.tile_size[0]} + threadPositionInThreadgroup.x;
             """)
-            if color_use_smem:
-                code_rasterize.raw(f"""
-                threadgroup float collected_rgb_gaussian[{block_size * 3}];
-                """)
-            if render_depth:
-                code_rasterize.raw(f"""
-                threadgroup float collected_depth[{block_size}];
-                """)
 
         else:
             launch_param = tv.LaunchParam(
@@ -576,22 +574,39 @@ class GaussianSplatForward:
             code_rasterize.raw(f"""
             tv::array<uint32_t, 2> pixel_idx_xy{{blockIdx.x * {self.cfg.tile_size[0]} + threadIdx.x, blockIdx.y * {self.cfg.tile_size[1]} + threadIdx.y}};
             tv::array<uint32_t, 2> tile_idx_xy{{blockIdx.x, blockIdx.y}};
-            bool inside = pixel_idx_xy[0] < $width && pixel_idx_xy[1] < $height;
-            __shared__ int collected_id[{block_size}];
-            __shared__ float2 collected_xy[{block_size}];
-            __shared__ float4 collected_conic_opacity[{block_size}];
             uint32_t thread_rank = threadIdx.y * {self.cfg.tile_size[0]} + threadIdx.x;
             """)
-            if color_use_smem:
-                code_rasterize.raw(f"""
-                __shared__ float collected_rgb_gaussian[{block_size * 3}];
-                """)
-            if render_depth:
-                code_rasterize.raw(f"""
-                __shared__ float collected_depth[{block_size}];
-                """)
+        code_rasterize.raw(f"""
+        TV_SHARED_MEMORY int collected_id[{block_size}];
+        TV_SHARED_MEMORY float2 collected_xy[{block_size}];
+        TV_SHARED_MEMORY float4 collected_conic_opacity[{block_size}];
+        """)
+        if color_use_smem:
+            code_rasterize.raw(f"""
+            TV_SHARED_MEMORY float collected_rgb_gaussian[{block_size * 3}];
+            """)
+        if render_depth:
+            code_rasterize.raw(f"""
+            TV_SHARED_MEMORY float collected_depth[{block_size}];
+            """)
+        if bwd_reduce_method == "block":
+            code_rasterize.raw(f"""
+            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_drgb_0;
+            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_drgb_1;
+            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_drgb_2;
+            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_dopacity;
+            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_duv_0;
+            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_duv_1;
+            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_dconic_0;
+            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_dconic_1;
+            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_dconic_2;
+            // TV_SHARED_MEMORY float shared_dL_dopacity[{block_size // 32}];
+            TV_SHARED_MEMORY tv::array<int, {block_size // 32}> shared_num_contributor;
+            """)
 
         code_rasterize.raw(f"""
+        bool inside = pixel_idx_xy[0] < $width && pixel_idx_xy[1] < $height;
+
         uint32_t pixel_id = $width * pixel_idx_xy[1] + pixel_idx_xy[0];
         auto pixel_idx_xy_fp = pixel_idx_xy.cast<float>();
 
@@ -613,24 +628,35 @@ class GaussianSplatForward:
             """)
         else:
             code_rasterize.raw(f"""
+            int warp_idx = thread_rank / 32;
+            int lane_idx = tv::parallel::lane_index();
+
             int contributor = inside ? $final_n_contrib[pixel_id] + 1 : 0;
             """)
+            if use_bwd_reduce:
+                code_rasterize.raw(f"""
+                int max_num_contributor = tv::parallel::warp_max(contributor);
+                max_num_contributor = tv::parallel::warp_broadcast(max_num_contributor, 0);
+                """)
+                if bwd_reduce_method == "block":
+                    code_rasterize.raw(f"""
+                    if (lane_idx == 0){{
+                        shared_num_contributor[warp_idx] = max_num_contributor;
+                    }}
+                    tv::parallel::block_sync_shared_io();
+                    max_num_contributor = shared_num_contributor.op<op::reduce_max>();
+                    """) 
+            else:
+                code_rasterize.raw(f"""
+                int max_num_contributor = contributor;
+                """)
             code_rasterize.raw(f"""
             // range[1] = min(range[1], range[0] + real_todo);
             // tv::printf2_once<' ', 1>(contributor, range[1] - range[0]); 
-            int toDo = contributor;
+            int toDo = max_num_contributor;
             // toDo = range[1] - range[0];
             int rounds = tv::div_up(range[1] - range[0], {block_size});
             """)
-
-            if self.cfg.backward_reduction == "warp":
-                code_rasterize.raw(f"""
-                int max_num_contributor = tv::parallel::warp_max(contributor);
-                """)
-            # elif self.cfg.backward_reduction == "block":
-            #     code_rasterize.raw(f"""
-            #     contributor = tv::parallel::warp_sum(contributor);
-            #     """)
 
         if render_depth:
             code_rasterize.raw(f"""
@@ -734,19 +760,48 @@ class GaussianSplatForward:
                                         conic_opacity_vec.y * dist[0] * dist[1]);
                 float G = math_op_t::fast_exp(power); // used in backward
                 float alpha = math_op_t::min(0.99f, conic_opacity_vec.w * G);
-                // TODO if remove the 'f', this kernel runs 4x slower.
-                if (alpha < 1.0f / 255.0f){{
-                    continue;
-                }}
-                float next_T = T * (1.0f - alpha);
+                
                 """)
-                # if is_bwd:
-                #     code_rasterize.raw(f"""
-                #     bool should_done = i * {block_size} + j > contributor;
-                #     should_done = false;
-                #     // should_done = next_T < {self.cfg.transmittance_eps}f;
+                if is_bwd and use_bwd_reduce:
+                    code_rasterize.raw(f"""
+                    float next_T = T * (1.0f - alpha);
+                    bool valid = power <= 0.0f && alpha >= 1.0f / 255.0f && (i * {block_size} + j < contributor); 
+                    """)
+                    if bwd_reduce_method == "warp":
+                        code_rasterize.raw(f"""
+                        // avoid empty atomic write
+                        if (!tv::parallel::warp_any(valid)){{
+                            continue;
+                        }}
+                        """)
+                    elif bwd_reduce_method == "block":
+                        # don't support block reduce for metal
+                        # block reduce currently greatly slower
+                        # than warp reduce, so we don't need to use it.
+                        code_rasterize.raw(f"""
+                        // avoid empty atomic write
+                        if (!__syncthreads_or(valid)){{
+                            continue;
+                        }}
+                        """)
+                else:
+                    if is_bwd:
+                        code_rasterize.raw(f"""
+                        // TODO if remove the 'f', this kernel runs 4x slower.
+                        if (alpha < 1.0f / 255.0f || power > 0.0f){{
+                            continue;
+                        }}
+                        float next_T = T * (1.0f - alpha);
+                        """)
 
-                #     """)
+                    else:
+                        code_rasterize.raw(f"""
+                        // TODO if remove the 'f', this kernel runs 4x slower.
+                        if (alpha < 1.0f / 255.0f){{
+                            continue;
+                        }}
+                        float next_T = T * (1.0f - alpha);
+                        """)
                 if not is_bwd:
                     code_rasterize.raw(f"""
                     bool should_done = next_T < {self.cfg.transmittance_eps}f;
@@ -755,95 +810,163 @@ class GaussianSplatForward:
                         continue;
                     }}
                     """)
-                code_rasterize.raw(f"""
-                float weight = alpha * T;
-                T = next_T;
-                // last_contributor = contributor;
-                auto gaussian_id = collected_id[j];
-                """)
-                if not is_bwd:
+                ifctx = nullcontext()
+                if is_bwd and use_bwd_reduce:
                     code_rasterize.raw(f"""
-                    weight_sum += weight;
-                    contributor = i * {block_size} + j;
+                    tv::array<float, 3> dL_drgb{{}};
+                    tv::array<float, 2> dL_duv{{}};
+                    tv::array<float, 3> dL_dcov2d{{}};
+                    float dL_dopacity = 0.0f;
                     """)
-                if color_use_smem:
+                    ifctx = code_rasterize.if_("valid")
+                with ifctx:
                     code_rasterize.raw(f"""
-                    auto rgb_val = op::reinterpret_cast_array_nd<3>(collected_rgb_gaussian)[j];
+                    float weight = alpha * T;
+                    T = next_T;
                     """)
-                else:
-                    code_rasterize.raw(f"""
-                    auto rgb_val = op::reinterpret_cast_array_nd<3>($rgb_gaussian_tv)[gaussian_id];
-                    """)
-                if is_bwd:
-                    code_rasterize.raw(f"""
-                    render_rgb -= weight * rgb_val;
-                    """)
-                if not is_bwd:
-                    code_rasterize.raw(f"""
-                    rgb += weight * rgb_val;
-                    """)
-                if render_depth:
-                    code_rasterize.raw(f"""
-                    auto depth_val = collected_depth[j];
-                    depth_accum += weight * depth_val;
-                    """)
-                if is_bwd:
-                    # TODO warp reduce
-                    code_rasterize.raw(f"""
-                    // auto suffix = render_rgb - rgb;
-                    float dL_dalpha_without_div = (drgb_array.op<op::dot>(T * rgb_val - render_rgb));
-                    // grad from T, we don't apply background when training, apply it in torch side.
-                    dL_dalpha_without_div += -dT_val * render_T;
-                    """)
+                    if not is_bwd:
+                        code_rasterize.raw(f"""
+                        weight_sum += weight;
+                        contributor = i * {block_size} + j;
+                        """)
+                    gaussian_id_inited = False
+                    if color_use_smem:
+                        code_rasterize.raw(f"""
+                        auto rgb_val = op::reinterpret_cast_array_nd<3>(collected_rgb_gaussian)[j];
+                        """)
+                    else:
+                        gaussian_id_inited = True
+                        code_rasterize.raw(f"""
+                        auto gaussian_id = collected_id[j];
+                        auto rgb_val = op::reinterpret_cast_array_nd<3>($rgb_gaussian_tv)[gaussian_id];
+                        """)
+                    if is_bwd:
+                        code_rasterize.raw(f"""
+                        render_rgb -= weight * rgb_val;
+                        """)
+                    if not is_bwd:
+                        code_rasterize.raw(f"""
+                        rgb += weight * rgb_val;
+                        """)
                     if render_depth:
                         code_rasterize.raw(f"""
-                        dL_dalpha_without_div += ddepth * (T * depth_val - (render_depth - depth_accum));
+                        auto depth_val = collected_depth[j];
+                        depth_accum += weight * depth_val;
                         """)
-                    code_rasterize.raw(f"""
-                    auto dL_dalpha = dL_dalpha_without_div / (1.0f - alpha);
-                    auto dL_drgb = weight * drgb_array;
-                    tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 0, dL_drgb[0]);
-                    tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 1, dL_drgb[1]);
-                    tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 2, dL_drgb[2]);
+                    if is_bwd:
+                        code_rasterize.raw(f"""
+                        // auto suffix = render_rgb - rgb;
+                        float dL_dalpha_without_div = (drgb_array.op<op::dot>(T * rgb_val - render_rgb));
+                        // grad from T, we don't apply background when training, apply it in torch side.
+                        dL_dalpha_without_div += -dT_val * render_T;
+                        """)
+                        if render_depth:
+                            code_rasterize.raw(f"""
+                            dL_dalpha_without_div += ddepth * (T * depth_val - (render_depth - depth_accum));
+                            """)
+                        code_rasterize.raw(f"""
+                        auto dL_dalpha = dL_dalpha_without_div / (1.0f - alpha);
+                        {"" if use_bwd_reduce else "auto"} dL_drgb = weight * drgb_array;
 
-                    const float dL_dG = conic_opacity_vec.w * dL_dalpha;
-                    const float gdx = G * dist[0];
-                    const float gdy = G * dist[1];
-                    // in original code, the proj matrix map point to ndc,
-                    // so their gradient contains 0.5 * W/H.
-                    // we don't do this, so that grad is removed.
-                    const float dG_du = -gdx * conic_opacity_vec.x - gdy * conic_opacity_vec.y;
-                    const float dG_dv = -gdy * conic_opacity_vec.z - gdx * conic_opacity_vec.y;
-                    tv::array<float, 2> dL_duv {{
-                        dL_dG * dG_du,
-                        dL_dG * dG_dv
-                    }};
-                    // in origin 3dgs code, this is -0.5f * gdx * d.y * dL_dG
-                    // this is actually sym grad, means dL_dcov2d is 2x2,
-                    // grad[0][1] == grad[1][0] == -0.5f * gdx * d.y * dL_dG
-                    // this make the input of grad of inverse (cov2d) is actually 2x2
-                    // here we remove the 0.5 and modify cov2d inverse grad code,
-                    // remove the 2 multipler in cov2d inverse grad code.
-                    tv::array<float, 3> dL_dcov2d{{
-                        -0.5f * gdx * dist[0] * dL_dG,
-                        -gdx * dist[1] * dL_dG,
-                        -0.5f * gdy * dist[1] * dL_dG,
-                    }};
-                    float dL_dopacity = dL_dalpha * G;
-                    tv::parallel::atomicAdd($duv + gaussian_id * 2 + 0, dL_duv[0]);
-                    tv::parallel::atomicAdd($duv + gaussian_id * 2 + 1, dL_duv[1]);
+                        const float dL_dG = conic_opacity_vec.w * dL_dalpha;
+                        const float gdx = G * dist[0];
+                        const float gdy = G * dist[1];
+                        // in original code, the proj matrix map point to ndc,
+                        // so their gradient contains 0.5 * W/H.
+                        // we don't do this, so that grad is removed.
+                        const float dG_du = -gdx * conic_opacity_vec.x - gdy * conic_opacity_vec.y;
+                        const float dG_dv = -gdy * conic_opacity_vec.z - gdx * conic_opacity_vec.y;
+                        {"" if use_bwd_reduce else "tv::array<float, 2>"} dL_duv =  {{
+                            dL_dG * dG_du,
+                            dL_dG * dG_dv
+                        }};
+                        // in origin 3dgs code, this is -0.5f * gdx * d.y * dL_dG
+                        // this is actually sym grad, means dL_dcov2d is 2x2,
+                        // grad[0][1] == grad[1][0] == -0.5f * gdx * d.y * dL_dG
+                        // this make the input of grad of inverse (cov2d) is actually 2x2
+                        // here we remove the 0.5 and modify cov2d inverse grad code,
+                        // remove the 2 multipler in cov2d inverse grad code.
+                        {"" if use_bwd_reduce else "tv::array<float, 3>"} dL_dcov2d = {{
+                            -0.5f * gdx * dist[0] * dL_dG,
+                            -gdx * dist[1] * dL_dG,
+                            -0.5f * gdy * dist[1] * dL_dG,
+                        }};
+                        {"" if use_bwd_reduce else "float"} dL_dopacity = dL_dalpha * G;
+                        """)
+                if is_bwd:
+                    reduce_if_ctx = nullcontext()
+                    if bwd_reduce_method == "warp":
+                        reduce_if_ctx = code_rasterize.if_("lane_idx == 0")
+                    elif bwd_reduce_method == "block":
+                        reduce_if_ctx = code_rasterize.if_("thread_rank == 0")
+                    if use_bwd_reduce:
+                        code_rasterize.raw(f"""
+                        dL_drgb[0] = tv::parallel::warp_sum(dL_drgb[0]);
+                        dL_drgb[1] = tv::parallel::warp_sum(dL_drgb[1]);
+                        dL_drgb[2] = tv::parallel::warp_sum(dL_drgb[2]);
 
-                    tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 0, dL_dcov2d[0]);
-                    tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 1, dL_dcov2d[1]);
-                    tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 2, dL_dcov2d[2]);
-                    tv::parallel::atomicAdd($dopacity + gaussian_id, dL_dopacity);
-                    """)
-                # if num_custom_feat > 0:
-                #     code_rasterize.raw(f"""
-                #     for (int channel_idx = 0; channel_idx < {num_custom_feat}; ++channel_idx){{
-                #         custom_feature[channel_idx] += weight * $custom_feat[gaussian_id * {num_custom_feat} + channel_idx];
-                #     }}
-                #     """)
+                        dL_duv[0] = tv::parallel::warp_sum(dL_duv[0]);
+                        dL_duv[1] = tv::parallel::warp_sum(dL_duv[1]);
+
+                        dL_dcov2d[0] = tv::parallel::warp_sum(dL_dcov2d[0]);
+                        dL_dcov2d[1] = tv::parallel::warp_sum(dL_dcov2d[1]);
+                        dL_dcov2d[2] = tv::parallel::warp_sum(dL_dcov2d[2]);
+
+                        dL_dopacity = tv::parallel::warp_sum(dL_dopacity);
+                        """)
+                        if self.cfg.backward_reduction == "block":
+                            code_rasterize.raw(f"""
+                            tv::parallel::block_sync_shared_io();
+
+                            if (lane_idx == 0){{
+                                shared_dL_drgb_0[warp_idx] = dL_drgb[0];
+                                shared_dL_drgb_1[warp_idx] = dL_drgb[1];
+                                shared_dL_drgb_2[warp_idx] = dL_drgb[2];
+                                shared_dL_duv_0[warp_idx] = dL_duv[0];
+                                shared_dL_duv_1[warp_idx] = dL_duv[1];
+                                shared_dL_dconic_0[warp_idx] = dL_dcov2d[0];
+                                shared_dL_dconic_1[warp_idx] = dL_dcov2d[1];
+                                shared_dL_dconic_2[warp_idx] = dL_dcov2d[2];
+                                shared_dL_dopacity[warp_idx] = dL_dopacity;
+                            }}
+                            tv::parallel::block_sync_shared_io();
+                            """) 
+                    with reduce_if_ctx:
+                        if not gaussian_id_inited:
+                            code_rasterize.raw(f"""
+                            auto gaussian_id = collected_id[j];
+                            """)
+                        if self.cfg.backward_reduction == "block":
+                            code_rasterize.raw(f"""
+                            dL_drgb[0] = shared_dL_drgb_0.op<op::sum>();
+                            dL_drgb[1] = shared_dL_drgb_1.op<op::sum>();
+                            dL_drgb[2] = shared_dL_drgb_2.op<op::sum>();
+                            dL_duv[0] = shared_dL_duv_0.op<op::sum>();
+                            dL_duv[1] = shared_dL_duv_1.op<op::sum>();
+                            dL_dcov2d[0] = shared_dL_dconic_0.op<op::sum>();
+                            dL_dcov2d[1] = shared_dL_dconic_1.op<op::sum>();
+                            dL_dcov2d[2] = shared_dL_dconic_2.op<op::sum>();
+                            dL_dopacity = shared_dL_dopacity.op<op::sum>();
+                            """)
+                        code_rasterize.raw(f"""
+                        tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 0, dL_drgb[0]);
+                        tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 1, dL_drgb[1]);
+                        tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 2, dL_drgb[2]);
+
+                        tv::parallel::atomicAdd($duv + gaussian_id * 2 + 0, dL_duv[0]);
+                        tv::parallel::atomicAdd($duv + gaussian_id * 2 + 1, dL_duv[1]);
+
+                        tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 0, dL_dcov2d[0]);
+                        tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 1, dL_dcov2d[1]);
+                        tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 2, dL_dcov2d[2]);
+                        tv::parallel::atomicAdd($dopacity + gaussian_id, dL_dopacity);
+                        """)
+                    # if num_custom_feat > 0:
+                    #     code_rasterize.raw(f"""
+                    #     for (int channel_idx = 0; channel_idx < {num_custom_feat}; ++channel_idx){{
+                    #         custom_feature[channel_idx] += weight * $custom_feat[gaussian_id * {num_custom_feat} + channel_idx];
+                    #     }}
+                    #     """)
         if not is_bwd:
             if not training:
                 code_rasterize.raw(f"""
@@ -887,15 +1010,12 @@ class GaussianSplatForward:
         #         }}
         #     }}
         #     """)
-        kernel_unique_name = (
-            f"rasterize_{is_bwd}_{self.cfg.tile_size}"
-            f"_{num_custom_feat}_{self.cfg.render_depth}"
-            f"_{self.cfg.use_nchw}_{self.cfg.render_rgba}"
-            f"_{final_n_contrib is None}_{t_dtype}")
-        with tv.measure_and_print("BWD-rasterize"):
+        with tv.measure_and_print(f"BWD-rasterize-{gaussian_idx_sorted_tv.shape[0]}"):
             INLINER.kernel_raw(kernel_unique_name, launch_param, code_rasterize)
-        if is_bwd:
-            print(INLINER.get_nvrtc_kernel_attrs(kernel_unique_name))
+        # if is_bwd:
+        #     # print(INLINER.get_nvrtc_module(kernel_unique_name).params.debug_code)
+
+        #     print(INLINER.get_nvrtc_kernel_attrs(kernel_unique_name))
         return grad_out
 
     def backward(self, model: GaussianModelBase,
@@ -1094,46 +1214,46 @@ class _RasterizeGaussians(torch.autograd.Function):
     def backward(ctx, drgb, ddepth, dcustom_features, dT, dn_contrib):
         if len(ctx.saved_tensors) == 0:
             return (None, ) * 8
+        with tv.measure_and_print("BWD-torch"):
 
-        out = GaussianSplatOutput(
-            final_n_contrib=ctx.saved_tensors[-5],
-            final_color=ctx.saved_tensors[-4],
-            final_depth=ctx.saved_tensors[-3],
-            final_custom_features=ctx.saved_tensors[-2],
-            final_T=ctx.saved_tensors[-1],
-            
-        )
-        fwd_ctx = GaussianSplatForwardContext(
-            conic_opacity=ctx.saved_tensors[0],
-            radii=ctx.saved_tensors[1],
-            uvs=ctx.saved_tensors[2],
-            rgb_gaussian=ctx.saved_tensors[3],
-            gaussian_idx_sorted=ctx.saved_tensors[4],
-            workload_ranges=ctx.saved_tensors[5],
-            image_shape_wh=ctx.image_shape_wh,
-            cov3d_vecs=ctx.saved_tensors[6],
-            cov2d_vecs=ctx.saved_tensors[7],
-            sh_to_rgb_ne_0=ctx.saved_tensors[8],
-            depths=ctx.saved_tensors[9],
-        )
-        model = GaussianModelOrigin(
-            xyz=ctx.saved_tensors[10],
-            color_sh=ctx.saved_tensors[11],
-            scale=ctx.saved_tensors[12],
-            quaternion_xyzw=ctx.saved_tensors[13],
-            opacity=ctx.saved_tensors[14],
-            act_applied=True,
-        )
-        op: GaussianSplatForward = ctx.op
-        if op.cfg.transmittance_is_double:
-            dT = dT.float()
-        gradient = GaussianSplatGradients(
-            drgb=drgb,
-            ddepth=ddepth,
-            dcustom_features=dcustom_features,
-            dT=dT # .float(),
-        )
-        cams: list[BasicPinholeCamera] = ctx.cams
+            out = GaussianSplatOutput(
+                final_n_contrib=ctx.saved_tensors[-5],
+                final_color=ctx.saved_tensors[-4],
+                final_depth=ctx.saved_tensors[-3],
+                final_custom_features=ctx.saved_tensors[-2],
+                final_T=ctx.saved_tensors[-1],
+            )
+            fwd_ctx = GaussianSplatForwardContext(
+                conic_opacity=ctx.saved_tensors[0],
+                radii=ctx.saved_tensors[1],
+                uvs=ctx.saved_tensors[2],
+                rgb_gaussian=ctx.saved_tensors[3],
+                gaussian_idx_sorted=ctx.saved_tensors[4],
+                workload_ranges=ctx.saved_tensors[5],
+                image_shape_wh=ctx.image_shape_wh,
+                cov3d_vecs=ctx.saved_tensors[6],
+                cov2d_vecs=ctx.saved_tensors[7],
+                sh_to_rgb_ne_0=ctx.saved_tensors[8],
+                depths=ctx.saved_tensors[9],
+            )
+            model = GaussianModelOrigin(
+                xyz=ctx.saved_tensors[10],
+                color_sh=ctx.saved_tensors[11],
+                scale=ctx.saved_tensors[12],
+                quaternion_xyzw=ctx.saved_tensors[13],
+                opacity=ctx.saved_tensors[14],
+                act_applied=True,
+            )
+            op: GaussianSplatForward = ctx.op
+            if op.cfg.transmittance_is_double:
+                dT = dT.float()
+            gradient = GaussianSplatGradients(
+                drgb=drgb,
+                ddepth=ddepth,
+                dcustom_features=dcustom_features,
+                dT=dT # .float(),
+            )
+            cams: list[BasicPinholeCamera] = ctx.cams
         grad_out = op.backward(model, cams, fwd_ctx, out, gradient)
         return grad_out.xyz, grad_out.color_sh, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, None
 
