@@ -31,10 +31,31 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
     def scale_act(self) -> torch.Tensor:
         raise NotImplementedError
 
+    @abc.abstractmethod
+    def inverse_scale_act(self, scale_act: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+
     @property 
     @abc.abstractmethod
     def opacity_act(self) -> torch.Tensor:
         raise NotImplementedError
+
+    @property 
+    def fused_quaternion_xyzw_act_op(self) -> tuple[str, str] | None:
+        """there are three component support fused act to save gpu memory.
+        when you implement fused op, you should return identity
+        in component_act property.
+        """
+        return None
+
+    @property 
+    def fused_scale_act_op(self) -> tuple[str, str] | None:
+        return None
+
+    @property 
+    def fused_opacity_act_op(self) -> tuple[str, str] | None:
+        return None
 
     @property 
     def color_sh_act(self) -> torch.Tensor:
@@ -75,6 +96,46 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
             color_sh=self.color_sh_act,
             act_applied=True)
 
+    @classmethod 
+    def empty(cls, N: int, num_degree: int):
+        return cls(
+            xyz=torch.empty(N, 3),
+            quaternion_xyzw=torch.empty(N, 4),
+            scale=torch.empty(N, 3),
+            opacity=torch.empty(N),
+            color_sh=torch.empty(N, (num_degree + 1) * (num_degree + 1), 3)
+        )
+
+    @classmethod 
+    def empty_parameter(cls, N: int, num_degree: int):
+        return cls(
+            xyz=torch.nn.Parameter(torch.empty(N, 3)),
+            quaternion_xyzw=torch.nn.Parameter(torch.empty(N, 4)),
+            scale=torch.nn.Parameter(torch.empty(N, 3)),
+            opacity=torch.nn.Parameter(torch.empty(N)),
+            color_sh=torch.nn.Parameter(torch.empty(N, (num_degree + 1) * (num_degree + 1), 3))
+        )
+
+    def to_parameter(self):
+        return self.__class__(
+            xyz=torch.nn.Parameter(self.xyz),
+            quaternion_xyzw=torch.nn.Parameter(self.quaternion_xyzw),
+            scale=torch.nn.Parameter(self.scale),
+            opacity=torch.nn.Parameter(self.opacity),
+            color_sh=torch.nn.Parameter(self.color_sh)
+        )
+
+    @classmethod 
+    def zeros(cls, N: int, num_degree: int):
+        return cls(
+            xyz=torch.zeros(N, 3),
+            quaternion_xyzw=torch.zeros(N, 4),
+            scale=torch.zeros(N, 3),
+            opacity=torch.zeros(N),
+            color_sh=torch.zeros(N, (num_degree + 1) * (num_degree + 1), 3)
+        )
+
+
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianModelOrigin(GaussianModelBase):
     @property 
@@ -89,6 +150,9 @@ class GaussianModelOrigin(GaussianModelBase):
             return self.scale
         return torch.exp(self.scale)
 
+    def inverse_scale_act(self, scale_act: torch.Tensor) -> torch.Tensor:
+        return torch.log(scale_act)
+
     @property 
     def opacity_act(self) -> torch.Tensor:
         if self.act_applied:
@@ -96,23 +160,32 @@ class GaussianModelOrigin(GaussianModelBase):
         return torch.sigmoid(self.opacity)
 
 
-    @staticmethod 
-    def empty(N: int, num_degree: int):
-        return GaussianModelOrigin(
-            xyz=torch.empty(N, 3),
-            quaternion_xyzw=torch.empty(N, 4),
-            scale=torch.empty(N, 3),
-            opacity=torch.empty(N),
-            color_sh=torch.empty(N, (num_degree + 1) * (num_degree + 1), 3)
-        )
+@dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
+class GaussianModelOriginFused(GaussianModelBase):
+    @property 
+    def quaternion_xyzw_act(self) -> torch.Tensor:
+        return self.quaternion_xyzw
 
-    @staticmethod 
-    def zeros(N: int, num_degree: int):
-        return GaussianModelOrigin(
-            xyz=torch.zeros(N, 3),
-            quaternion_xyzw=torch.zeros(N, 4),
-            scale=torch.zeros(N, 3),
-            opacity=torch.zeros(N),
-            color_sh=torch.zeros(N, (num_degree + 1) * (num_degree + 1), 3)
-        )
+    @property 
+    def scale_act(self) -> torch.Tensor:
+        return self.scale
+
+    def inverse_scale_act(self, scale_act: torch.Tensor) -> torch.Tensor:
+        return torch.log(scale_act)
+
+    @property 
+    def opacity_act(self) -> torch.Tensor:
+        return self.opacity
+
+    @property 
+    def fused_quaternion_xyzw_act_op(self) -> tuple[str, str] | None:
+        return ("normalize", "normalize_grad")
+
+    @property 
+    def fused_scale_act_op(self) -> tuple[str, str] | None:
+        return ("exponential", "exponential_grad")
+
+    @property 
+    def fused_opacity_act_op(self) -> tuple[str, str] | None:
+        return ("sigmoid", "sigmoid_grad")
 

@@ -65,6 +65,14 @@ class DataClassWithArrayCheck:
         check_shape_of_meta_shape([meta.shape for meta in all_metas], all_real_shapes)
         return self
 
+    def get_all_torch_tensor_byte_size(self):
+        total = 0
+        for field in dataclasses.fields(self):
+            ten = getattr(self, field.name)
+            if isinstance(ten, torch.Tensor):
+                total += ten.numel() * ten.element_size()
+        return total
+
 
 def __main():
     from d3sim.core.arrcheck import ArrayCheck, Float32, Float64

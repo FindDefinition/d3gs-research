@@ -20,30 +20,6 @@ from d3sim.ops.d3gs.data.utils.general_utils import strip_symmetric, build_scali
 from cumm.inliner import torch_tensor_to_tv, measure_and_print_torch
 from torch.autograd.function import once_differentiable
 
-
-def _validate_color_sh(color_sh: torch.Tensor, xyz: torch.Tensor,
-                       rgb_gaussian: torch.Tensor, cam2world_T_np: np.ndarray):
-    from d3sim.ops.d3gs.data.utils.sh_utils import eval_sh
-    shs_view = color_sh.transpose(1, 2).view(-1, 3, (3 + 1)**2)
-    dir_pp = (xyz - torch.from_numpy(cam2world_T_np[3]).cuda().repeat(
-        color_sh.shape[0], 1))
-    dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
-    sh2rgb = eval_sh(3, shs_view, dir_pp_normalized)
-    colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
-    print(torch.linalg.norm(colors_precomp - rgb_gaussian))
-
-    # print(INLINER.get_nvrtc_module(prep_kernel_name).params.debug_code)
-    # breakpoint()
-
-
-def build_covariance_from_scaling_rotation(scaling, scaling_modifier,
-                                           rotation):
-    L = build_scaling_rotation(scaling_modifier * scaling, rotation)
-    actual_covariance = L @ L.transpose(1, 2)
-    symm = strip_symmetric(actual_covariance)
-    return symm
-
-
 def fov2focal(fov: float, length: int):
     return float(length) / (2 * math.tan(fov / 2))
 
@@ -52,8 +28,16 @@ def focal2fov(focal: float, length: int):
     return 2 * math.atan(float(length) / (2 * focal))
 
 
-_DEFAULT_ENABLE_32BIT_SORT = False if IsAppleSiliconMacOs else False
+_DEFAULT_ENABLE_32BIT_SORT = True if IsAppleSiliconMacOs else False
 
+@dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
+class BatchCameraParams:
+    # 4x3 matrix
+    cam2world_T: torch.Tensor
+    focal_xy: torch.Tensor
+    principal_point: torch.Tensor
+    tan_fov: torch.Tensor
+    shape_wh: tuple[int, int]
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatConfig:
@@ -114,24 +98,31 @@ class GaussianSplatForwardContext(DataClassWithArrayCheck):
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatOutput(DataClassWithArrayCheck):
-    final_custom_features: Annotated[torch.Tensor | None,
+    custom_features: Annotated[torch.Tensor | None,
                                      ac.ArrayCheck([-1, "H", "W"], ac.F32)]
-    final_T: Annotated[torch.Tensor, ac.ArrayCheck(["H", "W"], ac.F32)]
-    final_color: Annotated[torch.Tensor, ac.ArrayCheck([3, "H", "W"], ac.F32)]
-    final_depth: Annotated[torch.Tensor | None,
+    T: Annotated[torch.Tensor, ac.ArrayCheck(["H", "W"], ac.F32)]
+    color: Annotated[torch.Tensor, ac.ArrayCheck([3, "H", "W"], ac.F32)]
+    depth: Annotated[torch.Tensor | None,
                            ac.ArrayCheck(["H", "W"], ac.F32)] = None
-    final_n_contrib: Annotated[torch.Tensor | None,
+    n_contrib: Annotated[torch.Tensor | None,
                                ac.ArrayCheck(["H", "W"], ac.I32)] = None
+    radii: Annotated[torch.Tensor | None,
+                            ac.ArrayCheck(["H", "W"], ac.I32)] = None
 
+    @property 
+    def image_shape_wh(self) -> tuple[int, int]:
+        return (self.T.shape[1], self.T.shape[0])
+
+    
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class RasterizeGradientOutput(DataClassWithArrayCheck):
-    duv: Annotated[torch.Tensor, ac.ArrayCheck([-1, 2], ac.F32)]
-    dconic: Annotated[torch.Tensor, ac.ArrayCheck([-1, 3], ac.F32)]
-    dopacity: Annotated[torch.Tensor, ac.ArrayCheck([-1], ac.F32)]
-    dcolor: Annotated[torch.Tensor, ac.ArrayCheck([-1, 3], ac.F32)]
+    duv: Annotated[torch.Tensor, ac.ArrayCheck(["N", 2], ac.F32)]
+    dconic: Annotated[torch.Tensor, ac.ArrayCheck(["N", 3], ac.F32)]
+    dopacity: Annotated[torch.Tensor, ac.ArrayCheck(["N"], ac.F32)]
+    dcolor: Annotated[torch.Tensor, ac.ArrayCheck(["N", 3], ac.F32)]
     dcustom_features: Annotated[torch.Tensor | None,
-                                ac.ArrayCheck([-1, -1], ac.F32)]
+                                ac.ArrayCheck(["N", -1], ac.F32)]
 
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
@@ -181,11 +172,6 @@ class GaussianSplatForward:
         focal_xy_np = np.array([focal_x, focal_y], np.float32)
         principal_point_np = np.array([intrinsic[0, 2], intrinsic[1, 2]],
                                       np.float32)
-        # TODO for original code only
-        principal_point_np[0] = width / 2
-        principal_point_np[1] = height / 2
-        principal_point_unified_np = principal_point_np / resolution_wh_np.astype(
-            np.float32)
         tanfov_xy_np = np.array([tanfov_x, tanfov_y], np.float32)
         cam2world_T_np = np.ascontiguousarray(cam2world[:3].T)
         cam2world_center_np = cam2world_T_np[3]
@@ -232,9 +218,14 @@ class GaussianSplatForward:
         custom_feat = model.custom_features
         num_custom_feat = 0 if custom_feat is None else custom_feat.shape[1]
         t1 = time.time()
+        fused_scale_act = model.fused_scale_act_op
+        fused_q_act = model.fused_quaternion_xyzw_act_op
+        fused_opacity_act = model.fused_opacity_act_op
         with measure_and_print_torch("1", enable=enable_verbose):
-            prep_kernel_name = f"gs3d_preprocess_{axis_front_u_v}_{self.cfg.tile_size}_{degree}"
-            code_prep = pccm.code(f"""
+            prep_kernel_name = (f"gs3d_preprocess_{axis_front_u_v}_{self.cfg.tile_size}_{degree}_{training}_"
+                                f"{fused_scale_act}_{fused_q_act}_{fused_opacity_act}")
+            code_prep = pccm.code()
+            code_prep.raw(f"""
             namespace op = tv::arrayops;
             using math_op_t = tv::arrayops::MathScalarOp<float>;
             auto cam2world_T = $cam2world_T_np;
@@ -244,18 +235,31 @@ class GaussianSplatForward:
             auto resolution_wh = $resolution_wh_np;
             auto point = op::reinterpret_cast_array_nd<3>($xyz)[i];
             auto point_cam = op::slice<0, 3>(cam2world_T).op<op::mv_rowmajor>(point - cam2world_T[3]);
-            // auto ndc_unified_and_z = CameraOps::pos_cam_to_ndc_uv_no_distort<{axis_front_u_v[0]}, {axis_front_u_v[1]}, {axis_front_u_v[2]}>(
-            //     point_cam, principal_point, focal_xy / resolution_wh.cast<float>());
-            // auto ndc_unified = std::get<0>(ndc_unified_and_z);
-            // auto uv = (std::get<0>(ndc_unified_and_z) + 1.0f) * resolution_wh.cast<float>() / 2.0f - 0.5f;
-            
-            auto ndc_unified_and_z = CameraOps::pos_cam_to_uv_no_distort<2, 0, 1>(point_cam, principal_point, focal_xy);
-            auto uv = std::get<0>(ndc_unified_and_z) - 0.5f;
-            auto z_in_cam = std::get<1>(ndc_unified_and_z);
+
+            auto uvz = CameraOps::pos_cam_to_uv_no_distort<2, 0, 1>(point_cam, principal_point, focal_xy);
+            auto uv = std::get<0>(uvz) - 0.5f;
+            auto z_in_cam = std::get<1>(uvz);
             auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
             auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[i];
-
-            auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale * $scale_global, quat);
+            """)
+            if fused_q_act is not None:
+                code_prep.raw(f"""
+                quat = quat.op<op::{fused_q_act[0]}>();
+                """)
+            if fused_scale_act is not None:
+                code_prep.raw(f"""
+                scale = scale.op<op::{fused_scale_act[0]}>();
+                """)
+            if training:
+                code_prep.raw(f"""
+                auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale, quat);
+                """)
+            else:
+                # scale modifier should only be used during inference.
+                code_prep.raw(f"""
+                auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale * $scale_global, quat);
+                """)
+            code_prep.raw(f"""
             auto cov2d_vec = Gaussian3D::project_gaussian_to_2d<float, 4>(point_cam, focal_xy, tan_fov, cam2world_T, cov3d_vec, $(self.cfg.projected_clamp_factor));
             
             cov2d_vec[0] += $(self.cfg.gaussian_lowpass_filter);
@@ -282,10 +286,16 @@ class GaussianSplatForward:
                 return;
             }}
             $depths[i] = z_in_cam;
-            // $debug_ten[i] = tile_num_xy[0];
 
             op::reinterpret_cast_array_nd<2>($uvs)[i] = uv;
-            tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], $opacity[i]}};
+            auto opacity_val = $opacity[i];
+            """)
+            if fused_opacity_act is not None:
+                code_prep.raw(f"""
+                opacity_val = tv::array<float, 1>{{opacity_val}}.op<op::{fused_opacity_act[0]}>()[0];
+                """)
+            code_prep.raw(f"""
+            tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], opacity_val}};
             op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
             auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1)};
             
@@ -309,7 +319,6 @@ class GaussianSplatForward:
         with measure_and_print_torch("2", enable=enable_verbose):
             tiles_touched.cumsum_(0)
             num_rendered = int(tiles_touched[-1].item())
-        
         out_img_shape = [self.cfg.num_channels, height, width] if self.cfg.use_nchw else [height, width, self.cfg.num_channels]
         out_custom_feat_shape = [num_custom_feat, height, width] if self.cfg.use_nchw else [height, width, num_custom_feat]
         if (num_rendered == 0):
@@ -330,11 +339,11 @@ class GaussianSplatForward:
                 final_depth = torch.zeros([height, width],
                                           dtype=torch.float32,
                                           device=xyz.device)
-            out_empty = GaussianSplatOutput(final_custom_features=None,
-                                            final_T=final_T,
-                                            final_color=out_color,
-                                            final_depth=final_depth,
-                                            final_n_contrib=n_contrib)
+            out_empty = GaussianSplatOutput(custom_features=None,
+                                            T=final_T,
+                                            color=out_color,
+                                            depth=final_depth,
+                                            n_contrib=n_contrib)
             return out_empty, None
         keys_tile_idx_depth = torch.empty(
             num_rendered,
@@ -398,7 +407,7 @@ class GaussianSplatForward:
                               code)
         # TODO use radix sort with trunated bits (faster) for cuda
         # TODO use 32bit sort, for 1920x1080 tile, the max tile idx is 8100, 13 bits
-        # so we can use 18bit for depth. (19bit if torch support uint32, true in torch >= 2.3)
+        # so we can use 18bit for depth. (19bit if torch support uint32, true in torch >= 2.3 and cuda)
         with measure_and_print_torch("4", enable=enable_verbose):
             sorted_vals, indices = torch.sort(keys_tile_idx_depth)
             gaussian_idx_sorted = torch.gather(gaussian_idx, 0, indices)
@@ -445,11 +454,12 @@ class GaussianSplatForward:
             final_depth = torch.zeros([height, width],
                                       dtype=torch.float32,
                                       device=xyz.device)
-        output_dc = GaussianSplatOutput(final_custom_features=out_custom_feat,
-                                        final_T=final_T,
-                                        final_color=out_color,
-                                        final_depth=final_depth,
-                                        final_n_contrib=n_contrib)
+        output_dc = GaussianSplatOutput(custom_features=out_custom_feat,
+                                        T=final_T,
+                                        color=out_color,
+                                        depth=final_depth,
+                                        n_contrib=n_contrib,
+                                        radii=radii)
         ctx = GaussianSplatForwardContext(
             conic_opacity=conic_opacity,
             radii=radii,
@@ -499,16 +509,15 @@ class GaussianSplatForward:
         gaussian_idx_sorted_tv = torch_tensor_to_tv(ctx.gaussian_idx_sorted,
                                                     to_const=True)
         rgb_gaussian_tv = torch_tensor_to_tv(ctx.rgb_gaussian, to_const=True)
-        final_custom_feat = out.final_custom_features
+        final_custom_feat = out.custom_features
         num_custom_feat = 0 if final_custom_feat is None else final_custom_feat.shape[
             0]
 
-        final_T = out.final_T
-        final_color = out.final_color
-        final_custom_features = out.final_custom_features
-        final_n_contrib = out.final_n_contrib
+        final_T = out.T
+        final_color = out.color
+        final_n_contrib = out.n_contrib
         assert final_n_contrib is not None 
-        final_depth = out.final_depth
+        final_depth = out.depth
         if render_depth:
             assert final_depth is not None
 
@@ -650,10 +659,7 @@ class GaussianSplatForward:
                 int max_num_contributor = contributor;
                 """)
             code_rasterize.raw(f"""
-            // range[1] = min(range[1], range[0] + real_todo);
-            // tv::printf2_once<' ', 1>(contributor, range[1] - range[0]); 
             int toDo = max_num_contributor;
-            // toDo = range[1] - range[0];
             int rounds = tv::div_up(range[1] - range[0], {block_size});
             """)
 
@@ -843,11 +849,11 @@ class GaussianSplatForward:
                         code_rasterize.raw(f"""
                         rgb += weight * rgb_val;
                         """)
-                    if render_depth:
-                        code_rasterize.raw(f"""
-                        auto depth_val = collected_depth[j];
-                        depth_accum += weight * depth_val;
-                        """)
+                        if render_depth:
+                            code_rasterize.raw(f"""
+                            auto depth_val = collected_depth[j];
+                            depth_accum += weight * depth_val;
+                            """)
                     if is_bwd:
                         code_rasterize.raw(f"""
                         float dL_dalpha_without_div = (drgb_array.op<op::dot>(T * rgb_val - render_rgb));
@@ -1070,12 +1076,16 @@ class GaussianSplatForward:
         scales = model.scale
         quat_xyzw = model.quaternion_xyzw
         color_sh = model.color_sh
+        opacity = model.opacity
         degree = model.color_sh_degree
-        prep_kernel_name = f"gs3d_preprocess_bwd_{axis_front_u_v}_{self.cfg.tile_size}_{degree}"
+        fused_scale_act = model.fused_scale_act_op
+        fused_q_act = model.fused_quaternion_xyzw_act_op
+        fused_opacity_act = model.fused_opacity_act_op
+        prep_kernel_name = (f"gs3d_preprocess_bwd_{axis_front_u_v}_{self.cfg.tile_size}_{degree}_"
+                            f"{fused_scale_act}_{fused_q_act}_{fused_opacity_act}")
         with tv.measure_and_print("BWD-2"):
-
-            INLINER.kernel_1d(
-                prep_kernel_name, num, 0, f"""
+            code_prep = pccm.code()
+            code_prep.raw(f"""
             namespace op = tv::arrayops;
             using math_op_t = tv::arrayops::MathScalarOp<float>;
             if ($radii[i] == 0){{
@@ -1090,7 +1100,6 @@ class GaussianSplatForward:
             auto focal_xy = $focal_xy_np;
             auto principal_point = $principal_point_np;
             auto tan_fov = $tanfov_xy_np;
-            auto resolution_wh = $resolution_wh_np;
             auto point = op::reinterpret_cast_array_nd<3>($xyz)[i];
             point = point - cam2world_center;
 
@@ -1101,18 +1110,50 @@ class GaussianSplatForward:
             auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad(conic_grad, cov2d_arr);
             
             auto proj_grad_res = Gaussian3D::project_gaussian_to_2d_grad<float, 3>(dcov2d, point_cam, focal_xy, tan_fov, cam2world_R_T, cov3d_vec);
-            auto dmean = std::get<0>(proj_grad_res);
             dpoint_cam += std::get<0>(proj_grad_res);
-            auto dLdcov = std::get<1>(proj_grad_res);
 
             auto dxyz = cam2world_R_T.op<op::mv_colmajor>(dpoint_cam);
 
             auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
             auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[i];
-
-            auto cov3d_grad_res = Gaussian3D::scale_quat_to_cov3d_grad(std::get<1>(proj_grad_res), scale, quat);
+            """)
+            if fused_scale_act:
+                code_prep.raw(f"""
+                auto scale_act = scale.op<op::{fused_scale_act[0]}>();
+                """)
+            else:
+                code_prep.raw(f"""
+                auto scale_act = scale;
+                """)
+            if fused_q_act:
+                code_prep.raw(f"""
+                auto quat_act = quat.op<op::normalize>();
+                """)
+            else:
+                code_prep.raw(f"""
+                auto quat_act = quat;
+                """)
+            code_prep.raw(f"""
+            auto cov3d_grad_res = Gaussian3D::scale_quat_to_cov3d_grad(std::get<1>(proj_grad_res), scale_act, quat_act);
             auto dscale = std::get<0>(cov3d_grad_res);
             auto dquat = std::get<1>(cov3d_grad_res);
+            """)
+            if fused_scale_act:
+                code_prep.raw(f"""
+                dscale = dscale.op<op::{fused_scale_act[1]}>(scale);
+                """)
+            if fused_q_act:
+                code_prep.raw(f"""
+                dquat = dquat.op<op::{fused_q_act[1]}>(quat);
+                """)
+            if fused_opacity_act:
+                code_prep.raw(f"""
+                tv::array<float, 1> opacity_val{{$opacity[i]}};
+                tv::array<float, 1> dopacity_val{{$dopacity[i]}};
+                dopacity_val = dopacity_val.op<op::{fused_opacity_act[1]}>(opacity_val);
+                $dopacity[i] = dopacity_val[0];
+                """)
+            code_prep.raw(f"""
             op::reinterpret_cast_array_nd<3>($dscale_res)[i] = dscale;
             op::reinterpret_cast_array_nd<4>($dquat_res)[i] = dquat;
 
@@ -1135,6 +1176,8 @@ class GaussianSplatForward:
             op::reinterpret_cast_array_nd<3>($dxyz_res)[i] = dxyz;
 
             """)
+            INLINER.kernel_1d(
+                prep_kernel_name, num, 0, code_prep)
         if return_uv_grad:
             return grad_model, duv
         return grad_model, None
@@ -1150,6 +1193,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         scale,
         quaternion_xyzw,
         opacity,
+        model_cls: type[GaussianModelBase],
         # cameras
         cameras,
         # options
@@ -1158,7 +1202,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         uv_grad_holder=None,
     ):
         op = GaussianSplatForward(gaussian_cfg)
-        model = GaussianModelOrigin(
+        model = model_cls(
             xyz=xyz,
             color_sh=color_sh,
             scale=scale,
@@ -1188,38 +1232,39 @@ class _RasterizeGaussians(torch.autograd.Function):
                 quaternion_xyzw,
                 opacity,
                 # outputs
-                out.final_n_contrib,
-                out.final_color,
-                out.final_depth,
-                out.final_custom_features,
-                out.final_T,
+                out.n_contrib,
+                out.color,
+                out.depth,
+                out.custom_features,
+                out.T,
             )
             ctx.image_shape_wh = fwd_ctx.image_shape_wh
 
         ctx.op = op
         ctx.cams = cameras
         ctx.return_uv_grad = uv_grad_holder is not None
-        # else:
-        #     ctx.save_for_backward()
+        ctx.model_cls = model_cls
         # torch autograd func only support tuple output
-        out_items = (out.final_color, out.final_depth,
-                     out.final_custom_features, out.final_T,
-                     out.final_n_contrib)
+        out_items = (out.color, out.depth,
+                     out.custom_features, out.T,
+                     out.n_contrib,
+                     out.radii)
         return out_items
 
     @staticmethod
     @once_differentiable
-    def backward(ctx, drgb, ddepth, dcustom_features, dT, dn_contrib):
+    def backward(ctx, drgb, ddepth, dcustom_features, dT, dn_contrib, dradii):
         if len(ctx.saved_tensors) == 0:
-            return (None, ) * 9
-        with tv.measure_and_print("BWD-torch"):
+            return (None, ) * 10
+        op: GaussianSplatForward = ctx.op
 
+        with tv.measure_and_print("BWD-torch", enable=op.cfg.verbose):
             out = GaussianSplatOutput(
-                final_n_contrib=ctx.saved_tensors[-5],
-                final_color=ctx.saved_tensors[-4],
-                final_depth=ctx.saved_tensors[-3],
-                final_custom_features=ctx.saved_tensors[-2],
-                final_T=ctx.saved_tensors[-1],
+                n_contrib=ctx.saved_tensors[-5],
+                color=ctx.saved_tensors[-4],
+                depth=ctx.saved_tensors[-3],
+                custom_features=ctx.saved_tensors[-2],
+                T=ctx.saved_tensors[-1],
             )
             fwd_ctx = GaussianSplatForwardContext(
                 conic_opacity=ctx.saved_tensors[0],
@@ -1234,7 +1279,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 sh_to_rgb_ne_0=ctx.saved_tensors[8],
                 depths=ctx.saved_tensors[9],
             )
-            model = GaussianModelOrigin(
+            model = ctx.model_cls(
                 xyz=ctx.saved_tensors[10],
                 color_sh=ctx.saved_tensors[11],
                 scale=ctx.saved_tensors[12],
@@ -1242,7 +1287,6 @@ class _RasterizeGaussians(torch.autograd.Function):
                 opacity=ctx.saved_tensors[14],
                 act_applied=True,
             )
-            op: GaussianSplatForward = ctx.op
             if op.cfg.transmittance_is_double:
                 dT = dT.float()
             gradient = GaussianSplatGradients(
@@ -1251,9 +1295,18 @@ class _RasterizeGaussians(torch.autograd.Function):
                 dcustom_features=dcustom_features,
                 dT=dT # .float(),
             )
+            if op.cfg.verbose:
+                print("Backward Used Memory", out.get_all_torch_tensor_byte_size() + 
+                    model.get_all_torch_tensor_byte_size() +
+                        fwd_ctx.get_all_torch_tensor_byte_size() +
+                        gradient.get_all_torch_tensor_byte_size())
+                print("Out Size", out.get_all_torch_tensor_byte_size())
+                print("Model Size", model.get_all_torch_tensor_byte_size())
+                print("FwdCtx Size", fwd_ctx.get_all_torch_tensor_byte_size())
+                print("Gradient Size", gradient.get_all_torch_tensor_byte_size())
             cams: list[BasicPinholeCamera] = ctx.cams
         grad_out, duv = op.backward(model, cams, fwd_ctx, out, gradient, ctx.return_uv_grad)
-        return grad_out.xyz, grad_out.color_sh, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, None, duv
+        return grad_out.xyz, grad_out.color_sh, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, None, None, duv
 
 
 def rasterize_gaussians(
@@ -1273,22 +1326,24 @@ def rasterize_gaussians(
         model.scale,
         model.quaternion_xyzw,
         model.opacity,
+        type(model),
         cameras,
         training,
         gaussian_cfg,
         uv_grad_holder,
     )
     out = GaussianSplatOutput(
-        final_color=res[0],
-        final_depth=res[1],
-        final_custom_features=res[2],
-        final_T=res[3],
-        final_n_contrib=res[4],
+        color=res[0],
+        depth=res[1],
+        custom_features=res[2],
+        T=res[3],
+        n_contrib=res[4],
+        radii=res[5],
     )
     if background_tensor is not None:
-        out.final_color = out.final_color + out.final_T * background_tensor
+        out.color = out.color + out.T * background_tensor
     else:
         if training:
             bg_in_cfg_device = gaussian_cfg.get_bg_color_device(model.xyz.device)
-            out.final_color = out.final_color + out.final_T * bg_in_cfg_device.view(3, 1, 1)
+            out.color = out.color + out.T * bg_in_cfg_device.view(3, 1, 1)
     return out

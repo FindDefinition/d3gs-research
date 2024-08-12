@@ -1,10 +1,10 @@
 from plyfile import PlyData
 import torch 
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT
-from d3sim.ops.d3gs.base import GaussianModelOrigin
+from d3sim.ops.d3gs.base import GaussianModelOrigin, GaussianModelOriginFused
 import numpy as np
 
-def load_3dgs_origin_model(ply_path: str):
+def load_3dgs_origin_model(ply_path: str, fused: bool = True):
     ply = PlyData.read(ply_path)
     vertex = ply["vertex"]
     positions = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1).astype(np.float32) # [:2000000]
@@ -33,5 +33,8 @@ def load_3dgs_origin_model(ply_path: str):
     rots_th = torch.from_numpy(rots).to(D3SIM_DEFAULT_DEVICE)
     scales_th = torch.from_numpy(scales).to(D3SIM_DEFAULT_DEVICE)
     opacity_th = torch.from_numpy(opacity).to(D3SIM_DEFAULT_DEVICE)
-    model = GaussianModelOrigin(xyz=positions_th, quaternion_xyzw=rots_th, scale=scales_th, opacity=opacity_th, color_sh=sh_coeffs_th)
+    if fused:
+        model = GaussianModelOriginFused(xyz=positions_th, quaternion_xyzw=rots_th, scale=scales_th, opacity=opacity_th, color_sh=sh_coeffs_th)
+    else:
+        model = GaussianModelOrigin(xyz=positions_th, quaternion_xyzw=rots_th, scale=scales_th, opacity=opacity_th, color_sh=sh_coeffs_th)
     return model
