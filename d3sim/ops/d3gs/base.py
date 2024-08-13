@@ -120,7 +120,7 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
             color_sh_base=torch.empty(N, 3, dtype=dtype, device=device)
             if split else None,
             color_sh=torch.empty(N, (max_num_degree + 1) *
-                                 (max_num_degree + 1) - (3 if split else 0),
+                                 (max_num_degree + 1) - (1 if split else 0),
                                  3,
                                  dtype=dtype,
                                  device=device),
@@ -148,7 +148,7 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
             if split else None,
             color_sh=torch.nn.Parameter(
                 torch.empty(N, (max_num_degree + 1) * (max_num_degree + 1) -
-                            (3 if split else 0),
+                            (1 if split else 0),
                             3,
                             dtype=dtype,
                             device=device)),
@@ -182,7 +182,7 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
             color_sh_base=torch.zeros(N, 3, dtype=dtype, device=device)
             if split else None,
             color_sh=torch.zeros(N, (max_num_degree + 1) *
-                                 (max_num_degree + 1) - (3 if split else 0),
+                                 (max_num_degree + 1) - (1 if split else 0),
                                  3,
                                  dtype=dtype,
                                  device=device),

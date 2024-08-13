@@ -28,7 +28,7 @@ T_co = TypeVar("T_co")
 
 
 @dataclasses.dataclass
-class TrainEvent:
+class TrainEvent(Generic[T_co]):
     type: str
     event_index: int
     cur_step: int
@@ -36,6 +36,7 @@ class TrainEvent:
     total_step: int = -1
     total_epoch: int = -1
     total_step_per_epoch: int = -1
+    step_ctx_value: Optional[T_co] = None
 
 
 @dataclasses.dataclass
@@ -296,7 +297,9 @@ class BasicTrainEngine:
                         dataclasses.replace(base_event,
                                             type=ev_type,
                                             cur_step=cur_step,
-                                            event_index=ev_index))
+                                            event_index=ev_index,
+                                            step_ctx_value=None
+                                            if step_ctx_creator is None else ctx_value))
 
                 cur_step += 1
                 total_step_int += 1

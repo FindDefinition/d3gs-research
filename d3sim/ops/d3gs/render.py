@@ -19,7 +19,7 @@ import cumm.tensorview as tv
 from d3sim.ops.d3gs.data.utils.general_utils import strip_symmetric, build_scaling_rotation
 from cumm.inliner import torch_tensor_to_tv, measure_and_print_torch
 from torch.autograd.function import once_differentiable
-
+from d3sim.ops.d3gs.config_def import GaussianSplatConfig
 def fov2focal(fov: float, length: int):
     return float(length) / (2 * math.tan(fov / 2))
 
@@ -39,44 +39,6 @@ class BatchCameraParams:
     tan_fov: torch.Tensor
     shape_wh: tuple[int, int]
 
-@dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
-class GaussianSplatConfig:
-    tile_size: tuple[int, int] = (16, 16)
-    eps: float = 1e-6
-    cov2d_radii_eigen_eps: float = 0.1
-    projected_clamp_factor: float = 1.3
-    gaussian_std_sigma: float = 3.0 if IsAppleSiliconMacOs else 3.0
-    gaussian_lowpass_filter: float = 0.3
-    alpha_eps: float = 1.0 / 255.0
-    transmittance_eps: float = 0.0001
-    depth_32bit_prec: float = 0.001
-
-    enable_32bit_sort: bool = _DEFAULT_ENABLE_32BIT_SORT
-    render_depth: bool = False
-    bg_color: np.ndarray = dataclasses.field(
-        default_factory=lambda: np.zeros((3), np.float32))
-    scale_global: float = 1.0
-    use_nchw: bool = True
-    render_rgba: bool = False
-
-    transmittance_is_double = False
-    backward_reduction: Literal["none", "warp", "block"] = "warp"
-    verbose: bool = False
-
-    _bg_color_device: torch.Tensor | None = None
-
-    @property 
-    def num_channels(self):
-        return 4 if self.render_rgba else 3
-
-    @property
-    def block_size(self):
-        return self.tile_size[0] * self.tile_size[1]
-
-    def get_bg_color_device(self, device: torch.device):
-        if self._bg_color_device is None:
-            self._bg_color_device = torch.from_numpy(self.bg_color).to(device)
-        return self._bg_color_device
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatForwardContext(DataClassWithArrayCheck):
@@ -306,7 +268,7 @@ class GaussianSplatForward:
             if (training):
                 if has_color_base:
                     code_prep.raw(f"""
-                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base);
+                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + i;
                     auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr, sh_base_ptr);
                     """)
                 else:
@@ -324,7 +286,7 @@ class GaussianSplatForward:
             else:
                 if has_color_base:
                     code_prep.raw(f"""
-                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base);
+                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + i;
                     op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr, sh_base_ptr).op<op::maximum>(0.0f);
                     """)
                 else:
@@ -334,8 +296,6 @@ class GaussianSplatForward:
 
             INLINER.kernel_1d(prep_kernel_name, num, 0, code_prep)
             # print(INLINER.get_nvrtc_module(prep_kernel_name).params.debug_code)
-            print(rgb_gaussian[1])
-            breakpoint()
         with measure_and_print_torch("2", enable=enable_verbose):
             tiles_touched.cumsum_(0)
             num_rendered = int(tiles_touched[-1].item())
@@ -1088,7 +1048,7 @@ class GaussianSplatForward:
         dcolor_sh_res = torch.zeros_like(model.color_sh)
         dcolor_base_sh_res = None 
         has_color_base = model.color_sh_base is not None
-        if has_color_base:
+        if model.color_sh_base is not None:
             dcolor_base_sh_res = torch.zeros_like(model.color_sh_base)
         # dopacity = torch.zeros_like(model.opacity)
         grad_model = GaussianModelOrigin(xyz=dxyz_res,
@@ -1110,7 +1070,7 @@ class GaussianSplatForward:
         prep_kernel_name = (f"gs3d_preprocess_bwd_{axis_front_u_v}_{self.cfg.tile_size}_{degree}_"
                             f"{fused_scale_act}_{fused_q_act}_{fused_opacity_act}_"
                             f"{cur_degree}_{has_color_base}")
-        with tv.measure_and_print("BWD-2"):
+        with tv.measure_and_print("BWD-2", enable=self.cfg.verbose):
             code_prep = pccm.code()
             code_prep.raw(f"""
             namespace op = tv::arrayops;
@@ -1201,7 +1161,7 @@ class GaussianSplatForward:
             """)
             if has_color_base:
                 code_prep.raw(f"""
-                auto dsh_base_ptr = op::reinterpret_cast_array_nd<3>($dcolor_sh_res) + i * {(degree + 1) * (degree + 1) - has_color_base};
+                auto dsh_base_ptr = op::reinterpret_cast_array_nd<3>($dcolor_base_sh_res) + i;
                 auto dnormed_dir = Gaussian3D::sh_dir_to_rgb_grad<{cur_degree}>(color_grad, dsh_ptr,
                     normed_dir, sh_ptr, dsh_base_ptr);
                 """)
