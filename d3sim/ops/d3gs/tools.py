@@ -37,4 +37,5 @@ def load_3dgs_origin_model(ply_path: str, fused: bool = True):
         model = GaussianModelOriginFused(xyz=positions_th, quaternion_xyzw=rots_th, scale=scales_th, opacity=opacity_th, color_sh=sh_coeffs_th)
     else:
         model = GaussianModelOrigin(xyz=positions_th, quaternion_xyzw=rots_th, scale=scales_th, opacity=opacity_th, color_sh=sh_coeffs_th)
+    model.cur_sh_degree = 3
     return model

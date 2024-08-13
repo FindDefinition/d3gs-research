@@ -110,20 +110,22 @@ def _main_bwd():
     uv_grad_holder = torch.empty_like(mean2d_grads)
     uv_grad_holder.requires_grad = True
     # breakpoint()
+    cfg = GaussianSplatConfig()
     for j in range(5):
         mod.clear_grad()
+        print("cur_sh_degree", mod.cur_sh_degree)
         uv_grad_holder.grad = None
         t = time.time()
         # with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
         # res, _ = fwd.forward(mod, [cam])
         if check_grad:
-            res = rasterize_gaussians(mod, [cam], training=True, uv_grad_holder=uv_grad_holder)
+            res = rasterize_gaussians(mod, [cam], gaussian_cfg=cfg, training=True, uv_grad_holder=uv_grad_holder)
         else:
             res = rasterize_gaussians(mod, [cam], training=True)
         sync()
         print("FWD", time.time() - t)
         assert res is not None 
-        out_color = res.final_color
+        out_color = res.color
         # torch.manual_seed(50051)
         # dout_color = torch.rand(out_color.shape, device=out_color.device)
         sync()
@@ -136,7 +138,7 @@ def _main_bwd():
         # assert not mod.act_applied
         if check_grad:
             # print(dout_color.reshape(3, -1)[:, 1])
-            print(mod.opacity.grad[1], res.final_T.reshape(-1)[1].item())
+            print(mod.opacity.grad[1], res.T.reshape(-1)[1].item())
             print(opacity_grads.shape, mod.scale.grad.shape)
             print("opacity", torch.linalg.norm(mod.opacity.grad.reshape(opacity_grads.shape) - opacity_grads))
             print("scales", torch.linalg.norm(mod.scale.grad - scale_grads))
@@ -159,12 +161,12 @@ def _main():
         # res, _ = fwd.forward(mod, [cam])
         res = rasterize_gaussians(mod, [cam])
         assert res is not None 
-        out_color = res.final_color
+        out_color = res.color
         if j == 0:
             out_color_u8 = out_color.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
             out_color_u8 = out_color_u8[..., ::-1]
-            if res.final_depth is not None:
-                depth = res.final_depth
+            if res.depth is not None:
+                depth = res.depth
                 depth_rgb = depth_map_to_jet_rgb(depth, (0.2, 25.0)).cpu().numpy()
                 out_color_u8 = np.concatenate([out_color_u8, depth_rgb], axis=0)
 

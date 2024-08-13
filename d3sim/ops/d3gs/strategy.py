@@ -62,9 +62,14 @@ class GaussianTrainState(HomogeneousTensor):
             scene_scale=scene_scale,
         )
 
+    def reset(self):
+        self.duv_ndc_length.zero_()
+        self.count.zero_()
+        self.max_radii.zero_()
+
 @dataclasses.dataclass
 class GaussianStrategyConfig:
-    prune_opa: float = 0.005
+    prune_opacity_thresh: float = 0.005
     grow_grad2d: float = 0.0002
     grow_scale3d: float = 0.01
     grow_scale2d: float = 0.05
@@ -111,7 +116,7 @@ class GaussianStrategyBase:
             )
 
     @torch.no_grad()
-    def refine_gs_by_clone_split_prune(
+    def refine_gs(
         self,
         model: GaussianModelBase,
         optimizers: dict[str, torch.optim.optimizer.Optimizer],
@@ -138,8 +143,8 @@ class GaussianStrategyBase:
         namespace op = tv::arrayops;
         using math_op_t = tv::arrayops::MathScalarOp<float>;
 
-        auto cnt_val = cnt[i];
-        auto duv_ndc_length_val = duv_ndc_length[i];
+        auto cnt_val = $cnt[i];
+        auto duv_ndc_length_val = $duv_ndc_length[i];
         bool is_grad_high = (duv_ndc_length_val / cnt_val) >= $(self.cfg.grow_grad2d);
         auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
         auto opacity_val = $opacity[i];
@@ -160,7 +165,7 @@ class GaussianStrategyBase:
         $should_dupti_u8[i] = is_dupli;
         bool is_large = !is_small;
         float max_radii_val = $max_radii[i];
-        bool prune_mask_origin = opacity_val < $(self.cfg.prune_opa);
+        bool prune_mask_origin = opacity_val < $(self.cfg.prune_opacity_thresh);
         prune_mask_origin |= scale_max > $(self.cfg.prune_scale3d) * $scene_scale;
         if ($refine_by_radii){{
             is_large |= max_radii_val > $(self.cfg.grow_scale2d);
@@ -185,6 +190,7 @@ class GaussianStrategyBase:
 
         # create new model (except origin) and assign duplicated and split GSs
         new_model = model.empty(int(n_dupti + n_split * 2), model.color_sh_degree)
+        new_model.cur_sh_degree = model.cur_sh_degree
         new_model_should_prune = torch.empty(n_dupti + n_split * 2, dtype=torch.bool, device=duv_ndc_length.device)
         new_model[:n_dupti] = model[should_dupti]
         new_model_should_prune[:n_dupti] = dupti_should_prune
@@ -198,7 +204,7 @@ class GaussianStrategyBase:
         new_state[n_dupti:n_dupti + n_split] = state[should_split_inds]
         new_state[n_dupti + n_split:] = state[should_split_inds]
 
-        # do new loaction and scale calc on split points
+        # do new location and scale calc on split points
         new_model_split = new_model[n_dupti:]
         unit_normals = torch.randn(n_split * 2, 3, device=model.xyz.device)
         split_prune_mask_u8 = torch.empty(n_split * 2, dtype=torch.uint8, device=duv_ndc_length.device)
@@ -231,12 +237,12 @@ class GaussianStrategyBase:
         auto normal_vec3 = op::reinterpret_cast_array_nd<3>($unit_normals)[i];
         auto new_xyz = qmat.op<op::mv_colmajor>(normal_vec3 * scale) + xyz;
 
-        auto new_scaling = scale_act / (0.8f * 2);
+        auto new_scaling = scale / (0.8f * 2);
 
         op::reinterpret_cast_array_nd<3>($(new_model_split.xyz))[i] = new_xyz;
         op::reinterpret_cast_array_nd<3>($(new_model_split.scale))[i] = math_op_t::log(new_scaling);
         // calc prune mask
-        bool prune_mask_origin = opacity_val < $(self.cfg.prune_opa);
+        bool prune_mask_origin = opacity_val < $(self.cfg.prune_opacity_thresh);
         auto new_scaling_max = new_scaling.op<op::reduce_max>();
         prune_mask_origin |= new_scaling_max > $(self.cfg.prune_scale3d) * $scene_scale;
         if ($refine_by_radii){{
@@ -262,6 +268,7 @@ class GaussianStrategyBase:
 
         model.assign_inplace(res_model)
         state.assign_inplace(res_state)
+        state.reset()
 
         res_inds = torch.cat([origin_model_inds_prune, new_model_inds_prune], dim=0)
         select_gs_optimizer_by_mask(model, optimizers, res_inds)

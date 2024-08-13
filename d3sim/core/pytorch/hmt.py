@@ -8,14 +8,23 @@ from d3sim.core.arrcheck.dcbase import DataClassWithArrayCheck
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class HomogeneousTensor(DataClassWithArrayCheck):
-
-    def get_all_tensor_fields(self) -> dict[str, torch.Tensor]:
+    def _get_all_fields(self) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
         res: dict[str, torch.Tensor] = {}
+        res_non_tensor: dict[str, Any] = {}
         for field in dataclasses.fields(self):
             field_value = getattr(self, field.name)
             if isinstance(field_value, torch.Tensor):
                 res[field.name] = field_value
-        return res 
+            else:
+                res_non_tensor[field.name] = field_value
+        return res, res_non_tensor
+
+
+    def get_all_tensor_fields(self) -> dict[str, torch.Tensor]:
+        return self._get_all_fields()[0]
+
+    def get_all_non_tensor_fields(self) -> dict[str, Any]:
+        return self._get_all_fields()[1]
 
     def get_all_parameter_fields(self) -> dict[str, torch.nn.Parameter]:
         res: dict[str, torch.nn.Parameter] = {}
@@ -29,7 +38,7 @@ class HomogeneousTensor(DataClassWithArrayCheck):
         tensor_fields = self.get_all_tensor_fields()
         for key, value in tensor_fields.items():
             tensor_fields[key] = value[indices_or_mask]
-        return self.__class__(**tensor_fields)
+        return self.__class__(**tensor_fields, **self.get_all_non_tensor_fields())
 
     def __setitem__(self, indices_or_mask: Any, other: Self) -> None:
         for key, value in self.get_all_tensor_fields().items():
@@ -45,7 +54,7 @@ class HomogeneousTensor(DataClassWithArrayCheck):
         tensor_fields = self.get_all_tensor_fields()
         for key, value in tensor_fields.items():
             tensor_fields[key] = torch.cat([value, getattr(other, key)], dim=0)
-        return self.__class__(**tensor_fields)
+        return self.__class__(**tensor_fields, **self.get_all_non_tensor_fields())
 
     def concat_inplace(self, other: Self) -> Self:
         for key, value in self.get_all_tensor_fields().items():

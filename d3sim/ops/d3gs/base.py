@@ -16,6 +16,7 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
     color_sh: Annotated[torch.Tensor, arrcheck.ArrayCheck(["N", -1, 3], arrcheck.F32)]
 
     act_applied: bool = False
+    cur_sh_degree: int = 0
 
     @property 
     def xyz_act(self) -> torch.Tensor:
@@ -94,26 +95,29 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
             scale=self.scale_act,
             opacity=self.opacity_act,
             color_sh=self.color_sh_act,
+            cur_sh_degree=self.cur_sh_degree,
             act_applied=True)
 
     @classmethod 
-    def empty(cls, N: int, num_degree: int):
+    def empty(cls, N: int, max_num_degree: int):
         return cls(
             xyz=torch.empty(N, 3),
             quaternion_xyzw=torch.empty(N, 4),
             scale=torch.empty(N, 3),
             opacity=torch.empty(N),
-            color_sh=torch.empty(N, (num_degree + 1) * (num_degree + 1), 3)
+            color_sh=torch.empty(N, (max_num_degree + 1) * (max_num_degree + 1), 3),
+            cur_sh_degree=0,
         )
 
     @classmethod 
-    def empty_parameter(cls, N: int, num_degree: int):
+    def empty_parameter(cls, N: int, max_num_degree: int):
         return cls(
             xyz=torch.nn.Parameter(torch.empty(N, 3)),
             quaternion_xyzw=torch.nn.Parameter(torch.empty(N, 4)),
             scale=torch.nn.Parameter(torch.empty(N, 3)),
             opacity=torch.nn.Parameter(torch.empty(N)),
-            color_sh=torch.nn.Parameter(torch.empty(N, (num_degree + 1) * (num_degree + 1), 3))
+            color_sh=torch.nn.Parameter(torch.empty(N, (max_num_degree + 1) * (max_num_degree + 1), 3)),
+            cur_sh_degree=0,
         )
 
     def to_parameter(self):
@@ -122,17 +126,19 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
             quaternion_xyzw=torch.nn.Parameter(self.quaternion_xyzw),
             scale=torch.nn.Parameter(self.scale),
             opacity=torch.nn.Parameter(self.opacity),
-            color_sh=torch.nn.Parameter(self.color_sh)
+            color_sh=torch.nn.Parameter(self.color_sh),
+            cur_sh_degree=self.cur_sh_degree,
         )
 
     @classmethod 
-    def zeros(cls, N: int, num_degree: int):
+    def zeros(cls, N: int, max_num_degree: int):
         return cls(
             xyz=torch.zeros(N, 3),
             quaternion_xyzw=torch.zeros(N, 4),
             scale=torch.zeros(N, 3),
             opacity=torch.zeros(N),
-            color_sh=torch.zeros(N, (num_degree + 1) * (num_degree + 1), 3)
+            color_sh=torch.zeros(N, (max_num_degree + 1) * (max_num_degree + 1), 3),
+            cur_sh_degree=0,
         )
 
 
