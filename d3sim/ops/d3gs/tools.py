@@ -1,10 +1,19 @@
 from plyfile import PlyData
 import torch 
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT
-from d3sim.ops.d3gs.base import GaussianModelOrigin, GaussianModelOriginFused
+from d3sim.ops.d3gs.base import GaussianModelBase, GaussianModelOrigin, GaussianModelOriginFused
 import numpy as np
+from d3sim.csrc.inliner import INLINER
+from d3sim.csrc.gs3d import SHConstants
+from d3sim.ops.d3gs.ops import simple_knn
 
-def load_3dgs_origin_model(ply_path: str, fused: bool = True):
+def rgb_to_sh(rgb):
+    return (rgb - 0.5) / SHConstants.C0
+
+def inverse_sigmoid(x):
+    return torch.log(x/(1-x))
+
+def load_3dgs_origin_model(ply_path: str, fused: bool = True, split: bool = True):
     ply = PlyData.read(ply_path)
     vertex = ply["vertex"]
     positions = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1).astype(np.float32) # [:2000000]
@@ -30,12 +39,44 @@ def load_3dgs_origin_model(ply_path: str, fused: bool = True):
     opacity = vertex["opacity"].astype(np.float32)
     positions_th = torch.from_numpy(positions).to(D3SIM_DEFAULT_DEVICE)
     sh_coeffs_th = torch.from_numpy(sh_coeffs).to(D3SIM_DEFAULT_DEVICE).reshape(-1, 16, 3)
+    if split:
+        sh_coeffs_base_th = sh_coeffs_th[:, 0].contiguous()
+        sh_coeffs_th = sh_coeffs_th[:, 1:].contiguous()
+    else:
+        sh_coeffs_base_th = None
     rots_th = torch.from_numpy(rots).to(D3SIM_DEFAULT_DEVICE)
     scales_th = torch.from_numpy(scales).to(D3SIM_DEFAULT_DEVICE)
     opacity_th = torch.from_numpy(opacity).to(D3SIM_DEFAULT_DEVICE)
+
     if fused:
-        model = GaussianModelOriginFused(xyz=positions_th, quaternion_xyzw=rots_th, scale=scales_th, opacity=opacity_th, color_sh=sh_coeffs_th)
+        model = GaussianModelOriginFused(xyz=positions_th, quaternion_xyzw=rots_th, scale=scales_th, opacity=opacity_th, color_sh=sh_coeffs_th, color_sh_base=sh_coeffs_base_th)
     else:
-        model = GaussianModelOrigin(xyz=positions_th, quaternion_xyzw=rots_th, scale=scales_th, opacity=opacity_th, color_sh=sh_coeffs_th)
+        model = GaussianModelOrigin(xyz=positions_th, quaternion_xyzw=rots_th, scale=scales_th, opacity=opacity_th, color_sh=sh_coeffs_th, color_sh_base=sh_coeffs_base_th)
+    
+    
     model.cur_sh_degree = 3
     return model
+
+def points_to_gaussian_init_scale(points: torch.Tensor):
+    knn_res = simple_knn(points, 3)
+    knn_res_mean2 = torch.square(knn_res).mean(1)
+    dist2 = torch.clamp_min(knn_res_mean2, 0.0000001)       
+    scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+    return scales
+
+def init_original_3dgs_model(model: GaussianModelBase, points: np.ndarray, points_rgb: np.ndarray):
+    assert model.xyz.shape[0] == points.shape[0]
+    points_th = torch.from_numpy(points).to(D3SIM_DEFAULT_DEVICE)
+    points_rgb_th = torch.from_numpy(points_rgb).to(D3SIM_DEFAULT_DEVICE)
+    points_sh = rgb_to_sh(points_rgb_th)    
+    model.color_sh[:, 0] = points_sh
+    scales = points_to_gaussian_init_scale(points_th)
+    model.scale[:] = scales
+    quat_xyzw = torch.zeros((points_rgb_th.shape[0], 4), device="cuda")
+    quat_xyzw[:, 3] = 1
+    model.quaternion_xyzw[:] = quat_xyzw
+    opacities = inverse_sigmoid(0.1 * torch.ones((points_th.shape[0], 1), dtype=torch.float32, device=D3SIM_DEFAULT_DEVICE))
+    model.opacity[:] = opacities
+    model.cur_sh_degree = 0
+    model.xyz[:] = points_th
+    return 

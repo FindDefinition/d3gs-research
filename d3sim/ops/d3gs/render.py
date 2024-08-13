@@ -187,7 +187,7 @@ class GaussianSplatForward:
         scales = model.scale
         opacity = model.opacity
         color_sh = model.color_sh
-
+        color_sh_base = model.color_sh_base
         degree = model.color_sh_degree
         cur_degree = model.cur_sh_degree
 
@@ -222,10 +222,11 @@ class GaussianSplatForward:
         fused_scale_act = model.fused_scale_act_op
         fused_q_act = model.fused_quaternion_xyzw_act_op
         fused_opacity_act = model.fused_opacity_act_op
+        has_color_base = color_sh_base is not None
         with measure_and_print_torch("1", enable=enable_verbose):
             prep_kernel_name = (f"gs3d_preprocess_{axis_front_u_v}_{self.cfg.tile_size}_{degree}_{training}_"
                                 f"{fused_scale_act}_{fused_q_act}_{fused_opacity_act}_"
-                                f"{cur_degree}")
+                                f"{cur_degree}_{has_color_base}")
             code_prep = pccm.code()
             code_prep.raw(f"""
             namespace op = tv::arrayops;
@@ -299,12 +300,20 @@ class GaussianSplatForward:
             code_prep.raw(f"""
             tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], opacity_val}};
             op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
-            auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1)};
+            auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1) - has_color_base};
             
             """)
             if (training):
+                if has_color_base:
+                    code_prep.raw(f"""
+                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base);
+                    auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr, sh_base_ptr);
+                    """)
+                else:
+                    code_prep.raw(f"""
+                    auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr);
+                    """)
                 code_prep.raw(f"""
-                auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr);
                 uint8_t ne_0_packed = (uint8_t(rgb[0] < 0) << 2) | (uint8_t(rgb[1] < 0) << 1) | uint8_t(rgb[2] < 0);
                 op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = rgb.op<op::maximum>(0.0f);
                 $sh_to_rgb_ne_0[i] = ne_0_packed;
@@ -313,11 +322,20 @@ class GaussianSplatForward:
                 op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i] = cov2d_vec;
                 """)
             else:
-                code_prep.raw(f"""
-                op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr).op<op::maximum>(0.0f);
-                """)
+                if has_color_base:
+                    code_prep.raw(f"""
+                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base);
+                    op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr, sh_base_ptr).op<op::maximum>(0.0f);
+                    """)
+                else:
+                    code_prep.raw(f"""
+                    op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr).op<op::maximum>(0.0f);
+                    """)
 
             INLINER.kernel_1d(prep_kernel_name, num, 0, code_prep)
+            # print(INLINER.get_nvrtc_module(prep_kernel_name).params.debug_code)
+            print(rgb_gaussian[1])
+            breakpoint()
         with measure_and_print_torch("2", enable=enable_verbose):
             tiles_touched.cumsum_(0)
             num_rendered = int(tiles_touched[-1].item())
@@ -1068,12 +1086,17 @@ class GaussianSplatForward:
         dscale_res = torch.zeros_like(model.scale)
         dquat_res = torch.zeros_like(model.quaternion_xyzw)
         dcolor_sh_res = torch.zeros_like(model.color_sh)
+        dcolor_base_sh_res = None 
+        has_color_base = model.color_sh_base is not None
+        if has_color_base:
+            dcolor_base_sh_res = torch.zeros_like(model.color_sh_base)
         # dopacity = torch.zeros_like(model.opacity)
         grad_model = GaussianModelOrigin(xyz=dxyz_res,
                                          color_sh=dcolor_sh_res,
                                          scale=dscale_res,
                                          quaternion_xyzw=dquat_res,
-                                         opacity=dopacity)
+                                         opacity=dopacity,
+                                         color_sh_base=dcolor_base_sh_res)
         xyz = model.xyz
         scales = model.scale
         quat_xyzw = model.quaternion_xyzw
@@ -1086,7 +1109,7 @@ class GaussianSplatForward:
         fused_opacity_act = model.fused_opacity_act_op
         prep_kernel_name = (f"gs3d_preprocess_bwd_{axis_front_u_v}_{self.cfg.tile_size}_{degree}_"
                             f"{fused_scale_act}_{fused_q_act}_{fused_opacity_act}_"
-                            f"{cur_degree}")
+                            f"{cur_degree}_{has_color_base}")
         with tv.measure_and_print("BWD-2"):
             code_prep = pccm.code()
             code_prep.raw(f"""
@@ -1162,8 +1185,8 @@ class GaussianSplatForward:
             op::reinterpret_cast_array_nd<4>($dquat_res)[i] = dquat;
 
             auto normed_dir = (point).op<op::normalize>();
-            auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1)};
-            auto dsh_ptr = op::reinterpret_cast_array_nd<3>($dcolor_sh_res) + i * {(degree + 1) * (degree + 1)};
+            auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1) - has_color_base};
+            auto dsh_ptr = op::reinterpret_cast_array_nd<3>($dcolor_sh_res) + i * {(degree + 1) * (degree + 1) - has_color_base};
             auto color_grad = op::reinterpret_cast_array_nd<3>($dcolor)[i];
 
             uint8_t nn_packed = $sh_to_rgb_ne_0[i];
@@ -1174,8 +1197,20 @@ class GaussianSplatForward:
             color_grad[1] *= rgb1_ne_0 ? 0.0f : 1.0f;
             color_grad[2] *= rgb2_ne_0 ? 0.0f : 1.0f;
             
-            auto dnormed_dir = Gaussian3D::sh_dir_to_rgb_grad<{cur_degree}>(color_grad, dsh_ptr,
-                normed_dir, sh_ptr);
+
+            """)
+            if has_color_base:
+                code_prep.raw(f"""
+                auto dsh_base_ptr = op::reinterpret_cast_array_nd<3>($dcolor_sh_res) + i * {(degree + 1) * (degree + 1) - has_color_base};
+                auto dnormed_dir = Gaussian3D::sh_dir_to_rgb_grad<{cur_degree}>(color_grad, dsh_ptr,
+                    normed_dir, sh_ptr, dsh_base_ptr);
+                """)
+            else:
+                code_prep.raw(f"""
+                auto dnormed_dir = Gaussian3D::sh_dir_to_rgb_grad<{cur_degree}>(color_grad, dsh_ptr,
+                    normed_dir, sh_ptr);
+                """)
+            code_prep.raw(f"""
             dxyz += dnormed_dir.op<op::normalize_grad>(point);
             op::reinterpret_cast_array_nd<3>($dxyz_res)[i] = dxyz;
 
@@ -1194,6 +1229,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         # model
         xyz,
         color_sh,
+        color_sh_base,
         scale,
         quaternion_xyzw,
         opacity,
@@ -1210,6 +1246,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         model = model_cls(
             xyz=xyz,
             color_sh=color_sh,
+            color_sh_base=color_sh_base,
             scale=scale,
             quaternion_xyzw=quaternion_xyzw,
             opacity=opacity,
@@ -1234,6 +1271,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 # model tensors
                 xyz,
                 color_sh,
+                color_sh_base,
                 scale,
                 quaternion_xyzw,
                 opacity,
@@ -1262,7 +1300,7 @@ class _RasterizeGaussians(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, drgb, ddepth, dcustom_features, dT, dn_contrib, dradii):
         if len(ctx.saved_tensors) == 0:
-            return (None, ) * 11
+            return (None, ) * 12
         op: GaussianSplatForward = ctx.op
 
         with tv.measure_and_print("BWD-torch", enable=op.cfg.verbose):
@@ -1289,9 +1327,10 @@ class _RasterizeGaussians(torch.autograd.Function):
             model = ctx.model_cls(
                 xyz=ctx.saved_tensors[10],
                 color_sh=ctx.saved_tensors[11],
-                scale=ctx.saved_tensors[12],
-                quaternion_xyzw=ctx.saved_tensors[13],
-                opacity=ctx.saved_tensors[14],
+                color_sh_base=ctx.saved_tensors[12],
+                scale=ctx.saved_tensors[13],
+                quaternion_xyzw=ctx.saved_tensors[14],
+                opacity=ctx.saved_tensors[15],
                 act_applied=True,
                 cur_sh_degree=ctx.cur_sh_degree,
             )
@@ -1314,7 +1353,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 print("Gradient Size", gradient.get_all_torch_tensor_byte_size())
             cams: list[BasicPinholeCamera] = ctx.cams
         grad_out, duv = op.backward(model, cams, fwd_ctx, out, gradient, ctx.return_uv_grad)
-        return grad_out.xyz, grad_out.color_sh, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, None, None, None, duv
+        return grad_out.xyz, grad_out.color_sh, grad_out.color_sh_base, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, None, None, None, duv
 
 
 def rasterize_gaussians(
@@ -1331,6 +1370,7 @@ def rasterize_gaussians(
     res = _RasterizeGaussians.apply(
         model.xyz,
         model.color_sh,
+        model.color_sh_base,
         model.scale,
         model.quaternion_xyzw,
         model.opacity,

@@ -85,40 +85,43 @@ class Gaussian3D(pccm.Class):
         code.targ("T")
         code.arg("dir", "tv::array<T, 3>")
         code.arg("sh_ptr", "TV_METAL_DEVICE const tv::array<T, 3>*")
+        code.arg("sh_base_ptr", "TV_METAL_DEVICE const tv::array<T, 3>*", "nullptr")
+
         code.raw(f"""
         namespace op = tv::arrayops;
-        op::PointerValueReader<TV_METAL_DEVICE const tv::array<T, 3>> sh(sh_ptr);
+        op::PointerValueReader<TV_METAL_DEVICE const tv::array<T, 3>> sh(sh_ptr + int(sh_base_ptr == nullptr));
         static_assert(Degree >= 0 && Degree <= 3, "Degree must be in [0, 3]");
-        tv::array<T, 3> result = T({SHConstants.C0}) * sh[0];
+        auto base = sh_base_ptr == nullptr ? sh_ptr[0] : sh_base_ptr[0];
+        tv::array<T, 3> result = T({SHConstants.C0}) * base;
         if (Degree > 0)
         {{
             T x = dir[0];
             T y = dir[1];
             T z = dir[2];
             constexpr T C1 = T({SHConstants.C1});
-            result = result - C1 * y * sh[1] + C1 * z * sh[2] - C1 * x * sh[3];
+            result = result - C1 * y * sh[0] + C1 * z * sh[1] - C1 * x * sh[2];
 
             if (Degree > 1)
             {{
                 T xx = x * x, yy = y * y, zz = z * z;
                 T xy = x * y, yz = y * z, xz = x * z;
                 result = result +
-                    T({SHConstants.C2[0]}) * xy * sh[4] +
-                    T({SHConstants.C2[1]}) * yz * sh[5] +
-                    T({SHConstants.C2[2]}) * (T(2) * zz - xx - yy) * sh[6] +
-                    T({SHConstants.C2[3]}) * xz * sh[7] +
-                    T({SHConstants.C2[4]}) * (xx - yy) * sh[8];
+                    T({SHConstants.C2[0]}) * xy * sh[3] +
+                    T({SHConstants.C2[1]}) * yz * sh[4] +
+                    T({SHConstants.C2[2]}) * (T(2) * zz - xx - yy) * sh[5] +
+                    T({SHConstants.C2[3]}) * xz * sh[6] +
+                    T({SHConstants.C2[4]}) * (xx - yy) * sh[7];
 
                 if (Degree > 2)
                 {{
                     result = result +
-                        T({SHConstants.C3[0]}) * y * (T(3) * xx - yy) * sh[9] +
-                        T({SHConstants.C3[1]}) * xy * z * sh[10] +
-                        T({SHConstants.C3[2]}) * y * (T(4) * zz - xx - yy) * sh[11] +
-                        T({SHConstants.C3[3]}) * z * (T(2) * zz - T(3) * xx - T(3) * yy) * sh[12] +
-                        T({SHConstants.C3[4]}) * x * (T(4) * zz - xx - yy) * sh[13] +
-                        T({SHConstants.C3[5]}) * z * (xx - yy) * sh[14] +
-                        T({SHConstants.C3[6]}) * x * (xx - T(3) * yy) * sh[15];
+                        T({SHConstants.C3[0]}) * y * (T(3) * xx - yy) * sh[8] +
+                        T({SHConstants.C3[1]}) * xy * z * sh[9] +
+                        T({SHConstants.C3[2]}) * y * (T(4) * zz - xx - yy) * sh[10] +
+                        T({SHConstants.C3[3]}) * z * (T(2) * zz - T(3) * xx - T(3) * yy) * sh[11] +
+                        T({SHConstants.C3[4]}) * x * (T(4) * zz - xx - yy) * sh[12] +
+                        T({SHConstants.C3[5]}) * z * (xx - yy) * sh[13] +
+                        T({SHConstants.C3[6]}) * x * (xx - T(3) * yy) * sh[14];
                 }}
             }}
         }}
@@ -136,31 +139,34 @@ class Gaussian3D(pccm.Class):
         code.arg("dsh_ptr", "TV_METAL_DEVICE tv::array<T, 3>*")
         code.arg("dir", "tv::array<T, 3>")
         code.arg("sh_ptr", "TV_METAL_DEVICE const tv::array<T, 3>*")
+        code.arg("dsh_base_ptr", "TV_METAL_DEVICE tv::array<T, 3>*", "nullptr")
+
         code.raw(f"""
         namespace op = tv::arrayops;
-        op::PointerValueReader<TV_METAL_DEVICE const tv::array<T, 3>> sh(sh_ptr);
+        op::PointerValueReader<TV_METAL_DEVICE const tv::array<T, 3>> sh(sh_ptr + int(dsh_base_ptr == nullptr));
         static_assert(Degree >= 0 && Degree <= 3, "Degree must be in [0, 3]");
         tv::array<T, 3> dRGBdx{{}};
         tv::array<T, 3> dRGBdy{{}};
         tv::array<T, 3> dRGBdz{{}};
-
+        auto real_dsh_base_ptr = dsh_base_ptr == nullptr ? dsh_ptr : dsh_base_ptr;
+        dsh_ptr += int(dsh_base_ptr == nullptr);
         T x = dir[0];
         T y = dir[1];
         T z = dir[2];
 
-        dsh_ptr[0] = T({SHConstants.C0}) * drgb;
+        real_dsh_base_ptr[0] = T({SHConstants.C0}) * drgb;
         if (Degree > 0)
         {{
             T dRGBdsh1 = -T({SHConstants.C1}) * y;
             T dRGBdsh2 = T({SHConstants.C1}) * z;
             T dRGBdsh3 = -T({SHConstants.C1}) * x;
-            dsh_ptr[1] = dRGBdsh1 * drgb;
-            dsh_ptr[2] = dRGBdsh2 * drgb;
-            dsh_ptr[3] = dRGBdsh3 * drgb;
+            dsh_ptr[0] = dRGBdsh1 * drgb;
+            dsh_ptr[1] = dRGBdsh2 * drgb;
+            dsh_ptr[2] = dRGBdsh3 * drgb;
 
-            dRGBdx = -T({SHConstants.C1}) * sh[3];
-            dRGBdy = -T({SHConstants.C1}) * sh[1];
-            dRGBdz = T({SHConstants.C1}) * sh[2];
+            dRGBdx = -T({SHConstants.C1}) * sh[2];
+            dRGBdy = -T({SHConstants.C1}) * sh[0];
+            dRGBdz = T({SHConstants.C1}) * sh[1];
 
             if (Degree > 1)
             {{
@@ -171,15 +177,15 @@ class Gaussian3D(pccm.Class):
                 T dRGBdsh6 = T({SHConstants.C2[2]}) * (T(2) * zz - xx - yy);
                 T dRGBdsh7 = T({SHConstants.C2[3]}) * xz;
                 T dRGBdsh8 = T({SHConstants.C2[4]}) * (xx - yy);
-                dsh_ptr[4] = dRGBdsh4 * drgb;
-                dsh_ptr[5] = dRGBdsh5 * drgb;
-                dsh_ptr[6] = dRGBdsh6 * drgb;
-                dsh_ptr[7] = dRGBdsh7 * drgb;
-                dsh_ptr[8] = dRGBdsh8 * drgb;
-
-                dRGBdx += T({SHConstants.C2[0]}) * y * sh[4] + T({SHConstants.C2[2]}) * T(2) * -x * sh[6] + T({SHConstants.C2[3]}) * z * sh[7] + T({SHConstants.C2[4]}) * T(2) * x * sh[8];
-                dRGBdy += T({SHConstants.C2[0]}) * x * sh[4] + T({SHConstants.C2[1]}) * z * sh[5] + T({SHConstants.C2[2]}) * T(2) * -y * sh[6] + T({SHConstants.C2[4]}) * T(2) * -y * sh[8];
-                dRGBdz += T({SHConstants.C2[1]}) * y * sh[5] + T({SHConstants.C2[2]}) * T(2) * T(2) * z * sh[6] + T({SHConstants.C2[3]}) * x * sh[7];
+                dsh_ptr[3] = dRGBdsh4 * drgb;
+                dsh_ptr[4] = dRGBdsh5 * drgb;
+                dsh_ptr[5] = dRGBdsh6 * drgb;
+                dsh_ptr[6] = dRGBdsh7 * drgb;
+                dsh_ptr[7] = dRGBdsh8 * drgb;
+                
+                dRGBdx += T({SHConstants.C2[0]}) * y * sh[3] + T({SHConstants.C2[2]}) * T(2) * -x * sh[5] + T({SHConstants.C2[3]}) * z * sh[6] + T({SHConstants.C2[4]}) * T(2) * x * sh[7];
+                dRGBdy += T({SHConstants.C2[0]}) * x * sh[3] + T({SHConstants.C2[1]}) * z * sh[4] + T({SHConstants.C2[2]}) * T(2) * -y * sh[5] + T({SHConstants.C2[4]}) * T(2) * -y * sh[7];
+                dRGBdz += T({SHConstants.C2[1]}) * y * sh[4] + T({SHConstants.C2[2]}) * T(2) * T(2) * z * sh[5] + T({SHConstants.C2[3]}) * x * sh[6];
                 
                 if (Degree > 2)
                 {{
@@ -190,38 +196,38 @@ class Gaussian3D(pccm.Class):
                     T dRGBdsh13 = T({SHConstants.C3[4]}) * x * (T(4) * zz - xx - yy);
                     T dRGBdsh14 = T({SHConstants.C3[5]}) * z * (xx - yy);
                     T dRGBdsh15 = T({SHConstants.C3[6]}) * x * (xx - T(3) * yy);
-                    dsh_ptr[9] = dRGBdsh9 * drgb;
-                    dsh_ptr[10] = dRGBdsh10 * drgb;
-                    dsh_ptr[11] = dRGBdsh11 * drgb;
-                    dsh_ptr[12] = dRGBdsh12 * drgb;
-                    dsh_ptr[13] = dRGBdsh13 * drgb;
-                    dsh_ptr[14] = dRGBdsh14 * drgb;
-                    dsh_ptr[15] = dRGBdsh15 * drgb;
+                    dsh_ptr[8] = dRGBdsh9 * drgb;
+                    dsh_ptr[9] = dRGBdsh10 * drgb;
+                    dsh_ptr[10] = dRGBdsh11 * drgb;
+                    dsh_ptr[11] = dRGBdsh12 * drgb;
+                    dsh_ptr[12] = dRGBdsh13 * drgb;
+                    dsh_ptr[13] = dRGBdsh14 * drgb;
+                    dsh_ptr[14] = dRGBdsh15 * drgb;
 
                     dRGBdx += (
-                        T({SHConstants.C3[0]}) * sh[9] * T(3) * T(2) * xy +
-                        T({SHConstants.C3[1]}) * sh[10] * yz +
-                        T({SHConstants.C3[2]}) * sh[11] * -T(2) * xy +
-                        T({SHConstants.C3[3]}) * sh[12] * -T(3) * T(2) * xz +
-                        T({SHConstants.C3[4]}) * sh[13] * (-T(3) * xx + T(4) * zz - yy) +
-                        T({SHConstants.C3[5]}) * sh[14] * T(2) * xz +
-                        T({SHConstants.C3[6]}) * sh[15] * T(3) * (xx - yy));
+                        T({SHConstants.C3[0]}) * sh[8] * T(3) * T(2) * xy +
+                        T({SHConstants.C3[1]}) * sh[9] * yz +
+                        T({SHConstants.C3[2]}) * sh[10] * -T(2) * xy +
+                        T({SHConstants.C3[3]}) * sh[11] * -T(3) * T(2) * xz +
+                        T({SHConstants.C3[4]}) * sh[12] * (-T(3) * xx + T(4) * zz - yy) +
+                        T({SHConstants.C3[5]}) * sh[13] * T(2) * xz +
+                        T({SHConstants.C3[6]}) * sh[14] * T(3) * (xx - yy));
 
                     dRGBdy += (
-                        T({SHConstants.C3[0]}) * sh[9] * T(3) * (xx - yy) +
-                        T({SHConstants.C3[1]}) * sh[10] * xz +
-                        T({SHConstants.C3[2]}) * sh[11] * (-T(3) * yy + T(4) * zz - xx) +
-                        T({SHConstants.C3[3]}) * sh[12] * -T(3) * T(2) * yz +
-                        T({SHConstants.C3[4]}) * sh[13] * -T(2) * xy +
-                        T({SHConstants.C3[5]}) * sh[14] * -T(2) * yz +
-                        T({SHConstants.C3[6]}) * sh[15] * -T(3) * T(2) * xy);
+                        T({SHConstants.C3[0]}) * sh[8] * T(3) * (xx - yy) +
+                        T({SHConstants.C3[1]}) * sh[9] * xz +
+                        T({SHConstants.C3[2]}) * sh[10] * (-T(3) * yy + T(4) * zz - xx) +
+                        T({SHConstants.C3[3]}) * sh[11] * -T(3) * T(2) * yz +
+                        T({SHConstants.C3[4]}) * sh[12] * -T(2) * xy +
+                        T({SHConstants.C3[5]}) * sh[13] * -T(2) * yz +
+                        T({SHConstants.C3[6]}) * sh[14] * -T(3) * T(2) * xy);
 
                     dRGBdz += (
-                        T({SHConstants.C3[1]}) * sh[10] * xy +
-                        T({SHConstants.C3[2]}) * sh[11] * T(4) * T(2) * yz +
-                        T({SHConstants.C3[3]}) * sh[12] * T(3) * (T(2) * zz - xx - yy) +
-                        T({SHConstants.C3[4]}) * sh[13] * T(4) * T(2) * xz +
-                        T({SHConstants.C3[5]}) * sh[14] * (xx - yy));
+                        T({SHConstants.C3[1]}) * sh[9] * xy +
+                        T({SHConstants.C3[2]}) * sh[10] * T(4) * T(2) * yz +
+                        T({SHConstants.C3[3]}) * sh[11] * T(3) * (T(2) * zz - xx - yy) +
+                        T({SHConstants.C3[4]}) * sh[12] * T(4) * T(2) * xz +
+                        T({SHConstants.C3[5]}) * sh[13] * (xx - yy));
                 }}
             }}
         }}

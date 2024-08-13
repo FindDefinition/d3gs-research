@@ -3,31 +3,36 @@ from typing import Annotated
 
 from d3sim.core import dataclass_dispatch as dataclasses
 from d3sim.core.pytorch.hmt import HomogeneousTensor
-import torch 
+import torch
 from d3sim.core import arrcheck
-import abc 
+import abc
+
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianModelBase(HomogeneousTensor, abc.ABC):
     xyz: Annotated[torch.Tensor, arrcheck.ArrayCheck(["N", 3], arrcheck.F32)]
-    quaternion_xyzw: Annotated[torch.Tensor, arrcheck.ArrayCheck(["N", 4], arrcheck.F32)]
+    quaternion_xyzw: Annotated[torch.Tensor,
+                               arrcheck.ArrayCheck(["N", 4], arrcheck.F32)]
     scale: Annotated[torch.Tensor, arrcheck.ArrayCheck(["N", 3], arrcheck.F32)]
     opacity: Annotated[torch.Tensor, arrcheck.ArrayCheck(["N"], arrcheck.F32)]
-    color_sh: Annotated[torch.Tensor, arrcheck.ArrayCheck(["N", -1, 3], arrcheck.F32)]
+    color_sh: Annotated[torch.Tensor,
+                        arrcheck.ArrayCheck(["N", -1, 3], arrcheck.F32)]
+    color_sh_base: Annotated[torch.Tensor | None,
+                             arrcheck.ArrayCheck(["N", 3], arrcheck.F32)]
 
     act_applied: bool = False
     cur_sh_degree: int = 0
 
-    @property 
+    @property
     def xyz_act(self) -> torch.Tensor:
         return self.xyz
 
-    @property 
+    @property
     @abc.abstractmethod
     def quaternion_xyzw_act(self) -> torch.Tensor:
         raise NotImplementedError
 
-    @property 
+    @property
     @abc.abstractmethod
     def scale_act(self) -> torch.Tensor:
         raise NotImplementedError
@@ -36,13 +41,12 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
     def inverse_scale_act(self, scale_act: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
-
-    @property 
+    @property
     @abc.abstractmethod
     def opacity_act(self) -> torch.Tensor:
         raise NotImplementedError
 
-    @property 
+    @property
     def fused_quaternion_xyzw_act_op(self) -> tuple[str, str] | None:
         """there are three component support fused act to save gpu memory.
         when you implement fused op, you should return identity
@@ -50,25 +54,28 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
         """
         return None
 
-    @property 
+    @property
     def fused_scale_act_op(self) -> tuple[str, str] | None:
         return None
 
-    @property 
+    @property
     def fused_opacity_act_op(self) -> tuple[str, str] | None:
         return None
 
-    @property 
+    @property
     def color_sh_act(self) -> torch.Tensor:
         return self.color_sh
 
-    @property 
+    @property
     def color_sh_degree(self) -> int:
-        res = int(math.sqrt(self.color_sh.shape[1])) - 1
-        assert (res + 1) * (res + 1) == self.color_sh.shape[1]
-        return res 
+        dim = self.color_sh.shape[1]
+        if self.color_sh_base is not None:
+            dim += 1
+        res = int(math.sqrt(dim)) - 1
+        assert (res + 1) * (res + 1) == dim
+        return res
 
-    @property 
+    @property
     def custom_features(self) -> torch.Tensor | None:
         return None
 
@@ -89,34 +96,62 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
     def create_model_with_act(self):
         if self.act_applied:
             return self
-        return self.__class__(
-            xyz=self.xyz_act,
-            quaternion_xyzw=self.quaternion_xyzw_act,
-            scale=self.scale_act,
-            opacity=self.opacity_act,
-            color_sh=self.color_sh_act,
-            cur_sh_degree=self.cur_sh_degree,
-            act_applied=True)
+        return self.__class__(xyz=self.xyz_act,
+                              quaternion_xyzw=self.quaternion_xyzw_act,
+                              scale=self.scale_act,
+                              opacity=self.opacity_act,
+                              color_sh=self.color_sh_act,
+                              cur_sh_degree=self.cur_sh_degree,
+                              color_sh_base=self.color_sh_base,
+                              act_applied=True)
 
-    @classmethod 
-    def empty(cls, N: int, max_num_degree: int):
+    @classmethod
+    def empty(cls,
+              N: int,
+              max_num_degree: int,
+              split: bool = False,
+              dtype: torch.dtype = torch.float32,
+              device: torch.device = torch.device("cpu")):
         return cls(
-            xyz=torch.empty(N, 3),
-            quaternion_xyzw=torch.empty(N, 4),
-            scale=torch.empty(N, 3),
-            opacity=torch.empty(N),
-            color_sh=torch.empty(N, (max_num_degree + 1) * (max_num_degree + 1), 3),
+            xyz=torch.empty(N, 3, dtype=dtype, device=device),
+            quaternion_xyzw=torch.empty(N, 4, dtype=dtype, device=device),
+            scale=torch.empty(N, 3, dtype=dtype, device=device),
+            opacity=torch.empty(N, dtype=dtype, device=device),
+            color_sh_base=torch.empty(N, 3, dtype=dtype, device=device)
+            if split else None,
+            color_sh=torch.empty(N, (max_num_degree + 1) *
+                                 (max_num_degree + 1) - (3 if split else 0),
+                                 3,
+                                 dtype=dtype,
+                                 device=device),
             cur_sh_degree=0,
         )
 
-    @classmethod 
-    def empty_parameter(cls, N: int, max_num_degree: int):
+    @classmethod
+    def empty_parameter(cls,
+                        N: int,
+                        max_num_degree: int,
+                        split: bool = False,
+                        dtype: torch.dtype = torch.float32,
+                        device: torch.device = torch.device("cpu")):
         return cls(
-            xyz=torch.nn.Parameter(torch.empty(N, 3)),
-            quaternion_xyzw=torch.nn.Parameter(torch.empty(N, 4)),
-            scale=torch.nn.Parameter(torch.empty(N, 3)),
-            opacity=torch.nn.Parameter(torch.empty(N)),
-            color_sh=torch.nn.Parameter(torch.empty(N, (max_num_degree + 1) * (max_num_degree + 1), 3)),
+            xyz=torch.nn.Parameter(
+                torch.empty(N, 3, dtype=dtype, device=device)),
+            quaternion_xyzw=torch.nn.Parameter(
+                torch.empty(N, 4, dtype=dtype, device=device)),
+            scale=torch.nn.Parameter(
+                torch.empty(N, 3, dtype=dtype, device=device)),
+            opacity=torch.nn.Parameter(
+                torch.empty(N, dtype=dtype, device=device)),
+            color_sh_base=torch.nn.Parameter(
+                torch.empty(N, 3, dtype=dtype, device=device))
+            if split else None,
+            color_sh=torch.nn.Parameter(
+                torch.empty(N, (max_num_degree + 1) * (max_num_degree + 1) -
+                            (3 if split else 0),
+                            3,
+                            dtype=dtype,
+                            device=device)),
             cur_sh_degree=0,
         )
 
@@ -127,30 +162,43 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
             scale=torch.nn.Parameter(self.scale),
             opacity=torch.nn.Parameter(self.opacity),
             color_sh=torch.nn.Parameter(self.color_sh),
+            color_sh_base=torch.nn.Parameter(self.color_sh_base)
+            if self.color_sh_base is not None else None,
             cur_sh_degree=self.cur_sh_degree,
         )
 
-    @classmethod 
-    def zeros(cls, N: int, max_num_degree: int):
+    @classmethod
+    def zeros(cls,
+              N: int,
+              max_num_degree: int,
+              split: bool = False,
+              dtype: torch.dtype = torch.float32,
+              device: torch.device = torch.device("cpu")):
         return cls(
-            xyz=torch.zeros(N, 3),
-            quaternion_xyzw=torch.zeros(N, 4),
-            scale=torch.zeros(N, 3),
-            opacity=torch.zeros(N),
-            color_sh=torch.zeros(N, (max_num_degree + 1) * (max_num_degree + 1), 3),
+            xyz=torch.zeros(N, 3, dtype=dtype, device=device),
+            quaternion_xyzw=torch.zeros(N, 4, dtype=dtype, device=device),
+            scale=torch.zeros(N, 3, dtype=dtype, device=device),
+            opacity=torch.zeros(N, dtype=dtype, device=device),
+            color_sh_base=torch.zeros(N, 3, dtype=dtype, device=device)
+            if split else None,
+            color_sh=torch.zeros(N, (max_num_degree + 1) *
+                                 (max_num_degree + 1) - (3 if split else 0),
+                                 3,
+                                 dtype=dtype,
+                                 device=device),
             cur_sh_degree=0,
         )
 
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianModelOrigin(GaussianModelBase):
-    @property 
+    @property
     def quaternion_xyzw_act(self) -> torch.Tensor:
         if self.act_applied:
             return self.quaternion_xyzw
         return torch.nn.functional.normalize(self.quaternion_xyzw, p=2, dim=-1)
 
-    @property 
+    @property
     def scale_act(self) -> torch.Tensor:
         if self.act_applied:
             return self.scale
@@ -159,7 +207,7 @@ class GaussianModelOrigin(GaussianModelBase):
     def inverse_scale_act(self, scale_act: torch.Tensor) -> torch.Tensor:
         return torch.log(scale_act)
 
-    @property 
+    @property
     def opacity_act(self) -> torch.Tensor:
         if self.act_applied:
             return self.opacity
@@ -168,30 +216,29 @@ class GaussianModelOrigin(GaussianModelBase):
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianModelOriginFused(GaussianModelBase):
-    @property 
+    @property
     def quaternion_xyzw_act(self) -> torch.Tensor:
         return self.quaternion_xyzw
 
-    @property 
+    @property
     def scale_act(self) -> torch.Tensor:
         return self.scale
 
     def inverse_scale_act(self, scale_act: torch.Tensor) -> torch.Tensor:
         return torch.log(scale_act)
 
-    @property 
+    @property
     def opacity_act(self) -> torch.Tensor:
         return self.opacity
 
-    @property 
+    @property
     def fused_quaternion_xyzw_act_op(self) -> tuple[str, str] | None:
         return ("normalize", "normalize_grad")
 
-    @property 
+    @property
     def fused_scale_act_op(self) -> tuple[str, str] | None:
         return ("exponential", "exponential_grad")
 
-    @property 
+    @property
     def fused_opacity_act_op(self) -> tuple[str, str] | None:
         return ("sigmoid", "sigmoid_grad")
-

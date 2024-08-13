@@ -17,7 +17,6 @@ def simple_knn(points: torch.Tensor, k: int, use_64bit: bool = False):
     """
     assert points.is_contiguous()
     num_point = points.shape[0]
-
     point_stride = points.stride(0)
     points_min, _ = points[:, :3].min(0)
     points_max, _ = points[:, :3].max(0)
@@ -26,7 +25,7 @@ def simple_knn(points: torch.Tensor, k: int, use_64bit: bool = False):
     code = pccm.code()
     cpp_dtype = get_dtype_from_tvdtype(morton_code_tv_uint.dtype)
     shift_bit = 21 if use_64bit else 10
-    box_size = 512
+    box_size = 256
     num_box = tv.div_up(num_point, box_size)
     boxes_minmax = torch.empty([num_box, 6], dtype=torch.float32, device=points.device)
     # with measure_and_print_torch("1"):
