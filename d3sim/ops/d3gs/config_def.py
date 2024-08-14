@@ -5,6 +5,7 @@ from d3sim.core import dataclass_dispatch as dataclasses
 
 @dataclasses.dataclass
 class Strategy:
+    reset_opacity_thresh: float = 0.01
     prune_opacity_thresh: float = 0.005
     grow_grad2d: float = 0.0002
     grow_scale3d: float = 0.01
@@ -14,7 +15,7 @@ class Strategy:
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 500
     refine_stop_iter: int = 15_000
-    reset_every: int = 3000
+    reset_opacity_every: int = 3000
     refine_every: int = 100
     absgrad: bool = False
     revised_opacity: bool = False
@@ -62,6 +63,9 @@ class GaussianSplatConfig:
     transmittance_is_double = False
     backward_reduction: Literal["none", "warp", "block"] = "warp"
     verbose: bool = False
+
+    recalc_cov3d_in_bwd: bool = False
+    enable_device_asserts: bool = False
 
     _bg_color_device: torch.Tensor | None = None
 

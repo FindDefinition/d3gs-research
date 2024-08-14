@@ -53,17 +53,28 @@ class HomogeneousTensor(DataClassWithArrayCheck):
     def concat(self, other: Self) -> Self:
         tensor_fields = self.get_all_tensor_fields()
         for key, value in tensor_fields.items():
+            is_parameter = isinstance(value, torch.nn.Parameter)
             tensor_fields[key] = torch.cat([value, getattr(other, key)], dim=0)
+            if is_parameter:
+                tensor_fields[key] = torch.nn.Parameter(tensor_fields[key])
         return self.__class__(**tensor_fields, **self.get_all_non_tensor_fields())
 
     def concat_inplace(self, other: Self) -> Self:
         for key, value in self.get_all_tensor_fields().items():
-            setattr(self, key, torch.cat([value, getattr(other, key)], dim=0))
+            is_parameter = isinstance(value, torch.nn.Parameter)
+            res = torch.cat([value, getattr(other, key)], dim=0)
+            if is_parameter:
+                res = torch.nn.Parameter(res)
+            setattr(self, key, res)
         return self
 
     def index_inplace_(self, indices_or_mask: Any) -> Self:
         for key, value in self.get_all_tensor_fields().items():
-            setattr(self, key, value[indices_or_mask])
+            is_parameter = isinstance(value, torch.nn.Parameter)
+            res = value[indices_or_mask]
+            if is_parameter:
+                res = torch.nn.Parameter(res)
+            setattr(self, key, res)
         return self
 
     def assign_inplace(self, other: Self) -> Self:
@@ -74,10 +85,18 @@ class HomogeneousTensor(DataClassWithArrayCheck):
     def to_device(self, device: Literal["cpu", "cuda"]) -> Self:
         tensor_fields = self.get_all_tensor_fields()
         for key, value in tensor_fields.items():
-            tensor_fields[key] = value.to(device)
+            is_parameter = isinstance(value, torch.nn.Parameter)
+            res = value.to(device)
+            if is_parameter:
+                res = torch.nn.Parameter(res)
+            tensor_fields[key] = res
         return self.__class__(**tensor_fields, **self.get_all_non_tensor_fields())
 
     def to_device_inplace(self, device: Literal["cpu", "cuda"]) -> Self:
         for key, value in self.get_all_tensor_fields().items():
-            setattr(self, key, value.to(device))
+            is_parameter = isinstance(value, torch.nn.Parameter)
+            res = value.to(device)
+            if is_parameter:
+                res = torch.nn.Parameter(res)
+            setattr(self, key, res)
         return self

@@ -7,6 +7,7 @@ from d3sim.csrc.inliner import INLINER
 from d3sim.csrc.gs3d import SHConstants
 from d3sim.ops.d3gs import config_def
 from d3sim.ops.d3gs.ops import simple_knn
+from d3sim.core.pytorch.optim import NgpAdam
 
 def rgb_to_sh(rgb):
     return (rgb - 0.5) / SHConstants.C0
@@ -123,15 +124,14 @@ def get_expon_lr_func(
 
 
 def create_origin_3dgs_optimizer(model: GaussianModelBase, optim_cfg: config_def.Optimizer, spatial_lr_scale: float):
-    assert model.color_sh_base is not None, "model must split sh features because base and higher degree sh features have different learning rates" 
 
     pg = [
         {'params': [model.xyz], 'lr': optim_cfg.position_lr_init * spatial_lr_scale, "name": "xyz"},
-        {'params': [model.color_sh_base], 'lr': optim_cfg.feature_lr, "name": "f_dc"},
-        {'params': [model.color_sh], 'lr': optim_cfg.feature_lr / 20.0, "name": "f_rest"},
+        {'params': [model.color_sh_base], 'lr': optim_cfg.feature_lr, "name": "color_sh_base"},
+        {'params': [model.color_sh], 'lr': optim_cfg.feature_lr / 20.0, "name": "color_sh"},
         {'params': [model.opacity], 'lr': optim_cfg.opacity_lr, "name": "opacity"},
-        {'params': [model.scale], 'lr': optim_cfg.scaling_lr, "name": "scaling"},
-        {'params': [model.quaternion_xyzw], 'lr': optim_cfg.rotation_lr, "name": "rotation"}
+        {'params': [model.scale], 'lr': optim_cfg.scaling_lr, "name": "scale"},
+        {'params': [model.quaternion_xyzw], 'lr': optim_cfg.rotation_lr, "name": "quaternion_xyzw"}
     ]
     optim = torch.optim.Adam(pg, lr=0.0, eps=1e-15)
 
@@ -140,3 +140,27 @@ def create_origin_3dgs_optimizer(model: GaussianModelBase, optim_cfg: config_def
                                                     lr_delay_mult=optim_cfg.position_lr_delay_mult,
                                                     max_steps=optim_cfg.position_lr_max_steps)
     return optim, xyz_schedule_xyz
+
+def create_origin_3dgs_optimizers(model: GaussianModelBase, optim_cfg: config_def.Optimizer, spatial_lr_scale: float):
+
+    pgs = [
+        {'params': [model.xyz], 'lr': optim_cfg.position_lr_init * spatial_lr_scale, "name": "xyz"},
+        {'params': [model.color_sh_base], 'lr': optim_cfg.feature_lr, "name": "color_sh_base"},
+        {'params': [model.color_sh], 'lr': optim_cfg.feature_lr / 20.0, "name": "color_sh"},
+        {'params': [model.opacity], 'lr': optim_cfg.opacity_lr, "name": "opacity"},
+        {'params': [model.scale], 'lr': optim_cfg.scaling_lr, "name": "scale"},
+        {'params': [model.quaternion_xyzw], 'lr': optim_cfg.rotation_lr, "name": "quaternion_xyzw"}
+    ]
+    optimizers = {
+        pg["name"] :torch.optim.Adam(
+            [{"params": pg["params"], "lr": pg["lr"], "name": pg["name"]}],
+            eps=1e-15, fused=True
+        )
+        for pg in pgs
+    }
+
+    xyz_schedule_xyz = get_expon_lr_func(lr_init=optim_cfg.position_lr_init*spatial_lr_scale,
+                                                    lr_final=optim_cfg.position_lr_final*spatial_lr_scale,
+                                                    lr_delay_mult=optim_cfg.position_lr_delay_mult,
+                                                    max_steps=optim_cfg.position_lr_max_steps)
+    return optimizers, xyz_schedule_xyz
