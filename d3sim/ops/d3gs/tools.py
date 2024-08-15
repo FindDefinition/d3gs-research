@@ -141,7 +141,7 @@ def create_origin_3dgs_optimizer(model: GaussianModelBase, optim_cfg: config_def
                                                     max_steps=optim_cfg.position_lr_max_steps)
     return optim, xyz_schedule_xyz
 
-def create_origin_3dgs_optimizers(model: GaussianModelBase, optim_cfg: config_def.Optimizer, spatial_lr_scale: float):
+def create_origin_3dgs_optimizers(model: GaussianModelBase, optim_cfg: config_def.Optimizer, spatial_lr_scale: float, fused: bool = True):
 
     pgs = [
         {'params': [model.xyz], 'lr': optim_cfg.position_lr_init * spatial_lr_scale, "name": "xyz"},
@@ -154,7 +154,7 @@ def create_origin_3dgs_optimizers(model: GaussianModelBase, optim_cfg: config_de
     optimizers = {
         pg["name"] :torch.optim.Adam(
             [{"params": pg["params"], "lr": pg["lr"], "name": pg["name"]}],
-            eps=1e-15, fused=False
+            eps=1e-15, fused=fused
         )
         for pg in pgs
     }

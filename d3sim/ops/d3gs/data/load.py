@@ -100,3 +100,17 @@ def load_model_and_cam(data_path: str, model_path: str):
 
     return mod, cam
 
+def load_model_and_2_cam(data_path: str, model_path: str):
+    from d3sim.ops.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, camera_to_JSON
+    path = model_path
+    scene_info = readColmapSceneInfo(data_path, "images_4", True)
+    train_camera_infos = scene_info.train_cameras
+    cam_iter = cameraList_from_camInfos_gen(train_camera_infos, 1, _Args())
+    train_camera_first = next(cam_iter)
+    train_camera_second = next(cam_iter)
+    mod = load_3dgs_origin_model(path, fused=True)
+    cam_first = original_cam_to_d3sim_cam(train_camera_first)
+    cam_second = original_cam_to_d3sim_cam(train_camera_second)
+
+    return mod, [cam_first, cam_second]
+

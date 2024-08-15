@@ -132,7 +132,15 @@ class Gaussian3D(pccm.Class):
 
     @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
     def sh_dir_to_rgb_grad(self):
+        return self.sh_dir_to_rgb_grad_template(False)
+
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def sh_dir_to_rgb_grad_batch(self):
+        return self.sh_dir_to_rgb_grad_template(True)
+
+    def sh_dir_to_rgb_grad_template(self, is_batch: bool):
         code = pccm.code()
+        assign_or_add = "+=" if is_batch else "="
         code.nontype_targ("Degree", "int")
         code.targ("T")
         code.arg("drgb", "tv::array<T, 3>")
@@ -154,15 +162,15 @@ class Gaussian3D(pccm.Class):
         T y = dir[1];
         T z = dir[2];
 
-        real_dsh_base_ptr[0] = T({SHConstants.C0}) * drgb;
+        real_dsh_base_ptr[0] {assign_or_add} T({SHConstants.C0}) * drgb;
         if (Degree > 0)
         {{
             T dRGBdsh1 = -T({SHConstants.C1}) * y;
             T dRGBdsh2 = T({SHConstants.C1}) * z;
             T dRGBdsh3 = -T({SHConstants.C1}) * x;
-            dsh_ptr[0] = dRGBdsh1 * drgb;
-            dsh_ptr[1] = dRGBdsh2 * drgb;
-            dsh_ptr[2] = dRGBdsh3 * drgb;
+            dsh_ptr[0] {assign_or_add} dRGBdsh1 * drgb;
+            dsh_ptr[1] {assign_or_add} dRGBdsh2 * drgb;
+            dsh_ptr[2] {assign_or_add} dRGBdsh3 * drgb;
 
             dRGBdx = -T({SHConstants.C1}) * sh[2];
             dRGBdy = -T({SHConstants.C1}) * sh[0];
@@ -177,11 +185,11 @@ class Gaussian3D(pccm.Class):
                 T dRGBdsh6 = T({SHConstants.C2[2]}) * (T(2) * zz - xx - yy);
                 T dRGBdsh7 = T({SHConstants.C2[3]}) * xz;
                 T dRGBdsh8 = T({SHConstants.C2[4]}) * (xx - yy);
-                dsh_ptr[3] = dRGBdsh4 * drgb;
-                dsh_ptr[4] = dRGBdsh5 * drgb;
-                dsh_ptr[5] = dRGBdsh6 * drgb;
-                dsh_ptr[6] = dRGBdsh7 * drgb;
-                dsh_ptr[7] = dRGBdsh8 * drgb;
+                dsh_ptr[3] {assign_or_add} dRGBdsh4 * drgb;
+                dsh_ptr[4] {assign_or_add} dRGBdsh5 * drgb;
+                dsh_ptr[5] {assign_or_add} dRGBdsh6 * drgb;
+                dsh_ptr[6] {assign_or_add} dRGBdsh7 * drgb;
+                dsh_ptr[7] {assign_or_add} dRGBdsh8 * drgb;
                 
                 dRGBdx += T({SHConstants.C2[0]}) * y * sh[3] + T({SHConstants.C2[2]}) * T(2) * -x * sh[5] + T({SHConstants.C2[3]}) * z * sh[6] + T({SHConstants.C2[4]}) * T(2) * x * sh[7];
                 dRGBdy += T({SHConstants.C2[0]}) * x * sh[3] + T({SHConstants.C2[1]}) * z * sh[4] + T({SHConstants.C2[2]}) * T(2) * -y * sh[5] + T({SHConstants.C2[4]}) * T(2) * -y * sh[7];
@@ -196,13 +204,13 @@ class Gaussian3D(pccm.Class):
                     T dRGBdsh13 = T({SHConstants.C3[4]}) * x * (T(4) * zz - xx - yy);
                     T dRGBdsh14 = T({SHConstants.C3[5]}) * z * (xx - yy);
                     T dRGBdsh15 = T({SHConstants.C3[6]}) * x * (xx - T(3) * yy);
-                    dsh_ptr[8] = dRGBdsh9 * drgb;
-                    dsh_ptr[9] = dRGBdsh10 * drgb;
-                    dsh_ptr[10] = dRGBdsh11 * drgb;
-                    dsh_ptr[11] = dRGBdsh12 * drgb;
-                    dsh_ptr[12] = dRGBdsh13 * drgb;
-                    dsh_ptr[13] = dRGBdsh14 * drgb;
-                    dsh_ptr[14] = dRGBdsh15 * drgb;
+                    dsh_ptr[8] {assign_or_add} dRGBdsh9 * drgb;
+                    dsh_ptr[9] {assign_or_add} dRGBdsh10 * drgb;
+                    dsh_ptr[10] {assign_or_add} dRGBdsh11 * drgb;
+                    dsh_ptr[11] {assign_or_add} dRGBdsh12 * drgb;
+                    dsh_ptr[12] {assign_or_add} dRGBdsh13 * drgb;
+                    dsh_ptr[13] {assign_or_add} dRGBdsh14 * drgb;
+                    dsh_ptr[14] {assign_or_add} dRGBdsh15 * drgb;
 
                     dRGBdx += (
                         T({SHConstants.C3[0]}) * sh[8] * T(3) * T(2) * xy +

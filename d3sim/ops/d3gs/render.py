@@ -43,7 +43,7 @@ class BatchCameraParams:
     focal_xy: torch.Tensor
     principal_point: torch.Tensor
     tan_fov: torch.Tensor
-    shape_wh: tuple[int, int]
+    image_shape_wh: tuple[int, int]
 
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
@@ -67,13 +67,13 @@ class GaussianSplatOpContext(DataClassWithArrayCheck):
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatOutput(DataClassWithArrayCheck):
     custom_features: Annotated[torch.Tensor | None,
-                               ac.ArrayCheck([-1, "H", "W"], ac.F32)]
-    T: Annotated[torch.Tensor, ac.ArrayCheck(["H", "W"], ac.F32)]
-    color: Annotated[torch.Tensor, ac.ArrayCheck([3, "H", "W"], ac.F32)]
+                               ac.ArrayCheck(["B", -1, "H", "W"], ac.F32)]
+    T: Annotated[torch.Tensor, ac.ArrayCheck(["B", "H", "W"], ac.F32)]
+    color: Annotated[torch.Tensor, ac.ArrayCheck(["B", 3, "H", "W"], ac.F32)]
     depth: Annotated[torch.Tensor | None,
-                     ac.ArrayCheck(["H", "W"], ac.F32)] = None
+                     ac.ArrayCheck(["B", "H", "W"], ac.F32)] = None
     n_contrib: Annotated[torch.Tensor | None,
-                         ac.ArrayCheck(["H", "W"], ac.I32)] = None
+                         ac.ArrayCheck(["B", "H", "W"], ac.I32)] = None
     radii: Annotated[torch.Tensor | None, ac.ArrayCheck([-1], ac.I32)] = None
 
     @property
@@ -89,67 +89,77 @@ class RasterizeGradientOutput(DataClassWithArrayCheck):
     dcolor: Annotated[torch.Tensor, ac.ArrayCheck(["N", 3], ac.F32)]
     dcustom_features: Annotated[torch.Tensor | None,
                                 ac.ArrayCheck(["N", -1], ac.F32)]
-
+    dz: Annotated[torch.Tensor | None, ac.ArrayCheck(["N"], ac.F32)]
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatGradients(DataClassWithArrayCheck):
-    drgb: Annotated[torch.Tensor, ac.ArrayCheck([-1, "H", "W"], ac.F32)]
-    dT: Annotated[torch.Tensor, ac.ArrayCheck(["H", "W"], ac.F32)]
-    ddepth: Annotated[torch.Tensor | None, ac.ArrayCheck(["H", "W"], ac.F32)]
+    drgb: Annotated[torch.Tensor, ac.ArrayCheck(["B", -1, "H", "W"], ac.F32)]
+    dT: Annotated[torch.Tensor, ac.ArrayCheck(["B", "H", "W"], ac.F32)]
+    ddepth: Annotated[torch.Tensor | None, ac.ArrayCheck(["B", "H", "W"], ac.F32)]
     dcustom_features: Annotated[torch.Tensor | None,
-                                ac.ArrayCheck([-1, "H", "W"], ac.F32)]
+                                ac.ArrayCheck(["B", -1, "H", "W"], ac.F32)]
+
+@dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
+class CameraParamBundle:
+    focal_xy_ppoint: torch.Tensor
+    image_shape_wh: tuple[int, int]
+
+@dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
+class CameraBundle(CameraParamBundle):
+    cam2world_T: torch.Tensor
 
 
 class GaussianSplatOp:
 
     def __init__(self, cfg: GaussianSplatConfig) -> None:
-        self._cfg = copy.deepcopy(cfg)
+        # user shouldn't modify cfg in op, create new op instead.
+        self._cfg = copy.deepcopy(cfg) 
         self._inliner = create_default_inliner()
 
     def forward(
         self,
         model: GaussianModelBase,
-        cameras: list[BasicPinholeCamera],
+        cameras: BasicPinholeCamera | CameraBundle,
         training: bool = False,
+        instance_poses: torch.Tensor | None = None,
     ):
         enable_verbose = self._cfg.verbose
         # enable_verbose = False
-
+        is_cam_bundle = isinstance(cameras, CameraBundle)
+        batch_size = 1
+        if not isinstance(cameras, BasicPinholeCamera):
+            batch_size = cameras.cam2world_T.shape[0]
+            # raise NotImplementedError
         with tv.measure_and_print("forward-0", enable=enable_verbose):
             assert model.act_applied, "model must be activated before render"
             num = len(model)
             scale_global = self._cfg.scale_global
             enable_32bit_sort = self._cfg.enable_32bit_sort
-            if len(cameras) > 1:
-                raise NotImplementedError("multi camera not supported yet")
-            camera = cameras[0]
-            intrinsic = camera.intrinsic
-            cam2world = camera.pose.to_world
+            camera = cameras
             image_shape_wh = camera.image_shape_wh
-            axis_front_u_v = camera.axes_front_u_v
+            # axis_front_u_v = camera.axes_front_u_v
 
             width = image_shape_wh[0]
             height = image_shape_wh[1]
-
-            focal_x = intrinsic[0, 0]
-            focal_y = intrinsic[1, 1]
-
-            fov_x = focal2fov(focal_x, width)
-            fov_y = focal2fov(focal_y, height)
-            tanfov_x = math.tan(fov_x / 2)
-            tanfov_y = math.tan(fov_y / 2)
             resolution_wh_np = np.array([width, height], np.int32)
 
-            focal_xy_np = np.array([focal_x, focal_y], np.float32)
-            principal_point_np = np.array([intrinsic[0, 2], intrinsic[1, 2]],
-                                          np.float32)
-            tanfov_xy_np = np.array([tanfov_x, tanfov_y], np.float32)
-            cam2world_T_np = np.ascontiguousarray(cam2world[:3].T)
-            cam2world_center_np = cam2world_T_np[3]
+            if isinstance(camera, BasicPinholeCamera):
+                intrinsic = camera.intrinsic
+                cam2world = camera.pose.to_world
+
+                focal_xy_np = np.array([intrinsic[0, 0], intrinsic[1, 1]], np.float32)
+                principal_point_np = np.array([intrinsic[0, 2], intrinsic[1, 2]],
+                                            np.float32)
+                cam2world_T_np = np.ascontiguousarray(cam2world[:3].T)
+                cam2world_center_np = cam2world_T_np[3]
+            else:
+                cam2world_T_ten = camera.cam2world_T
+                focal_xy_ppoint_ten = camera.focal_xy_ppoint
+
             tile_num_x = div_up(width, self._cfg.tile_size[0])
             tile_num_y = div_up(height, self._cfg.tile_size[1])
             if enable_32bit_sort:
-                assert tile_num_x * tile_num_y < 2**13, "32bit sort only support 13 bits tile idx"
+                assert batch_size * tile_num_x * tile_num_y < 2**13, "32bit sort only support 13 bits tile idx"
             block_size = self._cfg.block_size
             tile_num_xy_np = np.array([tile_num_x, tile_num_y], np.int32)
             xyz = model.xyz
@@ -162,10 +172,10 @@ class GaussianSplatOp:
             degree = model.color_sh_degree
             cur_degree = model.cur_sh_degree
 
-            depths = torch.empty(num, dtype=torch.float32, device=xyz.device)
-            radii = torch.empty(num, dtype=torch.int32, device=xyz.device)
-            uvs = torch.empty([num, 2], dtype=torch.float32, device=xyz.device)
-            conic_opacity = torch.empty([num, 4],
+            depths = torch.empty(batch_size * num, dtype=torch.float32, device=xyz.device)
+            radii = torch.empty(batch_size * num, dtype=torch.int32, device=xyz.device)
+            uvs = torch.empty([batch_size * num, 2], dtype=torch.float32, device=xyz.device)
+            conic_opacity = torch.empty([batch_size * num, 4],
                                         dtype=torch.float32,
                                         device=xyz.device)
             cov3d_vecs = None
@@ -174,19 +184,20 @@ class GaussianSplatOp:
             if training:
                 # for backward only
                 if not self._cfg.recalc_cov3d_in_bwd:
-                    cov3d_vecs = torch.empty([num, 6],
+                    cov3d_vecs = torch.empty([batch_size * num, 6],
                                              dtype=torch.float32,
                                              device=xyz.device)
-                cov2d_vecs = torch.empty([num, 3],
+                cov2d_vecs = torch.empty([batch_size * num, 3],
                                          dtype=torch.float32,
                                          device=xyz.device)
-                sh_to_rgb_ne_0 = torch.empty([num],
+                sh_to_rgb_ne_0 = torch.empty([batch_size * num],
                                              dtype=torch.uint8,
                                              device=xyz.device)
-            tiles_touched = torch.empty(num,
-                                        dtype=torch.int32,
+            # TODO when to use int64 tile_touched?
+            tiles_touched = torch.empty(batch_size * num,
+                                        dtype=torch.int64 if self._cfg.use_int64_tile_touched else torch.int32,
                                         device=xyz.device)
-            rgb_gaussian = torch.empty([num, 3],
+            rgb_gaussian = torch.empty([batch_size * num, 3],
                                        dtype=torch.float32,
                                        device=xyz.device)
         # debug_cov2d = torch.empty([num, 3], dtype=torch.float32, device=xyz.device)
@@ -201,9 +212,9 @@ class GaussianSplatOp:
         has_color_base = color_sh_base is not None
         with measure_and_print_torch("1", enable=enable_verbose):
             prep_kernel_name = (
-                f"gs3d_preprocess_{axis_front_u_v}_{self._cfg.tile_size}_{degree}_{training}_"
+                f"gs3d_preprocess_{self._cfg.tile_size}_{degree}_{training}_"
                 f"{fused_scale_act}_{fused_q_act}_{fused_opacity_act}_"
-                f"{cur_degree}_{has_color_base}")
+                f"{cur_degree}_{has_color_base}_{is_cam_bundle}")
             code_prep = pccm.code()
             lowpass_filter = self._cfg.gaussian_lowpass_filter
             eps = self._cfg.eps
@@ -213,19 +224,37 @@ class GaussianSplatOp:
             code_prep.raw(f"""
             namespace op = tv::arrayops;
             using math_op_t = tv::arrayops::MathScalarOp<float>;
-            auto cam2world_T = $cam2world_T_np;
-            auto focal_xy = $focal_xy_np;
-            auto principal_point = $principal_point_np;
-            auto tan_fov = $tanfov_xy_np;
             auto resolution_wh = $resolution_wh_np;
-            auto point = op::reinterpret_cast_array_nd<3>($xyz)[i];
+            """)
+            if is_cam_bundle:
+                # cam2world, focal and ppoint are tensor, load from gpu mem
+                code_prep.raw(f"""
+                int batch_idx = i / $num;
+                auto gaussian_idx = i % $num;
+                auto cam2world_T = op::reinterpret_cast_array_nd<4, 3>($cam2world_T_ten)[batch_idx];
+                auto focal_xy_ppoint = op::reinterpret_cast_array_nd<4>($focal_xy_ppoint_ten)[batch_idx];
+                auto focal_xy = op::slice<0, 2>(focal_xy_ppoint);
+                auto principal_point = op::slice<2, 4>(focal_xy_ppoint);
+                """)
+            else:
+                # cam2world, focal and ppoint are registers
+                code_prep.raw(f"""
+                auto gaussian_idx = i;
+
+                auto cam2world_T = $cam2world_T_np;
+                auto focal_xy = $focal_xy_np;
+                auto principal_point = $principal_point_np;
+                """)
+            code_prep.raw(f"""
+            auto tan_fov = 0.5f * resolution_wh.cast<float>() / focal_xy;
+            auto point = op::reinterpret_cast_array_nd<3>($xyz)[gaussian_idx];
             auto point_cam = op::slice<0, 3>(cam2world_T).op<op::mv_rowmajor>(point - cam2world_T[3]);
 
             auto uvz = CameraOps::pos_cam_to_uv_no_distort<2, 0, 1>(point_cam, principal_point, focal_xy);
             auto uv = std::get<0>(uvz) - 0.5f;
             auto z_in_cam = std::get<1>(uvz);
-            auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
-            auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[i];
+            auto scale = op::reinterpret_cast_array_nd<3>($scales)[gaussian_idx];
+            auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[gaussian_idx];
             """)
             if fused_q_act is not None:
                 code_prep.raw(f"""
@@ -273,7 +302,7 @@ class GaussianSplatOp:
             $depths[i] = z_in_cam;
 
             op::reinterpret_cast_array_nd<2>($uvs)[i] = uv;
-            auto opacity_val = $opacity[i];
+            auto opacity_val = $opacity[gaussian_idx];
             """)
             if fused_opacity_act is not None:
                 code_prep.raw(f"""
@@ -282,13 +311,13 @@ class GaussianSplatOp:
             code_prep.raw(f"""
             tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], opacity_val}};
             op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
-            auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1) - has_color_base};
+            auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + gaussian_idx * {(degree + 1) * (degree + 1) - has_color_base};
             
             """)
             if (training):
                 if has_color_base:
                     code_prep.raw(f"""
-                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + i;
+                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + gaussian_idx;
                     auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr, sh_base_ptr);
                     """)
                 else:
@@ -309,7 +338,7 @@ class GaussianSplatOp:
             else:
                 if has_color_base:
                     code_prep.raw(f"""
-                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + i;
+                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + gaussian_idx;
                     op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr, sh_base_ptr).op<op::maximum>(0.0f);
                     """)
                 else:
@@ -317,23 +346,24 @@ class GaussianSplatOp:
                     op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr).op<op::maximum>(0.0f);
                     """)
             # with measure_and_print_torch("1", enable=True):
-
-            self._inliner.kernel_1d(prep_kernel_name, num, 0, code_prep)
+            self._inliner.kernel_1d(prep_kernel_name, batch_size * num, 0, code_prep)
+            # if batch_size == 2:
+            #     print(torch.linalg.norm(rgb_gaussian.float().reshape(-1, num,3)[0] - rgb_gaussian.float().reshape(-1, num, 3)[1]))
             # print(INLINER.get_nvrtc_module(prep_kernel_name).params.debug_code)
         with measure_and_print_torch("2", enable=enable_verbose):
             tiles_touched.cumsum_(0)
             num_rendered = int(tiles_touched[-1].item())
         out_img_shape = [
-            self._cfg.num_channels, height, width
-        ] if self._cfg.use_nchw else [height, width, self._cfg.num_channels]
+            batch_size, self._cfg.num_channels, height, width
+        ] if self._cfg.use_nchw else [batch_size, height, width, self._cfg.num_channels]
         out_custom_feat_shape = [
-            num_custom_feat, height, width
-        ] if self._cfg.use_nchw else [height, width, num_custom_feat]
+            batch_size, num_custom_feat, height, width
+        ] if self._cfg.use_nchw else [batch_size, height, width, num_custom_feat]
         if (num_rendered == 0):
-            final_T = torch.empty([height, width],
+            final_T = torch.empty([batch_size, height, width],
                                   dtype=torch.float32,
                                   device=xyz.device)
-            n_contrib = torch.empty([height, width],
+            n_contrib = torch.empty([batch_size, height, width],
                                     dtype=torch.int32,
                                     device=xyz.device)
             out_color = torch.empty(out_img_shape,
@@ -344,7 +374,7 @@ class GaussianSplatOp:
                                           device=xyz.device)
             final_depth = None
             if self._cfg.render_depth:
-                final_depth = torch.zeros([height, width],
+                final_depth = torch.zeros([batch_size, height, width],
                                           dtype=torch.float32,
                                           device=xyz.device)
             out_empty = GaussianSplatOutput(custom_features=None,
@@ -366,7 +396,7 @@ class GaussianSplatOp:
             code.raw(f"""
             namespace op = tv::arrayops;
             using math_op_t = tv::arrayops::MathScalarOp<float>;
-
+            int batch_idx = i / $num;
             auto radii_val = $radii[i];
             auto radii_fp = float(radii_val);
             constexpr auto tile_size_xy = tv::array<int, 2>{{{self._cfg.tile_size[0]}, {self._cfg.tile_size[1]}}};
@@ -397,11 +427,11 @@ class GaussianSplatOp:
                         shift_bits = 32 if not enable_32bit_sort else 18
                         if enable_32bit_sort:
                             code.raw(f"""
-                            uint32_t key = y * tile_num_xy[0] + x;
+                            uint32_t key = batch_idx * tile_num_xy[0] * tile_num_xy[1] + y * tile_num_xy[0] + x;
                             """)
                         else:
                             code.raw(f"""
-                            uint64_t key = y * tile_num_xy[0] + x;
+                            uint64_t key = batch_idx * tile_num_xy[0] * tile_num_xy[1] + y * tile_num_xy[0] + x;
                             """)
                         if self._cfg.enable_device_asserts:
                             code.raw(f"""
@@ -416,7 +446,7 @@ class GaussianSplatOp:
                         """)
 
             self._inliner.kernel_1d(f"prepare_sort_data_{enable_32bit_sort}",
-                                    num, 0, code)
+                                    batch_size * num, 0, code)
         # TODO use radix sort with trunated bits (faster) for cuda
         # TODO use 32bit sort, for 1920x1080 tile, the max tile idx is 8100, 13 bits
         # so we can use 18bit for depth. (19bit if torch support uint32, true in torch >= 2.3 and cuda)
@@ -427,7 +457,7 @@ class GaussianSplatOp:
                 sorted_vals = torch.empty_like(keys_tile_idx_depth)
                 gaussian_idx_sorted = torch.empty_like(gaussian_idx)
                 end_bit = 32 + DeviceSort.get_higher_msb(
-                    tile_num_x * tile_num_y)
+                    batch_size * tile_num_x * tile_num_y)
                 keys_tile_idx_depth_tv = torch_tensor_to_tv(
                     keys_tile_idx_depth, dtype=tv.uint64)
                 sorted_vals_tv = torch_tensor_to_tv(sorted_vals,
@@ -466,7 +496,7 @@ class GaussianSplatOp:
                 gaussian_idx_sorted = torch.gather(gaussian_idx, 0, indices)
 
         with measure_and_print_torch("4.2", enable=enable_verbose):
-            workload_ranges = torch.zeros([tile_num_x * tile_num_y, 2],
+            workload_ranges = torch.zeros([batch_size * tile_num_x * tile_num_y, 2],
                                           dtype=torch.int32,
                                           device=xyz.device)
             shift_bits = 32 if not enable_32bit_sort else 18
@@ -477,7 +507,7 @@ class GaussianSplatOp:
             """)
             if self._cfg.enable_device_asserts:
                 code.raw(f"""
-                assert(tile_idx < $tile_num_x * $tile_num_y);
+                assert(tile_idx < $batch_size * $tile_num_x * $tile_num_y);
                 """)
             with code.if_("i == 0"):
                 code.raw(f"""
@@ -490,7 +520,7 @@ class GaussianSplatOp:
                 """)
                 if self._cfg.enable_device_asserts:
                     code.raw(f"""
-                    assert(last_tile_idx < $tile_num_x * $tile_num_y);
+                    assert(last_tile_idx < $batch_size * $tile_num_x * $tile_num_y);
                     """)
                 code.raw(f"""
                 if (tile_idx != last_tile_idx){{
@@ -511,11 +541,11 @@ class GaussianSplatOp:
         with measure_and_print_torch("5-prep", enable=enable_verbose):
 
             final_T = torch.empty(
-                [height, width],
+                [batch_size, height, width],
                 dtype=torch.float64
                 if self._cfg.transmittance_is_double else torch.float32,
                 device=xyz.device)
-            n_contrib = torch.empty([height, width],
+            n_contrib = torch.empty([batch_size, height, width],
                                     dtype=torch.int32,
                                     device=xyz.device)
             out_color = torch.empty(out_img_shape,
@@ -526,7 +556,7 @@ class GaussianSplatOp:
                                           device=xyz.device)
             final_depth = None
             if self._cfg.render_depth:
-                final_depth = torch.zeros([height, width],
+                final_depth = torch.zeros([batch_size, height, width],
                                           dtype=torch.float32,
                                           device=xyz.device)
             output_dc = GaussianSplatOutput(custom_features=out_custom_feat,
@@ -593,8 +623,9 @@ class GaussianSplatOp:
         final_T = out.T
         final_color = out.color
         final_n_contrib = out.n_contrib
-        assert final_T.numel() == width * height
-        assert final_color.numel() == width * height * 3
+        batch_size = final_color.shape[0]
+        # assert final_T.numel() == width * height
+        # assert final_color.numel() == width * height * 3
 
         assert final_n_contrib is not None
         final_depth = out.depth
@@ -607,38 +638,43 @@ class GaussianSplatOp:
             drgb = grad.drgb
             dT = grad.dT
             ddepth_th = grad.ddepth
-            assert drgb.numel() == width * height * 3
-            assert dT.numel() == width * height
-
+            # assert drgb.numel() == width * height * 3
+            # assert dT.numel() == width * height
         if is_bwd:
-            duv = torch.zeros([num, 2],
+            duv = torch.zeros([batch_size * num, 2],
                               dtype=torch.float32,
                               device=final_T.device)
-            dconic = torch.zeros([num, 3],
+            dconic = torch.zeros([batch_size * num, 3],
                                  dtype=torch.float32,
                                  device=final_T.device)
-            dopacity = torch.zeros([num],
+            dopacity = torch.zeros([batch_size * num],
                                    dtype=torch.float32,
                                    device=final_T.device)
-            dcolor = torch.zeros([num, 3],
+            dcolor = torch.zeros([batch_size * num, 3],
                                  dtype=torch.float32,
                                  device=final_T.device)
-            dcustom_features = torch.zeros([num, num_custom_feat],
+            dcustom_features = torch.zeros([batch_size * num, num_custom_feat],
                                            dtype=torch.float32,
                                            device=final_T.device)
+            dz = None
+            if render_depth:
+                dz = torch.zeros([batch_size * num],
+                                 dtype=torch.float32,
+                                 device=final_T.device)
             grad_out = RasterizeGradientOutput(
                 duv=duv,
                 dconic=dconic,
                 dopacity=dopacity,
                 dcolor=dcolor,
-                dcustom_features=dcustom_features)
+                dcustom_features=dcustom_features,
+                dz=dz)
         bwd_reduce_method = self._cfg.backward_reduction
         t_dtype = "double" if self._cfg.transmittance_is_double else "float"
         use_bwd_reduce = bwd_reduce_method != "none"
         kernel_unique_name = (
             f"rasterize_{is_bwd}_{self._cfg.tile_size}_{training}"
             f"_{num_custom_feat}_{self._cfg.render_depth}"
-            f"_{self._cfg.use_nchw}_{self._cfg.render_rgba}"
+            f"_{self._cfg.use_nchw}_{self._cfg.render_rgba}_{batch_size == 1}"
             f"_{final_n_contrib is None}_{self._cfg.backward_reduction}")
 
         code_rasterize = pccm.code()
@@ -649,7 +685,7 @@ class GaussianSplatOp:
         # when use raw kernel, we don't use nonuniform grid to
         # keep logic same as cuda.
         launch_param = tv.LaunchParam(
-            (tile_num_x, tile_num_y, 1),
+            (tile_num_x, tile_num_y, batch_size),
             (self._cfg.tile_size[0], self._cfg.tile_size[1], 1))
         if IsAppleSiliconMacOs:
             code_rasterize.raw(f"""
@@ -659,15 +695,28 @@ class GaussianSplatOp:
             threadgroup int num_done_shared[32];
             uint thread_rank = threadPositionInThreadgroup.y * {self._cfg.tile_size[0]} + threadPositionInThreadgroup.x;
             """)
+            if batch_size != 1:
+                code_rasterize.raw(f"""
+                int batch_idx = threadgroupPositionInGrid.z;
+                """)
+            else:
+                code_rasterize.raw(f"""
+                constexpr int batch_idx = 0;
+                """)
         else:
-            launch_param = tv.LaunchParam(
-                (tile_num_x, tile_num_y, 1),
-                (self._cfg.tile_size[0], self._cfg.tile_size[1], 1))
             code_rasterize.raw(f"""
             tv::array<uint32_t, 2> pixel_idx_xy{{blockIdx.x * {self._cfg.tile_size[0]} + threadIdx.x, blockIdx.y * {self._cfg.tile_size[1]} + threadIdx.y}};
             tv::array<uint32_t, 2> tile_idx_xy{{blockIdx.x, blockIdx.y}};
             uint32_t thread_rank = threadIdx.y * {self._cfg.tile_size[0]} + threadIdx.x;
             """)
+            if batch_size != 1:
+                code_rasterize.raw(f"""
+                int batch_idx = blockIdx.z;
+                """)
+            else:
+                code_rasterize.raw(f"""
+                constexpr int batch_idx = 0;
+                """)
         code_rasterize.raw(f"""
         TV_SHARED_MEMORY int collected_id[{block_size}];
         TV_SHARED_MEMORY float2 collected_xy[{block_size}];
@@ -698,18 +747,27 @@ class GaussianSplatOp:
 
         code_rasterize.raw(f"""
         bool inside = pixel_idx_xy[0] < $width && pixel_idx_xy[1] < $height;
-
-        uint32_t pixel_id = $width * pixel_idx_xy[1] + pixel_idx_xy[0];
+        uint32_t pixel_id = ({"" if batch_size == 1 else "batch_idx * ($width * $height) + "}
+            $width * pixel_idx_xy[1] + pixel_idx_xy[0]);
         auto pixel_idx_xy_fp = pixel_idx_xy.cast<float>();
 
         // Check if this thread is associated with a valid pixel or outside.
         // Done threads can help with fetching, but don't rasterize
         bool done = !inside;
 
-        auto range = op::reinterpret_cast_array_nd<2>($workload_ranges)[tile_idx_xy[1] * $tile_num_x + tile_idx_xy[0]];
         
         {t_dtype} T = 1.0f;
         """)
+        if batch_size == 1:
+            code_rasterize.raw(f"""
+            auto range = op::reinterpret_cast_array_nd<2>($workload_ranges)[tile_idx_xy[1] * $tile_num_x + tile_idx_xy[0]];
+            uint32_t pixel_id_no_batch = pixel_id;
+            """)
+        else:
+            code_rasterize.raw(f"""
+            uint32_t pixel_id_no_batch = $width * pixel_idx_xy[1] + pixel_idx_xy[0];
+            auto range = op::reinterpret_cast_array_nd<2>($workload_ranges)[batch_idx * $tile_num_x * $tile_num_y + tile_idx_xy[1] * $tile_num_x + tile_idx_xy[0]];
+            """)
         if not is_bwd:
             code_rasterize.raw(f"""
             tv::array<float, 3> rgb{{}};
@@ -756,51 +814,12 @@ class GaussianSplatOp:
             float depth_accum = 0.0f;
             """)
         if is_bwd:
-            if self._cfg.enable_device_asserts:
-                code_rasterize.raw(f"""
-                decltype(T) render_T = 0.0f;
-                float dT_val = 0.0f;
-                tv::array<float, 3> render_rgb{{}};
-                tv::array<float, 3> drgb_array{{}};
-                """)
-                if render_depth:
-                    code_rasterize.raw(f"""
-                    float render_depth = 0.0f;
-                    float ddepth = 0.0f;
-                    """)
-                with code_rasterize.if_("inside"):
-                    code_rasterize.raw(f"""
-                    assert(pixel_id >= 0 && pixel_id < $width * $height);
-                    render_T = $final_T[pixel_id];
-                    dT_val = $dT[pixel_id];
-                    """)
-                    if self._cfg.use_nchw:
-                        code_rasterize.raw(f"""
-                        render_rgb[0] = $final_color[0 * $height * $width + pixel_id];
-                        render_rgb[1] = $final_color[1 * $height * $width + pixel_id];
-                        render_rgb[2] = $final_color[2 * $height * $width + pixel_id];
-
-                        drgb_array[0] = $drgb[0 * $height * $width + pixel_id];
-                        drgb_array[1] = $drgb[1 * $height * $width + pixel_id];
-                        drgb_array[2] = $drgb[2 * $height * $width + pixel_id];
-                        """)
-                    else:
-                        code_rasterize.raw(f"""
-                        render_rgb = op::reinterpret_cast_array_nd<3>($final_color)[pixel_id];
-                        drgb_array = op::reinterpret_cast_array_nd<3>($drgb)[pixel_id];
-                        """)
-                    if render_depth:
-                        code_rasterize.raw(f"""
-                        render_depth = $final_depth[pixel_id];
-                        ddepth = $ddepth_th[pixel_id];
-                        """)
-
-            else:
-                code_rasterize.raw(f"""
-                decltype(T) render_T = inside ? $final_T[pixel_id] : 0.0f;
-                auto dT_val = inside ? $dT[pixel_id] : 0.0f;
-                """)
-                if self._cfg.use_nchw:
+            code_rasterize.raw(f"""
+            decltype(T) render_T = inside ? $final_T[pixel_id] : 0.0f;
+            auto dT_val = inside ? $dT[pixel_id] : 0.0f;
+            """)
+            if self._cfg.use_nchw:
+                if batch_size == 1:
                     code_rasterize.raw(f"""
                     tv::array<float, 3> render_rgb, drgb_array;
                     render_rgb[0] = inside ? $final_color[0 * $height * $width + pixel_id] : 0.0f;
@@ -813,15 +832,26 @@ class GaussianSplatOp:
                     """)
                 else:
                     code_rasterize.raw(f"""
-                    tv::array<float, 3> render_rgb = inside ? op::reinterpret_cast_array_nd<3>($final_color)[pixel_id] : tv::array<float, 3>{{}};
-                    auto drgb_array = inside ? op::reinterpret_cast_array_nd<3>($drgb)[pixel_id] : tv::array<float, 3>{{}};
-                    """)
+                    tv::array<float, 3> render_rgb, drgb_array;
+                    render_rgb[0] = inside ? $final_color[(batch_idx * 3 + 0) * $height * $width + pixel_id_no_batch] : 0.0f;
+                    render_rgb[1] = inside ? $final_color[(batch_idx * 3 + 1) * $height * $width + pixel_id_no_batch] : 0.0f;
+                    render_rgb[2] = inside ? $final_color[(batch_idx * 3 + 2) * $height * $width + pixel_id_no_batch] : 0.0f;
 
-                if render_depth:
-                    code_rasterize.raw(f"""
-                    auto render_depth = inside ? $final_depth[pixel_id] : 0.0f;
-                    auto ddepth = inside ? $ddepth_th[pixel_id] : 0.0f;
+                    drgb_array[0] = inside ? $drgb[(batch_idx * 3 + 0) * $height * $width + pixel_id_no_batch] : 0.0f;
+                    drgb_array[1] = inside ? $drgb[(batch_idx * 3 + 1) * $height * $width + pixel_id_no_batch] : 0.0f;
+                    drgb_array[2] = inside ? $drgb[(batch_idx * 3 + 2) * $height * $width + pixel_id_no_batch] : 0.0f;
                     """)
+            else:
+                code_rasterize.raw(f"""
+                tv::array<float, 3> render_rgb = inside ? op::reinterpret_cast_array_nd<3>($final_color)[pixel_id] : tv::array<float, 3>{{}};
+                auto drgb_array = inside ? op::reinterpret_cast_array_nd<3>($drgb)[pixel_id] : tv::array<float, 3>{{}};
+                """)
+
+            if render_depth:
+                code_rasterize.raw(f"""
+                auto render_depth = inside ? $final_depth[pixel_id] : 0.0f;
+                auto ddepth = inside ? $ddepth_th[pixel_id] : 0.0f;
+                """)
         with code_rasterize.for_(
                 f"int i = 0; i < rounds; ++i, toDo -= {block_size}"):
             if IsAppleSiliconMacOs:
@@ -951,6 +981,10 @@ class GaussianSplatOp:
                     tv::array<float, 3> dL_dcov2d{{}};
                     float dL_dopacity = 0.0f;
                     """)
+                    if render_depth:
+                        code_rasterize.raw(f"""
+                        float dL_dz = 0.0f;
+                        """)
                     ifctx = code_rasterize.if_("valid")
                 with ifctx:
                     code_rasterize.raw(f"""
@@ -1003,6 +1037,12 @@ class GaussianSplatOp:
                         code_rasterize.raw(f"""
                         auto dL_dalpha = dL_dalpha_without_div / (1.0f - alpha);
                         {"" if use_bwd_reduce else "auto"} dL_drgb = weight * drgb_array;
+                        """)
+                        if render_depth:
+                            code_rasterize.raw(f"""
+                            {"" if use_bwd_reduce else "float"} dL_dz = weight * ddepth;
+                            """)
+                        code_rasterize.raw(f"""
 
                         const float dL_dG = conic_opacity_vec.w * dL_dalpha;
                         const float gdx = G * dist[0];
@@ -1050,6 +1090,10 @@ class GaussianSplatOp:
 
                         dL_dopacity = tv::parallel::warp_sum(dL_dopacity);
                         """)
+                        if render_depth:
+                            code_rasterize.raw(f"""
+                            dL_dz = tv::parallel::warp_sum(dL_dz);
+                            """)
                         if self._cfg.backward_reduction == "block":
                             code_rasterize.raw(f"""
                             tv::parallel::block_sync_shared_io();
@@ -1088,6 +1132,8 @@ class GaussianSplatOp:
                             dL_dcov2d[2] = shared_dL_dconic_2.op<op::sum>();
                             dL_dopacity = shared_dL_dopacity.op<op::sum>();
                             """)
+                            if render_depth:
+                                raise NotImplementedError("not implemented yet")
                         code_rasterize.raw(f"""
                         tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 0, dL_drgb[0]);
                         tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 1, dL_drgb[1]);
@@ -1101,6 +1147,10 @@ class GaussianSplatOp:
                         tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 2, dL_dcov2d[2]);
                         tv::parallel::atomicAdd($dopacity + gaussian_id, dL_dopacity);
                         """)
+                        if render_depth:
+                            code_rasterize.raw(f"""
+                            tv::parallel::atomicAdd($dz + gaussian_id, dL_dz);
+                            """)
                     # if num_custom_feat > 0:
                     #     code_rasterize.raw(f"""
                     #     for (int channel_idx = 0; channel_idx < {num_custom_feat}; ++channel_idx){{
@@ -1126,23 +1176,34 @@ class GaussianSplatOp:
                         code_rasterize.raw(f"""
                         $final_depth[pixel_id] = depth_accum;
                         """)
-
-                if not training:
-                    # use fused background color on inference.
-                    # TODO how to support envmap?
-                    code_rasterize.raw(f"""
-                    auto rgb_before_clamp = rgb + T * bg_color_val;
-                    rgb_before_clamp = rgb_before_clamp.op<op::clamp>(0.0f, 1.0f);
-                    $final_color[0 * $height * $width + pixel_id] = rgb_before_clamp[0];
-                    $final_color[1 * $height * $width + pixel_id] = rgb_before_clamp[1];
-                    $final_color[2 * $height * $width + pixel_id] = rgb_before_clamp[2];
-                    """)
+                # use fused background color on inference.
+                # TODO how to support envmap?
+                if not self._cfg.use_nchw:
+                    if not training:
+                        code_rasterize.raw(f"""
+                        auto rgb_before_clamp = rgb + T * bg_color_val;
+                        rgb_before_clamp = rgb_before_clamp.op<op::clamp>(0.0f, 1.0f);
+                        op::reinterpret_cast_array_nd<3>($final_color)[pixel_id] = rgb_before_clamp;
+                        """)
+                    else:
+                        code_rasterize.raw(f"""
+                        op::reinterpret_cast_array_nd<3>($final_color)[pixel_id] = rgb;
+                        """)
                 else:
-                    code_rasterize.raw(f"""
-                    $final_color[0 * $height * $width + pixel_id] = rgb[0];
-                    $final_color[1 * $height * $width + pixel_id] = rgb[1];
-                    $final_color[2 * $height * $width + pixel_id] = rgb[2];
-                    """)
+                    if not training:
+                        code_rasterize.raw(f"""
+                        auto rgb_before_clamp = rgb + T * bg_color_val;
+                        rgb_before_clamp = rgb_before_clamp.op<op::clamp>(0.0f, 1.0f);
+                        $final_color[(batch_idx * 3 + 0) * $height * $width + pixel_id_no_batch] = rgb_before_clamp[0];
+                        $final_color[(batch_idx * 3 + 1) * $height * $width + pixel_id_no_batch] = rgb_before_clamp[1];
+                        $final_color[(batch_idx * 3 + 2) * $height * $width + pixel_id_no_batch] = rgb_before_clamp[2];
+                        """)
+                    else:
+                        code_rasterize.raw(f"""
+                        $final_color[(batch_idx * 3 + 0) * $height * $width + pixel_id_no_batch] = rgb[0];
+                        $final_color[(batch_idx * 3 + 1) * $height * $width + pixel_id_no_batch] = rgb[1];
+                        $final_color[(batch_idx * 3 + 2) * $height * $width + pixel_id_no_batch] = rgb[2];
+                        """)
         # if num_custom_feat:
         #     code_rasterize.raw(f"""
         #     if (inside)
@@ -1158,26 +1219,24 @@ class GaussianSplatOp:
             self._inliner.kernel_raw(kernel_unique_name, launch_param,
                                      code_rasterize)
         # if is_bwd:
-        #     # print(INLINER.get_nvrtc_module(kernel_unique_name).params.debug_code)
+        # print(self._inliner.get_nvrtc_module(kernel_unique_name).params.debug_code)
 
         #     print(INLINER.get_nvrtc_kernel_attrs(kernel_unique_name))
         return grad_out
 
     def backward(self,
                  model: GaussianModelBase,
-                 cameras: list[BasicPinholeCamera],
+                 cameras: BasicPinholeCamera | CameraBundle,
                  ctx: GaussianSplatOpContext,
                  out: GaussianSplatOutput,
                  grad: GaussianSplatGradients,
                  return_uv_grad: bool = False):
-        if len(cameras) > 1:
-            raise NotImplementedError("multi camera not supported yet")
+        # if isinstance(cameras, CameraBundle):
+        #     raise NotImplementedError("CameraBundle is not supported yet.")
         num = model.xyz.shape[0]
-        camera = cameras[0]
-        intrinsic = camera.intrinsic
-        cam2world = camera.pose.to_world
+        camera = cameras
         image_shape_wh = camera.image_shape_wh
-        axis_front_u_v = camera.axes_front_u_v
+        # axis_front_u_v = camera.axes_front_u_v
 
         width = image_shape_wh[0]
         height = image_shape_wh[1]
@@ -1195,19 +1254,29 @@ class GaussianSplatOp:
         dconic = grad_out.dconic
         dopacity = grad_out.dopacity
         dcolor = grad_out.dcolor
-
-        focal_xy_np = camera.focal_length
-        principal_point_np = camera.principal_point
-        fov_xy = camera.fov_xy
-        tanfov_x = math.tan(fov_xy[0] / 2)
-        tanfov_y = math.tan(fov_xy[1] / 2)
+        dz = grad_out.dz
+        # ddepth = grad_out.ddepth
         resolution_wh_np = np.array([width, height], np.int32)
+        is_cam_bundle = False
+        batch_size = 1
+        if isinstance(camera, BasicPinholeCamera):
+            intrinsic = camera.intrinsic
+            cam2world = camera.pose.to_world
 
-        tanfov_xy_np = np.array([tanfov_x, tanfov_y], np.float32)
-        cam2world_T_np = np.ascontiguousarray(cam2world[:3].T)
-        cam2world_R_np = cam2world_T_np[:3]
+            focal_xy_np = np.array([intrinsic[0, 0], intrinsic[1, 1]], np.float32)
+            principal_point_np = np.array([intrinsic[0, 2], intrinsic[1, 2]],
+                                        np.float32)
+            cam2world_T_np = np.ascontiguousarray(cam2world[:3].T)
+            cam2world_R_np = cam2world_T_np[:3]
+            cam2world_center_np = cam2world_T_np[3]
+        else:
+            is_cam_bundle = True
+            cam2world_T_ten = camera.cam2world_T
+            assert cam2world_T_ten.ndim == 3
+            focal_xy_ppoint_ten = camera.focal_xy_ppoint
+            batch_size = cam2world_T_ten.shape[0]
+
         conic_opacity = ctx.conic_opacity
-        cam2world_center_np = cam2world_T_np[3]
         cov3d_vecs = ctx.cov3d_vecs
         cov2d_vecs = ctx.cov2d_vecs
         sh_to_rgb_ne_0 = ctx.sh_to_rgb_ne_0
@@ -1241,123 +1310,191 @@ class GaussianSplatOp:
         fused_q_act = model.fused_quaternion_xyzw_act_op
         fused_opacity_act = model.fused_opacity_act_op
         prep_kernel_name = (
-            f"gs3d_preprocess_bwd_{axis_front_u_v}_{self._cfg.tile_size}_{degree}_"
+            f"gs3d_preprocess_bwd_{self._cfg.tile_size}_{degree}_"
             f"{fused_scale_act}_{fused_q_act}_{fused_opacity_act}_"
-            f"{cur_degree}_{has_color_base}")
+            f"{cur_degree}_{has_color_base}_{dz is None}_{batch_size == 1}_"
+            f"{is_cam_bundle}")
+        for_ctx = nullcontext()
         with tv.measure_and_print("BWD-prep", enable=self._cfg.verbose):
             code_prep = pccm.code()
             code_prep.raw(f"""
             namespace op = tv::arrayops;
             using math_op_t = tv::arrayops::MathScalarOp<float>;
-            if ($radii[i] == 0){{
-                return;
-            }}
-            auto uv_grad = op::reinterpret_cast_array_nd<2>($duv)[i];
-            auto conic_grad = op::reinterpret_cast_array_nd<3>($dconic)[i];
-            // auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i];
-            auto cam2world_R_T = $cam2world_R_np;
-            auto cam2world_center = $cam2world_center_np;
-
-            auto focal_xy = $focal_xy_np;
-            auto principal_point = $principal_point_np;
-            auto tan_fov = $tanfov_xy_np;
-            auto point = op::reinterpret_cast_array_nd<3>($xyz)[i];
-            point = point - cam2world_center;
-
-            auto point_cam = cam2world_R_T.op<op::mv_rowmajor>(point);
-            auto cov2d_arr = op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i];
-            
-            auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, 0.0f, point_cam, principal_point, focal_xy);
-            auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad(conic_grad, cov2d_arr);
-            auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
-            auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[i];
+            auto resolution_wh = $resolution_wh_np;
             """)
-            if fused_scale_act:
+            if batch_size > 1:
                 code_prep.raw(f"""
-                auto scale_act = scale.op<op::{fused_scale_act[0]}>();
+                float dopacity_val_acc = 0.0f;
+                tv::array<float, 3> dxyz_acc{{}};
+                tv::array<float, 4> dquat_acc{{}};
+                tv::array<float, 3> dscale_acc{{}};
                 """)
-            else:
+                for_ctx = code_prep.for_("int batch_idx = 0; batch_idx < $batch_size; ++batch_idx")
+            with for_ctx:
+                if batch_size > 1:
+                    code_prep.raw(f"""
+                    auto i_with_batch = i + batch_idx * $num;
+                    """)
+                else:
+                    code_prep.raw(f"""
+                    auto i_with_batch = i;
+                    """)
                 code_prep.raw(f"""
-                auto scale_act = scale;
+                if ($radii[i_with_batch] == 0){{
+                    {"return" if batch_size == 1 else "continue"};
+                }}
+                auto uv_grad = op::reinterpret_cast_array_nd<2>($duv)[i_with_batch];
+                auto conic_grad = op::reinterpret_cast_array_nd<3>($dconic)[i_with_batch];
+                // auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i_with_batch];
                 """)
-            if fused_q_act:
-                code_prep.raw(f"""
-                auto quat_act = quat.op<op::normalize>();
-                """)
-            else:
-                code_prep.raw(f"""
-                auto quat_act = quat;
-                """)
-            if self._cfg.recalc_cov3d_in_bwd:
-                code_prep.raw(f"""
-                auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale_act, quat_act);
-                """)
-            else:
-                code_prep.raw(f"""
-                auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i];
-                """)
-            code_prep.raw(f"""
-            auto proj_grad_res = Gaussian3D::project_gaussian_to_2d_grad<float, 3>(dcov2d, point_cam, focal_xy, tan_fov, cam2world_R_T, cov3d_vec);
-            dpoint_cam += std::get<0>(proj_grad_res);
 
-            auto dxyz = cam2world_R_T.op<op::mv_colmajor>(dpoint_cam);
+                if is_cam_bundle:
+                    # cam2world, focal and ppoint are tensor, load from gpu mem
+                    code_prep.raw(f"""
+                    auto cam2world_T = op::reinterpret_cast_array_nd<4, 3>($cam2world_T_ten)[batch_idx];
+                    auto focal_xy_ppoint = op::reinterpret_cast_array_nd<4>($focal_xy_ppoint_ten)[batch_idx];
+                    auto focal_xy = op::slice<0, 2>(focal_xy_ppoint);
+                    auto principal_point = op::slice<2, 4>(focal_xy_ppoint);
+                    auto cam2world_R_T = cam2world_T.slice<0, 3>();
+                    auto cam2world_center = cam2world_T[3];
+                    """)
+                else:
+                    # cam2world, focal and ppoint are registers
+                    code_prep.raw(f"""
+                    auto cam2world_R_T = $cam2world_R_np;
+                    auto cam2world_center = $cam2world_center_np;
+                    auto focal_xy = $focal_xy_np;
+                    auto principal_point = $principal_point_np;
+                    """)
 
-            """)
-            code_prep.raw(f"""
-            auto cov3d_grad_res = Gaussian3D::scale_quat_to_cov3d_grad(std::get<1>(proj_grad_res), scale_act, quat_act);
-            auto dscale = std::get<0>(cov3d_grad_res);
-            auto dquat = std::get<1>(cov3d_grad_res);
-            """)
-            if fused_scale_act:
                 code_prep.raw(f"""
-                dscale = dscale.op<op::{fused_scale_act[1]}>(scale);
-                """)
-            if fused_q_act:
-                code_prep.raw(f"""
-                dquat = dquat.op<op::{fused_q_act[1]}>(quat);
-                """)
-            if fused_opacity_act:
-                code_prep.raw(f"""
-                tv::array<float, 1> opacity_val{{$opacity[i]}};
-                tv::array<float, 1> dopacity_val{{$dopacity[i]}};
-                dopacity_val = dopacity_val.op<op::{fused_opacity_act[1]}>(opacity_val);
-                $dopacity[i] = dopacity_val[0];
-                """)
-            code_prep.raw(f"""
-            op::reinterpret_cast_array_nd<3>($dscale_res)[i] = dscale;
-            op::reinterpret_cast_array_nd<4>($dquat_res)[i] = dquat;
 
-            auto normed_dir = (point).op<op::normalize>();
-            auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1) - has_color_base};
-            auto dsh_ptr = op::reinterpret_cast_array_nd<3>($dcolor_sh_res) + i * {(degree + 1) * (degree + 1) - has_color_base};
-            auto color_grad = op::reinterpret_cast_array_nd<3>($dcolor)[i];
+                auto tan_fov = 0.5f * resolution_wh.cast<float>() / focal_xy;
+                auto point = op::reinterpret_cast_array_nd<3>($xyz)[i];
+                point = point - cam2world_center;
 
-            uint8_t nn_packed = $sh_to_rgb_ne_0[i];
-            bool rgb0_ne_0 = nn_packed & 0x1;
-            bool rgb1_ne_0 = nn_packed & 0x2;
-            bool rgb2_ne_0 = nn_packed & 0x4;
-            color_grad[0] *= rgb0_ne_0 ? 0.0f : 1.0f;
-            color_grad[1] *= rgb1_ne_0 ? 0.0f : 1.0f;
-            color_grad[2] *= rgb2_ne_0 ? 0.0f : 1.0f;
-            
-
-            """)
-            if has_color_base:
-                code_prep.raw(f"""
-                auto dsh_base_ptr = op::reinterpret_cast_array_nd<3>($dcolor_base_sh_res) + i;
-                auto dnormed_dir = Gaussian3D::sh_dir_to_rgb_grad<{cur_degree}>(color_grad, dsh_ptr,
-                    normed_dir, sh_ptr, dsh_base_ptr);
+                auto point_cam = cam2world_R_T.op<op::mv_rowmajor>(point);
+                auto cov2d_arr = op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i_with_batch];
+                auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, {"$dz[i_with_batch]" if dz is not None else "0.0f"}, point_cam, principal_point, focal_xy);
+                auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad(conic_grad, cov2d_arr);
+                auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
+                auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[i];
                 """)
-            else:
+                if fused_scale_act:
+                    code_prep.raw(f"""
+                    auto scale_act = scale.op<op::{fused_scale_act[0]}>();
+                    """)
+                else:
+                    code_prep.raw(f"""
+                    auto scale_act = scale;
+                    """)
+                if fused_q_act:
+                    code_prep.raw(f"""
+                    auto quat_act = quat.op<op::normalize>();
+                    """)
+                else:
+                    code_prep.raw(f"""
+                    auto quat_act = quat;
+                    """)
+                if self._cfg.recalc_cov3d_in_bwd:
+                    code_prep.raw(f"""
+                    auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale_act, quat_act);
+                    """)
+                else:
+                    code_prep.raw(f"""
+                    auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i_with_batch];
+                    """)
                 code_prep.raw(f"""
-                auto dnormed_dir = Gaussian3D::sh_dir_to_rgb_grad<{cur_degree}>(color_grad, dsh_ptr,
-                    normed_dir, sh_ptr);
-                """)
-            code_prep.raw(f"""
-            dxyz += dnormed_dir.op<op::normalize_grad>(point);
-            op::reinterpret_cast_array_nd<3>($dxyz_res)[i] = dxyz;
+                auto proj_grad_res = Gaussian3D::project_gaussian_to_2d_grad<float, 3>(dcov2d, point_cam, focal_xy, tan_fov, cam2world_R_T, cov3d_vec);
+                dpoint_cam += std::get<0>(proj_grad_res);
 
-            """)
+                auto dxyz = cam2world_R_T.op<op::mv_colmajor>(dpoint_cam);
+                auto cov3d_grad_res = Gaussian3D::scale_quat_to_cov3d_grad(std::get<1>(proj_grad_res), scale_act, quat_act);
+                auto dscale = std::get<0>(cov3d_grad_res);
+                auto dquat = std::get<1>(cov3d_grad_res);
+                """)
+                if fused_scale_act:
+                    code_prep.raw(f"""
+                    dscale = dscale.op<op::{fused_scale_act[1]}>(scale);
+                    """)
+                if fused_q_act:
+                    code_prep.raw(f"""
+                    dquat = dquat.op<op::{fused_q_act[1]}>(quat);
+                    """)
+                if fused_opacity_act:
+                    code_prep.raw(f"""
+                    tv::array<float, 1> opacity_val{{$opacity[i]}};
+                    tv::array<float, 1> dopacity_val{{$dopacity[i_with_batch]}};
+                    dopacity_val = dopacity_val.op<op::{fused_opacity_act[1]}>(opacity_val);
+                    """)
+                    if batch_size > 1:
+                        code_prep.raw(f"""
+                        dopacity_val_acc += dopacity_val[0];
+                        """)
+                    else:
+                        code_prep.raw(f"""
+                        $dopacity[i] = dopacity_val[0];
+                        """)
+                if batch_size > 1:
+                    if not fused_opacity_act:
+                        code_prep.raw(f"""
+                        dopacity_val_acc += $dopacity[i_with_batch];
+                        """)
+                    code_prep.raw(f"""
+                    dscale_acc += dscale;
+                    dquat_acc += dquat;
+                    """)
+                else:
+                    code_prep.raw(f"""
+                    op::reinterpret_cast_array_nd<3>($dscale_res)[i] = dscale;
+                    op::reinterpret_cast_array_nd<4>($dquat_res)[i] = dquat;
+                    """)
+                code_prep.raw(f"""
+
+                auto normed_dir = (point).op<op::normalize>();
+                auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1) - has_color_base};
+                auto dsh_ptr = op::reinterpret_cast_array_nd<3>($dcolor_sh_res) + i * {(degree + 1) * (degree + 1) - has_color_base};
+                auto color_grad = op::reinterpret_cast_array_nd<3>($dcolor)[i_with_batch];
+
+                uint8_t nn_packed = $sh_to_rgb_ne_0[i_with_batch];
+                bool rgb0_ne_0 = nn_packed & 0x1;
+                bool rgb1_ne_0 = nn_packed & 0x2;
+                bool rgb2_ne_0 = nn_packed & 0x4;
+                color_grad[0] *= rgb0_ne_0 ? 0.0f : 1.0f;
+                color_grad[1] *= rgb1_ne_0 ? 0.0f : 1.0f;
+                color_grad[2] *= rgb2_ne_0 ? 0.0f : 1.0f;
+                """)
+                sh_grad_fn = "sh_dir_to_rgb_grad" if batch_size == 1 else "sh_dir_to_rgb_grad_batch"
+                if has_color_base:
+                    code_prep.raw(f"""
+                    auto dsh_base_ptr = op::reinterpret_cast_array_nd<3>($dcolor_base_sh_res) + i;
+                    auto dnormed_dir = Gaussian3D::{sh_grad_fn}<{cur_degree}>(color_grad, dsh_ptr,
+                        normed_dir, sh_ptr, dsh_base_ptr);
+                    """)
+                else:
+                    code_prep.raw(f"""
+                    auto dnormed_dir = Gaussian3D::{sh_grad_fn}<{cur_degree}>(color_grad, dsh_ptr,
+                        normed_dir, sh_ptr);
+                    """)
+                code_prep.raw(f"""
+                dxyz += dnormed_dir.op<op::normalize_grad>(point);
+                """)
+                if batch_size == 1:
+                    code_prep.raw(f"""
+                    op::reinterpret_cast_array_nd<3>($dxyz_res)[i] = dxyz;
+                    """)
+                else:
+                    code_prep.raw(f"""
+                    dxyz_acc += dxyz;
+                    """)
+            if batch_size > 1:
+                code_prep.raw(f"""
+                op::reinterpret_cast_array_nd<3>($dxyz_res)[i] = dxyz_acc;
+                op::reinterpret_cast_array_nd<4>($dquat_res)[i] = dquat_acc;
+                op::reinterpret_cast_array_nd<3>($dscale_res)[i] = dscale_acc;
+                $dopacity[i] = dopacity_val_acc;
+                """)
+
             self._inliner.kernel_1d(prep_kernel_name, num, 0, code_prep)
         if return_uv_grad:
             return grad_model, duv
@@ -1377,15 +1514,29 @@ class _RasterizeGaussians(torch.autograd.Function):
         quaternion_xyzw,
         opacity,
         cur_sh_degree,
+        instance_id,
         model_cls: type[GaussianModelBase],
         # cameras
-        cameras,
+        camera_params: CameraParamBundle | BasicPinholeCamera,
+        cam2world_T: torch.Tensor | None,
+        instance_poses,
         # options
         training,
         op: GaussianSplatOp,
         uv_grad_holder=None,
     ):
         enable_verbose = False
+        if isinstance(camera_params, CameraParamBundle):
+            assert cam2world_T is not None
+            cam_bundle = CameraBundle(
+                focal_xy_ppoint=camera_params.focal_xy_ppoint,
+                image_shape_wh=camera_params.image_shape_wh,
+                cam2world_T=cam2world_T,
+            )
+            focal_xy_ppoint = camera_params.focal_xy_ppoint
+        else:
+            cam_bundle = camera_params
+            focal_xy_ppoint = None 
         with tv.measure_and_print("FWD-all-torch-1", enable=enable_verbose):
 
             model = model_cls(
@@ -1396,10 +1547,11 @@ class _RasterizeGaussians(torch.autograd.Function):
                 quaternion_xyzw=quaternion_xyzw,
                 opacity=opacity,
                 cur_sh_degree=cur_sh_degree,
+                instance_id=instance_id,
                 act_applied=True,
             )
         with tv.measure_and_print("FWD-all-torch", enable=enable_verbose):
-            out, fwd_ctx = op.forward(model, cameras, training=training)
+            out, fwd_ctx = op.forward(model, cam_bundle, training=training, instance_poses=instance_poses)
         with tv.measure_and_print("FWD-all-torch-2", enable=enable_verbose):
 
             if fwd_ctx is not None:
@@ -1422,6 +1574,12 @@ class _RasterizeGaussians(torch.autograd.Function):
                     scale,
                     quaternion_xyzw,
                     opacity,
+                    instance_id,
+                    # cam bundle
+                    cam2world_T,
+                    focal_xy_ppoint,
+                    # instance pose
+                    instance_poses,
                     # outputs
                     out.n_contrib,
                     out.color,
@@ -1432,7 +1590,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 ctx.image_shape_wh = fwd_ctx.image_shape_wh
 
         ctx.op = op
-        ctx.cams = cameras
+        if isinstance(camera_params, BasicPinholeCamera):
+            ctx.cams = camera_params
         ctx.cur_sh_degree = cur_sh_degree
         ctx.return_uv_grad = uv_grad_holder is not None
         ctx.model_cls = model_cls
@@ -1445,7 +1604,7 @@ class _RasterizeGaussians(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, drgb, ddepth, dcustom_features, dT, dn_contrib, dradii):
         if len(ctx.saved_tensors) == 0:
-            return (None, ) * 12
+            return (None, ) * 15
         op: GaussianSplatOp = ctx.op
 
         with tv.measure_and_print("BWD-all-torch", enable=False):
@@ -1476,9 +1635,21 @@ class _RasterizeGaussians(torch.autograd.Function):
                 scale=ctx.saved_tensors[13],
                 quaternion_xyzw=ctx.saved_tensors[14],
                 opacity=ctx.saved_tensors[15],
+                instance_id=ctx.saved_tensors[16],
                 act_applied=True,
                 cur_sh_degree=ctx.cur_sh_degree,
             )
+            cam2world_T = ctx.saved_tensors[17]
+            focal_xy_ppoint = ctx.saved_tensors[18]
+            instance_poses = ctx.saved_tensors[19]
+            if cam2world_T is not None:
+                cam_bundle = CameraBundle(
+                    focal_xy_ppoint=focal_xy_ppoint,
+                    image_shape_wh=fwd_ctx.image_shape_wh,
+                    cam2world_T=cam2world_T,
+                )
+            else:
+                cam_bundle = ctx.cams
             if op._cfg.transmittance_is_double:
                 dT = dT.float()
             gradient = GaussianSplatGradients(
@@ -1496,23 +1667,26 @@ class _RasterizeGaussians(torch.autograd.Function):
             # print("Model Size", model.get_all_torch_tensor_byte_size())
             # print("FwdCtx Size", fwd_ctx.get_all_torch_tensor_byte_size())
             # print("Gradient Size", gradient.get_all_torch_tensor_byte_size())
-            cams: list[BasicPinholeCamera] = ctx.cams
-        grad_out, duv = op.backward(model, cams, fwd_ctx, out, gradient,
+        grad_out, duv = op.backward(model, cam_bundle, fwd_ctx, out, gradient,
                                     ctx.return_uv_grad)
-        return grad_out.xyz, grad_out.color_sh, grad_out.color_sh_base, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, None, None, None, duv
+        return grad_out.xyz, grad_out.color_sh, grad_out.color_sh_base, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, None, None, None, None, None, None, duv
 
 
 def rasterize_gaussians(
     model: GaussianModelBase,
-    cameras: list[BasicPinholeCamera],
+    cameras: BasicPinholeCamera | CameraBundle,
     op: GaussianSplatOp,
     training=False,
     background_tensor: torch.Tensor | None = None,
     uv_grad_holder: torch.Tensor | None = None,
+    instance_poses: torch.Tensor | None = None,
 ):
     if not training:
         assert background_tensor is None, "background_tensor is only used in training mode"
     model = model.create_model_with_act()  # apply activation
+    c2w_T = None 
+    if isinstance(cameras, CameraBundle):
+        c2w_T = cameras.cam2world_T
     res = _RasterizeGaussians.apply(
         model.xyz,
         model.color_sh,
@@ -1521,8 +1695,11 @@ def rasterize_gaussians(
         model.quaternion_xyzw,
         model.opacity,
         model.cur_sh_degree,
+        model.instance_id,
         type(model),
         cameras,
+        c2w_T,
+        instance_poses,
         training,
         op,
         uv_grad_holder,
@@ -1540,5 +1717,5 @@ def rasterize_gaussians(
     else:
         if training:
             bg_in_cfg_device = op._cfg.get_bg_color_device(model.xyz.device)
-            out.color = out.color + out.T * bg_in_cfg_device.view(3, 1, 1)
+            out.color = out.color + out.T * bg_in_cfg_device.view(1, 3, 1, 1)
     return out

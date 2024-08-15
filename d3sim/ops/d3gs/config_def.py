@@ -69,6 +69,8 @@ class GaussianSplatConfig:
 
     use_cub_sort: bool = True
 
+    use_int64_tile_touched: bool = False
+
     _bg_color_device: torch.Tensor | None = None
 
     @property 

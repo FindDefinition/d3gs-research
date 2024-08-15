@@ -5,11 +5,11 @@ import torch
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT, IsAppleSiliconMacOs
 from d3sim.data.scene_def.base import Pose, Resource
 from d3sim.data.scene_def.camera import BasicPinholeCamera
-from d3sim.ops.d3gs.render import GaussianSplatConfig, GaussianSplatForward, rasterize_gaussians
+from d3sim.ops.d3gs.render import CameraBundle, GaussianSplatConfig, GaussianSplatOp, rasterize_gaussians
 from d3sim.ops.d3gs.data.scene.dataset_readers import readColmapSceneInfo
 import numpy as np
 from d3sim.ops.points.projection import depth_map_to_jet_rgb 
-
+from d3sim.ops.d3gs.data.load import load_model_and_2_cam, load_model_and_cam
 from torch.profiler import profile, record_function, ProfilerActivity
 # def _validate_color_sh(color_sh: torch.Tensor, xyz: torch.Tensor,
 #                        rgb_gaussian: torch.Tensor, cam2world_T_np: np.ndarray):
@@ -45,39 +45,20 @@ def sync():
         torch.cuda.synchronize()
 
 def _load_model_and_cam():
-    from d3sim.ops.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, camera_to_JSON
-
     data_path = "/Users/yanyan/Downloads/360_v2/garden"
-    # data_path = "/root/autodl-tmp/garden_scene/garden"
+    data_path = "/root/autodl-tmp/garden_scene/garden"
     path = "/Users/yanyan/Downloads/models/garden/point_cloud/iteration_30000/point_cloud.ply"
-    # path = "/root/autodl-tmp/garden_model/garden/point_cloud/iteration_30000/point_cloud.ply"
+    path = "/root/autodl-tmp/garden_model/garden/point_cloud/iteration_30000/point_cloud.ply"
 
-    test_data_path = PACKAGE_ROOT.parent / "scripts/d3gs_cam.pkl"
-    if test_data_path.exists():
-        with open(test_data_path, "rb") as f:
-            intrinsic, world2cam, image_shape_wh = pickle.load(f)
-    else:
-        scene_info = readColmapSceneInfo(data_path, "images_4", True)
-        train_camera_infos = scene_info.train_cameras
-        train_camera_first = next(cameraList_from_camInfos_gen(train_camera_infos, 1, _Args()))
-        intrinsic = train_camera_first.get_intrinsic()
-        world2cam = np.eye(4, dtype=np.float32)
-        world2cam[:3, :3] = train_camera_first.R.T
-        world2cam[:3, 3] = train_camera_first.T
-        image_shape_wh = (train_camera_first.image_width, train_camera_first.image_height)
-        with open(test_data_path, "wb") as f:
-            pickle.dump((intrinsic, world2cam, image_shape_wh), f)
-    # breakpoint()
-    intrinsic_4x4 = np.eye(4, dtype=np.float32)
-    intrinsic_4x4[:3, :3] = intrinsic
+    return load_model_and_cam(data_path, path)
 
-    mod = load_3dgs_origin_model(path, fused=True)
-    cam = BasicPinholeCamera(id="", timestamp=0, pose=Pose(np.eye(4), np.linalg.inv(world2cam)), 
-        image_rc=Resource(base_uri="", loader_type=""), intrinsic=intrinsic_4x4, distortion=np.zeros(4, np.float32),
-        image_shape_wh=image_shape_wh, objects=[])
+def _load_model_and_2cam():
+    data_path = "/Users/yanyan/Downloads/360_v2/garden"
+    data_path = "/root/autodl-tmp/garden_scene/garden"
+    path = "/Users/yanyan/Downloads/models/garden/point_cloud/iteration_30000/point_cloud.ply"
+    path = "/root/autodl-tmp/garden_model/garden/point_cloud/iteration_30000/point_cloud.ply"
 
-    return mod, cam
-
+    return load_model_and_2_cam(data_path, path)
 
 def _main_bwd():
     """
@@ -99,18 +80,22 @@ def _main_bwd():
     print(mod.xyz.shape)
     print("LOADED")
     cfg = GaussianSplatConfig()
-    fwd = GaussianSplatForward(cfg)
+    fwd = GaussianSplatOp(cfg)
     mod.set_requires_grad(True)
     grad_path = "/root/Projects/3dgs/gaussian-splatting/grads.pt"
-    grad_path = "/Users/yanyan/grads.pt"
-    grads = torch.load(grad_path, map_location=D3SIM_DEFAULT_DEVICE)
+    # grad_path = "/Users/yanyan/grads.pt"
     check_grad: bool = True
-    (xyz_grads, opacity_grads, scale_grads, rotation_grads, feature_grads, mean2d_grads, dout) = grads
-    mean2d_grads = mean2d_grads[:, :2]
-    uv_grad_holder = torch.empty_like(mean2d_grads)
+    if check_grad:
+        grads = torch.load(grad_path, map_location=D3SIM_DEFAULT_DEVICE)
+
+        (xyz_grads, opacity_grads, scale_grads, rotation_grads, feature_grads, mean2d_grads, dout) = grads
+        mean2d_grads = mean2d_grads[:, :2]
+
+    uv_grad_holder = torch.empty(mod.xyz.shape[0], 2, dtype=torch.float32, device=mod.xyz.device)
     uv_grad_holder.requires_grad = True
     # breakpoint()
-    cfg = GaussianSplatConfig()
+    cfg = GaussianSplatConfig(verbose=False)
+    op = GaussianSplatOp(cfg)
     for j in range(5):
         mod.clear_grad()
         print("cur_sh_degree", mod.cur_sh_degree)
@@ -119,22 +104,25 @@ def _main_bwd():
         # with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
         # res, _ = fwd.forward(mod, [cam])
         if check_grad:
-            res = rasterize_gaussians(mod, [cam], gaussian_cfg=cfg, training=True, uv_grad_holder=uv_grad_holder)
+            res = rasterize_gaussians(mod, cam, op=op, training=True, uv_grad_holder=uv_grad_holder)
         else:
-            res = rasterize_gaussians(mod, [cam], training=True)
+            res = rasterize_gaussians(mod, cam, op=op, training=True)
         sync()
         print("FWD", time.time() - t)
         assert res is not None 
-        out_color = res.color
+        out_color = res.color[0]
+
+
         # torch.manual_seed(50051)
-        # dout_color = torch.rand(out_color.shape, device=out_color.device)
         sync()
+        if not check_grad:
+            dout = torch.rand(out_color.shape, device=out_color.device)
 
         t = time.time()
 
         out_color.backward(dout)
         sync()
-        # print("BWD", time.time() - t)
+        print("BWD", time.time() - t)
         # assert not mod.act_applied
         if check_grad:
             # print(dout_color.reshape(3, -1)[:, 1])
@@ -149,19 +137,34 @@ def _main_bwd():
             print(xyz_grads[1])
             print(torch.linalg.norm(mod.xyz.grad - xyz_grads))
             breakpoint()
+    breakpoint()
+    print("?")
 
 def _main():
-    mod, cam = _load_model_and_cam()
+    mod, cams = _load_model_and_2cam()
+    # cams[1] = cams[0]
+    cfg = GaussianSplatConfig(verbose=False)
+    op = GaussianSplatOp(cfg)
+    cam2worlds = [cam.pose.to_world for cam in cams]
+    cam2world_Ts = [cam2world[:3].T for cam2world in cam2worlds]
+    cam2world_Ts_onearray = np.stack(cam2world_Ts, axis=0).reshape(-1, 4, 3)
+    cam2world_Ts_th = torch.from_numpy(np.ascontiguousarray(cam2world_Ts_onearray)).to(D3SIM_DEFAULT_DEVICE)
 
+    focal_xys = np.stack([cam.focal_length for cam in cams], axis=0).reshape(-1, 2)
+    ppoints = np.stack([cam.principal_point for cam in cams], axis=0).reshape(-1, 2)
+    focal_xy_ppoints = np.concatenate([focal_xys, ppoints], axis=1)
+    focal_xy_ppoints_th = torch.from_numpy(np.ascontiguousarray(focal_xy_ppoints)).to(D3SIM_DEFAULT_DEVICE)
+    cam_bundle = CameraBundle(focal_xy_ppoints_th, cams[0].image_shape_wh, cam2world_Ts_th)
     for j in range(15):
-        import torchvision
-        torchvision.utils.save_image
         t = time.time()
         # with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
         # res, _ = fwd.forward(mod, [cam])
-        res = rasterize_gaussians(mod, [cam])
+        res = rasterize_gaussians(mod, cam_bundle, op=op)
         assert res is not None 
-        out_color = res.color
+        out_color = res.color # [N, C, H, W]
+        # breakpoint()
+        #  -> [C, H * N, W]
+        out_color = torch.concat([out_color[i] for i in range(out_color.shape[0])], dim=1)
         if j == 0:
             out_color_u8 = out_color.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
             out_color_u8 = out_color_u8[..., ::-1]
@@ -181,4 +184,4 @@ def _main():
 
     
 if __name__ == "__main__":
-    _main_bwd()
+    _main()

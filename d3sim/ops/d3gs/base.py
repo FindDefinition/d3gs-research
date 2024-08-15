@@ -19,6 +19,7 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
                         arrcheck.ArrayCheck(["N", -1, 3], arrcheck.F32)]
     color_sh_base: Annotated[torch.Tensor | None,
                              arrcheck.ArrayCheck(["N", 3], arrcheck.F32)]
+    instance_id: Annotated[torch.Tensor | None, arrcheck.ArrayCheck(["N"], arrcheck.I32)] = None
 
     act_applied: bool = False
     cur_sh_degree: int = 0
@@ -103,6 +104,7 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
                               color_sh=self.color_sh_act,
                               cur_sh_degree=self.cur_sh_degree,
                               color_sh_base=self.color_sh_base,
+                              instance_id=self.instance_id,
                               act_applied=True)
 
     @classmethod
@@ -165,6 +167,8 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
             color_sh_base=torch.nn.Parameter(self.color_sh_base)
             if self.color_sh_base is not None else None,
             cur_sh_degree=self.cur_sh_degree,
+            act_applied=self.act_applied,
+            instance_id=self.instance_id,
         )
 
     @classmethod

@@ -76,7 +76,7 @@ class Trainer:
 
         for cam_raw in scene.getTestCameras():
             cam = original_cam_to_d3sim_cam(cam_raw)
-            out = rasterize_gaussians(self.model, [cam], op=self.gauss_op, training=False)
+            out = rasterize_gaussians(self.model, cam, op=self.gauss_op, training=False)
             gt_image = cam_raw.original_image.to(self.device)
             metrics["psnr"].append(psnr(out.color[None], gt_image[None]))
             metrics["ssim"].append(ssim(out.color[None], gt_image[None]))
@@ -123,7 +123,7 @@ class Trainer:
                     gt_image = viewpoint_cam.original_image.to(D3SIM_DEFAULT_DEVICE)
                 with tv.measure_and_print("fwd-bwd", enable=verbose):
                     # with tv.measure_and_print("rasterize"):
-                    out = rasterize_gaussians(self.model, [cam], op=self.gauss_op, training=True, uv_grad_holder=uv_grad_holder)
+                    out = rasterize_gaussians(self.model, cam, op=self.gauss_op, training=True, uv_grad_holder=uv_grad_holder)
                     assert ev.step_ctx_value is not None 
                     ev.step_ctx_value.output = out
                     Ll1 = l1_loss(out.color, gt_image)
