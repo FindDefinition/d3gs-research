@@ -28,6 +28,8 @@ class DeviceSort(pccm.Class):
     def get_sort_workspace_size(self):
         code = pccm.code()
         code.arg("keys_in, keys_out, values_in, values_out", "tv::Tensor")
+        code.arg("bit_start, bit_end", "int")
+        code.arg("double_buffer", "bool")
         if IsAppleSiliconMacOs:
             code.raw(f"""
             
@@ -43,12 +45,26 @@ class DeviceSort(pccm.Class):
                 for val_dtype in dispatch(code, [dtypes.float32, dtypes.uint32, dtypes.uint64, dtypes.int32, dtypes.int64], "values_in.dtype()"):
 
                     code.raw(f"""
-                    cub::DeviceRadixSort::SortPairs(
-                        nullptr, sort_size,
-                        keys_in.data_ptr<const {key_dtype}>(), 
-                        keys_out.data_ptr<{key_dtype}>(),
-                        values_in.data_ptr<const {val_dtype}>(), 
-                        values_out.data_ptr<{val_dtype}>(), keys_in.dim(0));
+                    if (double_buffer){{
+                        cub::DoubleBuffer<{key_dtype}> d_keys(keys_in.data_ptr<{key_dtype}>(),
+                                                        keys_out.data_ptr<{key_dtype}>());
+                        cub::DoubleBuffer<{val_dtype}> d_values(values_in.data_ptr<{val_dtype}>(),
+                                                            values_out.data_ptr<{val_dtype}>());
+                        cub::DeviceRadixSort::SortPairs(
+                            nullptr, sort_size,
+                            d_keys,
+                            d_values, keys_in.dim(0),
+                            bit_start, bit_end);
+                    }}else{{
+                        cub::DeviceRadixSort::SortPairs(
+                            nullptr, sort_size,
+                            keys_in.data_ptr<const {key_dtype}>(), 
+                            keys_out.data_ptr<{key_dtype}>(),
+                            values_in.data_ptr<const {val_dtype}>(), 
+                            values_out.data_ptr<{val_dtype}>(), keys_in.dim(0),
+                            bit_start, bit_end);
+
+                    }}
                     """)
             code.raw(f"""
             return sort_size;
@@ -62,6 +78,7 @@ class DeviceSort(pccm.Class):
         code.arg("keys_in, keys_out, values_in, values_out", "tv::Tensor")
         code.arg("workspace", "tv::Tensor")
         code.arg("bit_start, bit_end", "int")
+        code.arg("double_buffer", "bool")
         code.arg("stream_int", "std::uintptr_t")
         if IsAppleSiliconMacOs:
             code.raw(f"""
@@ -73,20 +90,39 @@ class DeviceSort(pccm.Class):
             code.raw(f"""
             cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_int);
             size_t storage_size = workspace.raw_size();
+            bool key_swap = false;
+            bool value_swap = false;
             """)
             for key_dtype in dispatch(code, [dtypes.uint32, dtypes.uint64, dtypes.int32, dtypes.int64], "keys_in.dtype()"):
                 for val_dtype in dispatch(code, [dtypes.float32, dtypes.uint32, dtypes.uint64, dtypes.int32, dtypes.int64], "values_in.dtype()"):
 
                     code.raw(f"""
-                    cub::DeviceRadixSort::SortPairs(
-                        workspace.raw_data(), storage_size,
-                        keys_in.data_ptr<const {key_dtype}>(), 
-                        keys_out.data_ptr<{key_dtype}>(),
-                        values_in.data_ptr<const {val_dtype}>(), 
-                        values_out.data_ptr<{val_dtype}>(), size_t(keys_in.dim(0)),
-                        bit_start, bit_end, stream);
+                    if (double_buffer){{
+                        cub::DoubleBuffer<{key_dtype}> d_keys(keys_in.data_ptr<{key_dtype}>(),
+                                                        keys_out.data_ptr<{key_dtype}>());
+                        cub::DoubleBuffer<{val_dtype}> d_values(values_in.data_ptr<{val_dtype}>(),
+                                                            values_out.data_ptr<{val_dtype}>());
+                        cub::DeviceRadixSort::SortPairs(
+                            workspace.raw_data(), storage_size,
+                            d_keys,
+                            d_values, size_t(keys_in.dim(0)),
+                            bit_start, bit_end, stream);
+                        key_swap = d_keys.selector == 0;
+                        value_swap = d_values.selector == 0;
+                    }}else{{
+                        cub::DeviceRadixSort::SortPairs(
+                            workspace.raw_data(), storage_size,
+                            keys_in.data_ptr<const {key_dtype}>(), 
+                            keys_out.data_ptr<{key_dtype}>(),
+                            values_in.data_ptr<const {val_dtype}>(), 
+                            values_out.data_ptr<{val_dtype}>(), size_t(keys_in.dim(0)),
+                            bit_start, bit_end, stream);
+                    }}
                     """)
-        return code 
+        code.raw(f"""
+        return std::make_tuple(key_swap, value_swap);
+        """)
+        return code.ret("std::tuple<bool, bool>")
 
     @pccm.pybind.mark 
     @pccm.static_function

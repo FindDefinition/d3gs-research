@@ -208,8 +208,8 @@ class Trainer:
                         cv2.imwrite(str(save_root / f"test_train_{ev.cur_step}.png"), out_color_u8)
 
                 with torch.no_grad():
-                    if (ev.cur_step + 1) % 1000 == 0 and (ev.cur_step + 1) >= 3000:
-                        self._on_eval(ev.cur_step + 1, scene)
+                    # if (ev.cur_step + 1) % 1000 == 0 and (ev.cur_step + 1) >= 3000:
+                    #     self._on_eval(ev.cur_step + 1, scene)
                     # progress.print(f"LosVals: {loss.item():.{7}f}", self.model.xyz.shape[0])
                     # if loss.item() > 1 or loss .item() < 0:
                     #     out_color = out.color
