@@ -7,9 +7,12 @@ from pccm.utils import project_is_editable, project_is_installed
 import torch 
 from cumm.bindings import build_pytorch_bindings
 from d3sim.constants import PACKAGE_ROOT
-# torch_version = torch.__version__.split("+")[0]
 
-build_pytorch_bindings("d3sim_thtools", PACKAGE_ROOT)
+from .devsort import DeviceSort
+# torch_version = torch.__version__.split("+")[0]
+__dsort = DeviceSort()
+__dsort.namespace = "device_sort"
+build_pytorch_bindings("d3sim_thtools", PACKAGE_ROOT, [__dsort])
 
 # torch_version = torch_version.replace(".", "_")
 # __pytorch_cu = PyTorchTools()

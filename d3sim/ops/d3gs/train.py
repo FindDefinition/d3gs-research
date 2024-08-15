@@ -9,7 +9,7 @@ from d3sim.ops.d3gs import config_def
 from d3sim.core import dataclass_dispatch as dataclasses
 
 from d3sim.ops.d3gs.data.load import load_scene_info_and_first_cam, Scene, original_cam_to_d3sim_cam
-from d3sim.ops.d3gs.render import GaussianSplatOutput, rasterize_gaussians
+from d3sim.ops.d3gs.render import GaussianSplatOp, GaussianSplatOutput, rasterize_gaussians
 from d3sim.ops.d3gs.strategy import GaussianTrainState, GaussianStrategyBase, reset_param_in_optim
 from d3sim.ops.d3gs.losses import l1_loss, ssim
 from cumm import tensorview as tv
@@ -53,6 +53,8 @@ class Trainer:
         self.strategy = GaussianStrategyBase(cfg.train.strategy)
         self.strategy_ref = StrategyRef(verbose=True)
 
+        self.gauss_op = GaussianSplatOp(cfg.model.op)
+
         self.use_strategy_ref = False
         self.engine.register_period_event("log", 1000, self._on_log)
         self.engine.register_period_event("up_sh", 1000, self._on_up_sh_degree_log)
@@ -72,7 +74,7 @@ class Trainer:
 
         for cam_raw in scene.getTestCameras():
             cam = original_cam_to_d3sim_cam(cam_raw)
-            out = rasterize_gaussians(self.model, [cam], gaussian_cfg=self.cfg.model.op, training=False)
+            out = rasterize_gaussians(self.model, [cam], op=self.gauss_op, training=False)
             gt_image = cam_raw.original_image.to(self.device)
             metrics["psnr"].append(psnr(out.color[None], gt_image[None]))
             metrics["ssim"].append(ssim(out.color[None], gt_image[None]))
@@ -119,7 +121,7 @@ class Trainer:
                     gt_image = viewpoint_cam.original_image.to(D3SIM_DEFAULT_DEVICE)
                 with tv.measure_and_print("fwd-bwd", enable=verbose):
                     # with tv.measure_and_print("rasterize"):
-                    out = rasterize_gaussians(self.model, [cam], gaussian_cfg=self.cfg.model.op, training=True, uv_grad_holder=uv_grad_holder)
+                    out = rasterize_gaussians(self.model, [cam], op=self.gauss_op, training=True, uv_grad_holder=uv_grad_holder)
                     assert ev.step_ctx_value is not None 
                     ev.step_ctx_value.output = out
                     Ll1 = l1_loss(out.color, gt_image)
@@ -192,7 +194,7 @@ class Trainer:
 
                 save_root = PACKAGE_ROOT / "build/debug"
                 with torch.no_grad():
-                    if (ev.cur_step + 1) % 500 == 0:
+                    if (ev.cur_step + 1) % 1000 == 0:
                         out_color = out.color
                         out_color_u8 = out_color.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
                         out_color_u8 = out_color_u8[..., ::-1]
@@ -204,7 +206,7 @@ class Trainer:
                         cv2.imwrite(str(save_root / f"test_train_{ev.cur_step}.png"), out_color_u8)
 
                 with torch.no_grad():
-                    if (ev.cur_step + 1) % 1000 == 0:
+                    if (ev.cur_step + 1) % 1000 == 0 and (ev.cur_step + 1) >= 3000:
                         self._on_eval(ev.cur_step + 1, scene)
                     # progress.print(f"LosVals: {loss.item():.{7}f}", self.model.xyz.shape[0])
                     # if loss.item() > 1 or loss .item() < 0:
@@ -296,9 +298,9 @@ def __main():
 
     path = "/Users/yanyan/Downloads/360_v2/garden"
     path = "/root/autodl-tmp/garden_scene/garden"
-    random.seed(0)
-    np.random.seed(0)
-    torch.manual_seed(0)
+    random.seed(50051)
+    # np.random.seed(2)
+    # torch.manual_seed(2)
     scene_info, first_cam = load_scene_info_and_first_cam(path)
     points = scene_info.point_cloud.points
     cfg = config_def.Config(

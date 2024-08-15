@@ -27,6 +27,10 @@ __deps: list[type[pccm.Class]] = [
     RotationMath, CameraOps, CameraDefs, VisUtils, Gaussian3D
 ]
 
-INLINER = NVRTCInlineBuilder(__deps,
-                             reload_when_code_change=True, mps_context=MPSContext())
-INLINER.maximum_1d_threads = 256
+def create_default_inliner():
+    inliner = NVRTCInlineBuilder(__deps,
+                                reload_when_code_change=True, mps_context=MPSContext())
+    inliner.maximum_1d_threads = 256
+    return inliner
+
+INLINER = create_default_inliner()

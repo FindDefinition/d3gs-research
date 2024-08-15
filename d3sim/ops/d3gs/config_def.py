@@ -64,8 +64,10 @@ class GaussianSplatConfig:
     backward_reduction: Literal["none", "warp", "block"] = "warp"
     verbose: bool = False
 
-    recalc_cov3d_in_bwd: bool = False
+    recalc_cov3d_in_bwd: bool = True
     enable_device_asserts: bool = False
+
+    use_cub_sort: bool = True
 
     _bg_color_device: torch.Tensor | None = None
 

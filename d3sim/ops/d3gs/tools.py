@@ -154,7 +154,7 @@ def create_origin_3dgs_optimizers(model: GaussianModelBase, optim_cfg: config_de
     optimizers = {
         pg["name"] :torch.optim.Adam(
             [{"params": pg["params"], "lr": pg["lr"], "name": pg["name"]}],
-            eps=1e-15, fused=True
+            eps=1e-15, fused=False
         )
         for pg in pgs
     }

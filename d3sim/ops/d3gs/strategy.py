@@ -289,6 +289,10 @@ class GaussianStrategyBase:
         split_prune_mask_u8 = torch.empty(n_split * 2, dtype=torch.uint8, device=duv_ndc_length.device)
         code = pccm.code()
         assert n_split * 2 == xyz_split.shape[0]
+        assert n_split * 2 == scale_split.shape[0]
+        assert n_split * 2 == opacity_split.shape[0]
+        assert n_split * 2 == quaternion_xyzw_split.shape[0]
+
         code.raw(f"""
         namespace op = tv::arrayops;
         using math_op_t = tv::arrayops::MathScalarOp<float>;

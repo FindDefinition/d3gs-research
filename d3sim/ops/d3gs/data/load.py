@@ -5,7 +5,7 @@ import torch
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT, IsAppleSiliconMacOs
 from d3sim.data.scene_def.base import Pose, Resource
 from d3sim.data.scene_def.camera import BasicPinholeCamera
-from d3sim.ops.d3gs.render import GaussianSplatConfig, GaussianSplatForward, rasterize_gaussians
+from d3sim.ops.d3gs.render import GaussianSplatConfig, GaussianSplatOp, rasterize_gaussians
 from d3sim.ops.d3gs.data.scene.dataset_readers import readColmapSceneInfo, SceneInfo
 import numpy as np
 from d3sim.ops.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, cameraList_from_camInfos, camera_to_JSON, Camera
