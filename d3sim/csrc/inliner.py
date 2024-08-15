@@ -29,8 +29,10 @@ __deps: list[type[pccm.Class]] = [
 
 def create_default_inliner():
     inliner = NVRTCInlineBuilder(__deps,
-                                reload_when_code_change=True, mps_context=MPSContext())
+                                reload_when_code_change=True,
+                                mps_context=MPSContext())
     inliner.maximum_1d_threads = 256
+    inliner.show_diff_when_reload = True
     return inliner
 
 INLINER = create_default_inliner()

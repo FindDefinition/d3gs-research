@@ -427,7 +427,7 @@ class GaussianSplatOp:
                 gaussian_idx_sorted = torch.gather(gaussian_idx, 0, indices)
 
         with measure_and_print_torch("4.2", enable=enable_verbose):
-            workload_ranges = torch.empty([tile_num_x * tile_num_y, 2],
+            workload_ranges = torch.zeros([tile_num_x * tile_num_y, 2],
                                           dtype=torch.int32,
                                           device=xyz.device)
             shift_bits = 32 if not enable_32bit_sort else 18
@@ -594,10 +594,10 @@ class GaussianSplatOp:
         t_dtype = "double" if self._cfg.transmittance_is_double else "float"
         use_bwd_reduce = bwd_reduce_method != "none"
         kernel_unique_name = (
-            f"rasterize_{is_bwd}_{self._cfg.tile_size}"
+            f"rasterize_{is_bwd}_{self._cfg.tile_size}_{training}"
             f"_{num_custom_feat}_{self._cfg.render_depth}"
             f"_{self._cfg.use_nchw}_{self._cfg.render_rgba}"
-            f"_{final_n_contrib is None}_{t_dtype}_{self._cfg.backward_reduction}")
+            f"_{final_n_contrib is None}_{self._cfg.backward_reduction}")
 
         code_rasterize = pccm.code()
         code_rasterize.raw(f"""
@@ -1138,7 +1138,7 @@ class GaussianSplatOp:
         tile_num_x = div_up(width, self._cfg.tile_size[0])
         tile_num_y = div_up(height, self._cfg.tile_size[1])
         radii = ctx.radii
-        grad_out = self.rasterize_forward_backward(model, ctx, out, grad)
+        grad_out = self.rasterize_forward_backward(model, ctx, out, grad, training=True)
         assert grad_out is not None
         duv = grad_out.duv
         dconic = grad_out.dconic

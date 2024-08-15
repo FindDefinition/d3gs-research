@@ -28,6 +28,8 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
+def get_used_gpu_mem_GB():
+    return torch.cuda.max_memory_allocated() / 1024**3
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class StepCtx:
@@ -224,7 +226,7 @@ class Trainer:
 
                     ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
                     if (ev.cur_step + 1) % 100 == 0:
-                        print(f"Loss: {ema_loss_for_log:.{7}f}")
+                        print(f"Loss: {ema_loss_for_log:.{7}f}, Mem: {get_used_gpu_mem_GB():.3f} GB")
                     # progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
                 # if ev.cur_step >= 10:
                 #     raise NotImplementedError
@@ -298,10 +300,12 @@ def __main():
 
     path = "/Users/yanyan/Downloads/360_v2/garden"
     path = "/root/autodl-tmp/garden_scene/garden"
-    random.seed(50051)
-    # np.random.seed(2)
-    # torch.manual_seed(2)
+    random.seed(0)
+    np.random.seed(0)
+    torch.manual_seed(0)
     scene_info, first_cam = load_scene_info_and_first_cam(path)
+    scene = Scene(scene_info, True)
+    print("Load Dataset GPU Memory", get_used_gpu_mem_GB())
     points = scene_info.point_cloud.points
     cfg = config_def.Config(
         model=config_def.Model(config_def.GaussianSplatConfig()),
@@ -309,7 +313,8 @@ def __main():
     )
     model = GaussianModelOriginFused.empty_parameter(points.shape[0], 3, True, device=torch.device(D3SIM_DEFAULT_DEVICE)) 
     init_original_3dgs_model(model, points, scene_info.point_cloud.colors)
-    
+    print("Init Model GPU Memory", get_used_gpu_mem_GB())
+
     # (_, xyz, feat_dc, feat_rest, scale, rot, opac, *_) = torch.load("/root/Projects/3dgs/gaussian-splatting/init_model.pth")
 
     # print(torch.linalg.norm(xyz - model.xyz))
@@ -320,7 +325,6 @@ def __main():
 
     # breakpoint()
     trainer = Trainer(model, cfg, scene_info.nerf_normalization["radius"])
-    scene = Scene(scene_info, True)
     with create_enter_debug_store():
 
         trainer.train(scene)
