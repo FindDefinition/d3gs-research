@@ -76,10 +76,6 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
         assert (res + 1) * (res + 1) == dim
         return res
 
-    @property
-    def custom_features(self) -> torch.Tensor | None:
-        return None
-
     def set_requires_grad(self, requires_grad: bool):
         self.xyz.requires_grad_(requires_grad)
         self.quaternion_xyzw.requires_grad_(requires_grad)

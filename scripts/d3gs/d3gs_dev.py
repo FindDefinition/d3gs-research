@@ -84,7 +84,7 @@ def _main_bwd():
     mod.set_requires_grad(True)
     grad_path = "/root/Projects/3dgs/gaussian-splatting/grads.pt"
     # grad_path = "/Users/yanyan/grads.pt"
-    check_grad: bool = True
+    check_grad: bool = False
     if check_grad:
         grads = torch.load(grad_path, map_location=D3SIM_DEFAULT_DEVICE)
 
@@ -143,7 +143,9 @@ def _main_bwd():
 def _main():
     mod, cams = _load_model_and_2cam()
     # cams[1] = cams[0]
-    cfg = GaussianSplatConfig(verbose=False)
+    cfg = GaussianSplatConfig(verbose=False, enable_32bit_sort=True, gaussian_std_sigma=2.0)
+    # cfg = GaussianSplatConfig(verbose=False)
+
     op = GaussianSplatOp(cfg)
     cam2worlds = [cam.pose.to_world for cam in cams]
     cam2world_Ts = [cam2world[:3].T for cam2world in cam2worlds]
@@ -154,7 +156,7 @@ def _main():
     ppoints = np.stack([cam.principal_point for cam in cams], axis=0).reshape(-1, 2)
     focal_xy_ppoints = np.concatenate([focal_xys, ppoints], axis=1)
     focal_xy_ppoints_th = torch.from_numpy(np.ascontiguousarray(focal_xy_ppoints)).to(D3SIM_DEFAULT_DEVICE)
-    cam_bundle = CameraBundle(focal_xy_ppoints_th, cams[0].image_shape_wh, cam2world_Ts_th)
+    cam_bundle = CameraBundle(focal_xy_ppoints_th, cams[0].image_shape_wh, None, cam2world_Ts_th)
     for j in range(15):
         t = time.time()
         # with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
@@ -162,12 +164,20 @@ def _main():
         res = rasterize_gaussians(mod, cam_bundle, op=op)
         assert res is not None 
         out_color = res.color # [N, C, H, W]
-        # breakpoint()
-        #  -> [C, H * N, W]
-        out_color = torch.concat([out_color[i] for i in range(out_color.shape[0])], dim=1)
         if j == 0:
+            if not op.is_nchw:
+                # to nchw
+                out_color = out_color.permute(0, 3, 1, 2)
+
+            # breakpoint()
+            #  -> [C, H * N, W]
+            out_color = torch.concat([out_color[i] for i in range(out_color.shape[0])], dim=1)
+
             out_color_u8 = out_color.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
-            out_color_u8 = out_color_u8[..., ::-1]
+            if op.is_rgba:
+                out_color_u8 = out_color_u8[..., [2, 1, 0, 3]]
+            else:
+                out_color_u8 = out_color_u8[..., ::-1]
             if res.depth is not None:
                 depth = res.depth
                 depth_rgb = depth_map_to_jet_rgb(depth, (0.2, 25.0)).cpu().numpy()
@@ -184,4 +194,4 @@ def _main():
 
     
 if __name__ == "__main__":
-    _main()
+    _main_bwd()

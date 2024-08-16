@@ -66,10 +66,11 @@ class GaussianSplatOpContext(DataClassWithArrayCheck):
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatOutput(DataClassWithArrayCheck):
+    # no way to support checker for both nchw and nhwc.
     custom_features: Annotated[torch.Tensor | None,
-                               ac.ArrayCheck(["B", -1, "H", "W"], ac.F32)]
+                               ac.ArrayCheck(["B", -1, "E", -1], ac.F32)]
     T: Annotated[torch.Tensor, ac.ArrayCheck(["B", "H", "W"], ac.F32)]
-    color: Annotated[torch.Tensor, ac.ArrayCheck(["B", 3, "H", "W"], ac.F32)]
+    color: Annotated[torch.Tensor, ac.ArrayCheck(["B", -1, "E", -1], ac.F32)]
     depth: Annotated[torch.Tensor | None,
                      ac.ArrayCheck(["B", "H", "W"], ac.F32)] = None
     n_contrib: Annotated[torch.Tensor | None,
@@ -103,11 +104,12 @@ class RasterizeGradientOutput(DataClassWithArrayCheck):
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatGradients(DataClassWithArrayCheck):
-    drgb: Annotated[torch.Tensor, ac.ArrayCheck(["B", -1, "H", "W"], ac.F32)]
+    # no way to support checker for both nchw and nhwc.
+    drgb: Annotated[torch.Tensor, ac.ArrayCheck(["B", -1, "F", -1], ac.F32)]
     dT: Annotated[torch.Tensor, ac.ArrayCheck(["B", "H", "W"], ac.F32)]
     ddepth: Annotated[torch.Tensor | None, ac.ArrayCheck(["B", "H", "W"], ac.F32)]
     dcustom_features: Annotated[torch.Tensor | None,
-                                ac.ArrayCheck(["B", -1, "H", "W"], ac.F32)]
+                                ac.ArrayCheck(["B", -1, "F", -1], ac.F32)]
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class CameraParamBundle:
@@ -128,12 +130,21 @@ class GaussianSplatOp:
         self._cfg = copy.deepcopy(cfg) 
         self._inliner = create_default_inliner()
 
+    @property 
+    def is_nchw(self):
+        return self._cfg.use_nchw
+
+    @property 
+    def is_rgba(self):
+        return self._cfg.render_rgba
+
     def forward(
         self,
         model: GaussianModelBase,
         cameras: BasicPinholeCamera | CameraBundle,
         training: bool = False,
         instance2world_T: torch.Tensor | None = None,
+        custom_features: torch.Tensor | None = None,
     ):
         enable_verbose = self._cfg.verbose
         # enable_verbose = False
@@ -230,8 +241,12 @@ class GaussianSplatOp:
         # debug_cov2d = torch.empty([num, 3], dtype=torch.float32, device=xyz.device)
 
         # debug_ten = torch.empty(num, dtype=torch.float32, device=xyz.device)
-        custom_feat = model.custom_features
-        num_custom_feat = 0 if custom_feat is None else custom_feat.shape[1]
+        custom_feat = custom_features
+        num_custom_feat = 0
+        if custom_feat is not None:
+            num_custom_feat = custom_feat.shape[-1]
+            assert custom_feat.shape[0] == batch_size * num
+            assert not self.is_nchw, "custom feat don't support nchw, set use_nchw=False in config."
         t1 = time.time()
         fused_scale_act = model.fused_scale_act_op
         fused_q_act = model.fused_quaternion_xyzw_act_op
@@ -297,7 +312,7 @@ class GaussianSplatOp:
                     auto world2instance_center = - (instance2world_R_T.op<op::mv_rowmajor>(instance2world_center));
                     
                     // get cam2instance_R_T
-                    auto cam2instance_R_T = cam2world_R_T.op<op::mm_tt>(instance2world_R_T.op<op::transpose>());
+                    auto cam2instance_R_T = cam2world_R_T.op<op::mm_ttt>(instance2world_R_T.op<op::transpose>());
                     // get cam2instance_center 
                     // y2 = R2 @ (R1 @ x + t1) + t2 = R2 @ R1 @ x + R2 @ t1 + t2
                     auto cam2instance_center = cam2world_R_T.op<op::mv_rowmajor>(world2instance_center) + cam2world_center;
@@ -468,7 +483,7 @@ class GaussianSplatOp:
             with code.if_("radii_val > 0"):
                 if enable_32bit_sort:
                     code.raw(f"""
-                    auto depth_uint = uint32_t($depths[i] / $(self._cfg.depth_32bit_prec)) & 0x3FFFF;
+                    auto depth_uint = uint32_t($depths[i] / $(self._cfg.depth_32bit_prec)) & 0x3FFFFu;
                     """)
                 else:
                     code.raw(f"""
@@ -500,12 +515,16 @@ class GaussianSplatOp:
                                 code.raw(f"""
                                 int bitcount = __popc(key);
                                 """)
-                            code.raw(f"""
-                            if (bitcount == 14){{
-                                // inverse order of depth because of sign bit is set
-                                depth_uint = 0x3FFFFu - depth_uint;
-                            }}
-                            """)
+                            if not self._cfg.use_cub_sort:
+                                # cub sort use unsigned, torch don't support uint sort
+                                # so we only need to reverse the depth bits
+                                # when use torch sort.
+                                code.raw(f"""
+                                if (bitcount == 14){{
+                                    // inverse order of depth because of sign bit is set
+                                    depth_uint = 0x3FFFFu - depth_uint;
+                                }}
+                                """)
                         else:
                             code.raw(f"""
                             uint64_t key = batch_idx * tile_num_xy[0] * tile_num_xy[1] + y * tile_num_xy[0] + x;
@@ -535,10 +554,12 @@ class GaussianSplatOp:
                 gaussian_idx_sorted = torch.empty_like(gaussian_idx)
                 end_bit = 32 + DeviceSort.get_higher_msb(
                     batch_size * tile_num_x * tile_num_y)
+                if enable_32bit_sort:
+                    end_bit = 32
                 keys_tile_idx_depth_tv = torch_tensor_to_tv(
-                    keys_tile_idx_depth, dtype=tv.uint64)
+                    keys_tile_idx_depth, dtype=tv.uint64 if not enable_32bit_sort else tv.uint32)
                 sorted_vals_tv = torch_tensor_to_tv(sorted_vals,
-                                                    dtype=tv.uint64)
+                                                    dtype=tv.uint64 if not enable_32bit_sort else tv.uint32)
                 gaussian_idx_tv = torch_tensor_to_tv(gaussian_idx)
                 gaussian_idx_sorted_tv = torch_tensor_to_tv(
                     gaussian_idx_sorted)
@@ -662,7 +683,8 @@ class GaussianSplatOp:
                 ctx,
                 output_dc,
                 training=training,
-                render_depth=self._cfg.render_depth)
+                render_depth=self._cfg.render_depth,
+                custom_features=custom_feat)
         if not training:
             ctx = None
 
@@ -674,7 +696,8 @@ class GaussianSplatOp:
                                    out: GaussianSplatOutput,
                                    grad: GaussianSplatGradients | None = None,
                                    training: bool = False,
-                                   render_depth: bool = False):
+                                   render_depth: bool = False,
+                                   custom_features: torch.Tensor | None = None):
         """if grad is not None, run backward mode, otherwise run forward mode.
         rasterize backward share many code with forward, so we use a single function to handle both.
         """
@@ -696,8 +719,10 @@ class GaussianSplatOp:
                                                     to_const=True)
         rgb_gaussian_tv = torch_tensor_to_tv(ctx.rgb_gaussian, to_const=True)
         final_custom_feat = out.custom_features
+        # assume nhwc
         num_custom_feat = 0 if final_custom_feat is None else final_custom_feat.shape[
-            0]
+            1 if self._cfg.use_nchw else -1]
+        has_custom_feat = num_custom_feat > 0
 
         final_T = out.T
         final_color = out.color
@@ -713,6 +738,7 @@ class GaussianSplatOp:
 
         grad_out: RasterizeGradientOutput | None = None
         color_use_smem = is_bwd  # TODO why bwd use smem for color?
+        custom_feat_use_smem = num_custom_feat <= 16
         if grad is not None:
             drgb = grad.drgb
             dT = grad.dT
@@ -732,9 +758,11 @@ class GaussianSplatOp:
             dcolor = torch.zeros([batch_size * num, 3],
                                  dtype=torch.float32,
                                  device=final_T.device)
-            dcustom_features = torch.zeros([batch_size * num, num_custom_feat],
-                                           dtype=torch.float32,
-                                           device=final_T.device)
+            dcustom_features = None 
+            if num_custom_feat > 0:
+                dcustom_features = torch.zeros([batch_size * num, num_custom_feat],
+                                            dtype=torch.float32,
+                                            device=final_T.device)
             dz = None
             if render_depth:
                 dz = torch.zeros([batch_size * num],
@@ -755,7 +783,8 @@ class GaussianSplatOp:
             f"_{num_custom_feat}_{self._cfg.render_depth}"
             f"_{self._cfg.use_nchw}_{self._cfg.render_rgba}_{batch_size == 1}"
             f"_{final_n_contrib is None}_{self._cfg.backward_reduction}")
-
+        num_channels = self._cfg.num_channels
+        render_rgba = self._cfg.render_rgba
         code_rasterize = pccm.code()
         code_rasterize.raw(f"""
         namespace op = tv::arrayops;
@@ -809,6 +838,10 @@ class GaussianSplatOp:
             code_rasterize.raw(f"""
             TV_SHARED_MEMORY float collected_depth[{block_size}];
             """)
+        if custom_feat_use_smem and has_custom_feat:
+            code_rasterize.raw(f"""
+            TV_SHARED_MEMORY tv::array<float, {num_custom_feat}> collected_custom_feat[{block_size}];
+            """)
         if bwd_reduce_method == "block":
             code_rasterize.raw(f"""
             TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_drgb_0;
@@ -833,8 +866,6 @@ class GaussianSplatOp:
         // Check if this thread is associated with a valid pixel or outside.
         // Done threads can help with fetching, but don't rasterize
         bool done = !inside;
-
-        
         {t_dtype} T = 1.0f;
         """)
         if batch_size == 1:
@@ -849,11 +880,15 @@ class GaussianSplatOp:
             """)
         if not is_bwd:
             code_rasterize.raw(f"""
-            tv::array<float, 3> rgb{{}};
+            tv::array<float, {num_channels}> rgb{{}};
             int toDo = range[1] - range[0];
             int rounds = tv::div_up(range[1] - range[0], {block_size});
             uint32_t contributor = 0;
             """)
+            if has_custom_feat:
+                code_rasterize.raw(f"""
+                tv::array<float, {num_custom_feat}> custom_feat_accum{{}};
+                """)
         else:
             code_rasterize.raw(f"""
             int warp_idx = thread_rank / 32;
@@ -899,7 +934,7 @@ class GaussianSplatOp:
             if self._cfg.use_nchw:
                 if batch_size == 1:
                     code_rasterize.raw(f"""
-                    tv::array<float, 3> render_rgb, drgb_array;
+                    tv::array<float, {num_channels}> render_rgb, drgb_array;
                     render_rgb[0] = inside ? $final_color[0 * $height * $width + pixel_id] : 0.0f;
                     render_rgb[1] = inside ? $final_color[1 * $height * $width + pixel_id] : 0.0f;
                     render_rgb[2] = inside ? $final_color[2 * $height * $width + pixel_id] : 0.0f;
@@ -908,22 +943,37 @@ class GaussianSplatOp:
                     drgb_array[1] = inside ? $drgb[1 * $height * $width + pixel_id] : 0.0f;
                     drgb_array[2] = inside ? $drgb[2 * $height * $width + pixel_id] : 0.0f;
                     """)
+                    if render_rgba:
+                        code_rasterize.raw(f"""
+                        render_rgb[3] = inside ? $final_color[3 * $height * $width + pixel_id] : 0.0f;
+                        drgb_array[3] = inside ? $drgb[3 * $height * $width + pixel_id] : 0.0f;
+                        """)
                 else:
                     code_rasterize.raw(f"""
-                    tv::array<float, 3> render_rgb, drgb_array;
-                    render_rgb[0] = inside ? $final_color[(batch_idx * 3 + 0) * $height * $width + pixel_id_no_batch] : 0.0f;
-                    render_rgb[1] = inside ? $final_color[(batch_idx * 3 + 1) * $height * $width + pixel_id_no_batch] : 0.0f;
-                    render_rgb[2] = inside ? $final_color[(batch_idx * 3 + 2) * $height * $width + pixel_id_no_batch] : 0.0f;
+                    tv::array<float, {num_channels}> render_rgb, drgb_array;
+                    render_rgb[0] = inside ? $final_color[(batch_idx * {num_channels} + 0) * $height * $width + pixel_id_no_batch] : 0.0f;
+                    render_rgb[1] = inside ? $final_color[(batch_idx * {num_channels} + 1) * $height * $width + pixel_id_no_batch] : 0.0f;
+                    render_rgb[2] = inside ? $final_color[(batch_idx * {num_channels} + 2) * $height * $width + pixel_id_no_batch] : 0.0f;
 
-                    drgb_array[0] = inside ? $drgb[(batch_idx * 3 + 0) * $height * $width + pixel_id_no_batch] : 0.0f;
-                    drgb_array[1] = inside ? $drgb[(batch_idx * 3 + 1) * $height * $width + pixel_id_no_batch] : 0.0f;
-                    drgb_array[2] = inside ? $drgb[(batch_idx * 3 + 2) * $height * $width + pixel_id_no_batch] : 0.0f;
+                    drgb_array[0] = inside ? $drgb[(batch_idx * {num_channels} + 0) * $height * $width + pixel_id_no_batch] : 0.0f;
+                    drgb_array[1] = inside ? $drgb[(batch_idx * {num_channels} + 1) * $height * $width + pixel_id_no_batch] : 0.0f;
+                    drgb_array[2] = inside ? $drgb[(batch_idx * {num_channels} + 2) * $height * $width + pixel_id_no_batch] : 0.0f;
                     """)
+                    if render_rgba:
+                        code_rasterize.raw(f"""
+                        render_rgb[3] = inside ? $final_color[(batch_idx * {num_channels} + 3) * $height * $width + pixel_id_no_batch] : 0.0f;
+                        drgb_array[3] = inside ? $drgb[(batch_idx * {num_channels} + 3) * $height * $width + pixel_id_no_batch] : 0.0f;
+                        """)
             else:
                 code_rasterize.raw(f"""
-                tv::array<float, 3> render_rgb = inside ? op::reinterpret_cast_array_nd<3>($final_color)[pixel_id] : tv::array<float, 3>{{}};
-                auto drgb_array = inside ? op::reinterpret_cast_array_nd<3>($drgb)[pixel_id] : tv::array<float, 3>{{}};
+                tv::array<float, {num_channels}> render_rgb = inside ? op::reinterpret_cast_array_nd<{num_channels}>($final_color)[pixel_id] : tv::array<float, {num_channels}>{{}};
+                auto drgb_array = inside ? op::reinterpret_cast_array_nd<{num_channels}>($drgb)[pixel_id] : tv::array<float, {num_channels}>{{}};
                 """)
+                if has_custom_feat:
+                    code_rasterize.raw(f"""
+                    auto render_custom_feat = inside ? op::reinterpret_cast_array_nd<{num_custom_feat}>($final_custom_feat)[pixel_id] : tv::array<float, {num_custom_feat}>{{}};
+                    auto dcustom_feat = inside ? op::reinterpret_cast_array_nd<{num_custom_feat}>($dcustom_features)[pixel_id] : tv::array<float, {num_custom_feat}>{{}};
+                    """)
 
             if render_depth:
                 code_rasterize.raw(f"""
@@ -970,6 +1020,11 @@ class GaussianSplatOp:
                     collected_rgb_gaussian[thread_rank * 3 + 0] = rgb_gaussian_val[0];
                     collected_rgb_gaussian[thread_rank * 3 + 1] = rgb_gaussian_val[1];
                     collected_rgb_gaussian[thread_rank * 3 + 2] = rgb_gaussian_val[2];
+                    """)
+                if has_custom_feat and custom_feat_use_smem:
+                    code_rasterize.raw(f"""
+                    auto custom_feat_val = op::reinterpret_cast_array_nd<{num_custom_feat}>($custom_features)[gaussian_id];
+                    collected_custom_feat[thread_rank] = custom_feat_val;
                     """)
                 if render_depth:
                     code_rasterize.raw(f"""
@@ -1088,24 +1143,61 @@ class GaussianSplatOp:
                             code_rasterize.raw(f"""
                             assert(gaussian_id >= 0 && gaussian_id < $num);
                             """)
+                    if has_custom_feat:
+                        if custom_feat_use_smem:
+                            code_rasterize.raw(f"""
+                            auto custom_feat_val = collected_custom_feat[j];
+                            """)
+                        else:
+                            if not gaussian_id_inited:
+                                code_rasterize.raw(f"""
+                                auto gaussian_id = collected_id[j];
+                                """)
+                            code_rasterize.raw(f"""
+                            auto custom_feat_val = op::reinterpret_cast_array_nd<{num_custom_feat}>($custom_features)[gaussian_id];
+                            """)
                     if is_bwd:
-                        code_rasterize.raw(f"""
-                        render_rgb -= weight * rgb_val;
-                        """)
+                        if render_rgba:
+                            code_rasterize.raw(f"""
+                            render_rgb[0] -= weight * rgb_val[0];
+                            render_rgb[1] -= weight * rgb_val[1];
+                            render_rgb[2] -= weight * rgb_val[2];
+                            render_rgb[3] -= weight;
+                            """)
+                        else:
+                            code_rasterize.raw(f"""
+                            render_rgb -= weight * rgb_val;
+                            """)
                         if render_depth:
                             code_rasterize.raw(f"""
                             auto depth_val = collected_depth[j];
                             render_depth -= weight * depth_val;
                             """)
+                        if has_custom_feat:
+                            code_rasterize.raw(f"""
+                            render_custom_feat -= weight * custom_feat_val;
+                            """)
 
                     if not is_bwd:
-                        code_rasterize.raw(f"""
-                        rgb += weight * rgb_val;
-                        """)
+                        if render_rgba:
+                            code_rasterize.raw(f"""
+                            rgb[0] += weight * rgb_val[0];
+                            rgb[1] += weight * rgb_val[1];
+                            rgb[2] += weight * rgb_val[2];
+                            rgb[3] += weight;
+                            """)
+                        else:
+                            code_rasterize.raw(f"""
+                            rgb += weight * rgb_val;
+                            """)
                         if render_depth:
                             code_rasterize.raw(f"""
                             auto depth_val = collected_depth[j];
                             depth_accum += weight * depth_val;
+                            """)
+                        if has_custom_feat:
+                            code_rasterize.raw(f"""
+                            custom_feat_accum += weight * custom_feat_val;
                             """)
                     if is_bwd:
                         code_rasterize.raw(f"""
@@ -1119,7 +1211,7 @@ class GaussianSplatOp:
                             """)
                         code_rasterize.raw(f"""
                         auto dL_dalpha = dL_dalpha_without_div / (1.0f - alpha);
-                        {"" if use_bwd_reduce else "auto"} dL_drgb = weight * drgb_array;
+                        {"" if use_bwd_reduce else "auto"} dL_drgb = weight * {"op::slice<0, 3>(drgb_array)" if render_rgba else "drgb_array"};
                         """)
                         if render_depth:
                             code_rasterize.raw(f"""
@@ -1173,6 +1265,10 @@ class GaussianSplatOp:
 
                         dL_dopacity = tv::parallel::warp_sum(dL_dopacity);
                         """)
+                        if has_custom_feat:
+                            code_rasterize.raw(f"""
+                            dL_dcustom_feat = op::apply(tv::parallel::warp_sum<float>, dL_dcustom_feat);
+                            """)
                         if render_depth:
                             code_rasterize.raw(f"""
                             dL_dz = tv::parallel::warp_sum(dL_dz);
@@ -1234,7 +1330,12 @@ class GaussianSplatOp:
                             code_rasterize.raw(f"""
                             tv::parallel::atomicAdd($dz + gaussian_id, dL_dz);
                             """)
-                    # if num_custom_feat > 0:
+                        if has_custom_feat:
+                            for j in range(num_custom_feat):
+                                code_rasterize.raw(f"""
+                                tv::parallel::atomicAdd($dcustom_features + gaussian_id * {num_custom_feat} + {j}, dL_dcustom_feat[{j}]);
+                                """)
+                    # if has_custom_feat:
                     #     code_rasterize.raw(f"""
                     #     for (int channel_idx = 0; channel_idx < {num_custom_feat}; ++channel_idx){{
                     #         custom_feature[channel_idx] += weight * $custom_feat[gaussian_id * {num_custom_feat} + channel_idx];
@@ -1242,9 +1343,15 @@ class GaussianSplatOp:
                     #     """)
         if not is_bwd:
             if not training:
-                code_rasterize.raw(f"""
-                auto bg_color_val = $(self._cfg.bg_color);
-                """)
+                if render_rgba:
+                    code_rasterize.raw(f"""
+                    auto bg_color_val_rgb = $(self._cfg.bg_color);
+                    auto bg_color_val = op::concat(bg_color_val_rgb, tv::array<float, 1>{{0.0f}});
+                    """)
+                else:
+                    code_rasterize.raw(f"""
+                    auto bg_color_val = $(self._cfg.bg_color);
+                    """)
             with code_rasterize.if_("inside"):
                 code_rasterize.raw(f"""
                 $final_T[pixel_id] = T;
@@ -1267,27 +1374,39 @@ class GaussianSplatOp:
                         code_rasterize.raw(f"""
                         auto rgb_before_clamp = rgb + T * bg_color_val;
                         rgb_before_clamp = rgb_before_clamp.op<op::clamp>(0.0f, 1.0f);
-                        op::reinterpret_cast_array_nd<3>($final_color)[pixel_id] = rgb_before_clamp;
+                        op::reinterpret_cast_array_nd<{num_channels}>($final_color)[pixel_id] = rgb_before_clamp;
                         """)
                     else:
                         code_rasterize.raw(f"""
-                        op::reinterpret_cast_array_nd<3>($final_color)[pixel_id] = rgb;
+                        op::reinterpret_cast_array_nd<{num_channels}>($final_color)[pixel_id] = rgb;
+                        """)
+                    if has_custom_feat:
+                        code_rasterize.raw(f"""
+                        op::reinterpret_cast_array_nd<{num_custom_feat}>($final_custom_feat)[pixel_id] = custom_feat_accum;
                         """)
                 else:
                     if not training:
                         code_rasterize.raw(f"""
                         auto rgb_before_clamp = rgb + T * bg_color_val;
                         rgb_before_clamp = rgb_before_clamp.op<op::clamp>(0.0f, 1.0f);
-                        $final_color[(batch_idx * 3 + 0) * $height * $width + pixel_id_no_batch] = rgb_before_clamp[0];
-                        $final_color[(batch_idx * 3 + 1) * $height * $width + pixel_id_no_batch] = rgb_before_clamp[1];
-                        $final_color[(batch_idx * 3 + 2) * $height * $width + pixel_id_no_batch] = rgb_before_clamp[2];
+                        $final_color[(batch_idx * {num_channels} + 0) * $height * $width + pixel_id_no_batch] = rgb_before_clamp[0];
+                        $final_color[(batch_idx * {num_channels} + 1) * $height * $width + pixel_id_no_batch] = rgb_before_clamp[1];
+                        $final_color[(batch_idx * {num_channels} + 2) * $height * $width + pixel_id_no_batch] = rgb_before_clamp[2];
                         """)
+                        if render_rgba:
+                            code_rasterize.raw(f"""
+                            $final_color[(batch_idx * {num_channels} + 3) * $height * $width + pixel_id_no_batch] = rgb_before_clamp[3];
+                            """)
                     else:
                         code_rasterize.raw(f"""
-                        $final_color[(batch_idx * 3 + 0) * $height * $width + pixel_id_no_batch] = rgb[0];
-                        $final_color[(batch_idx * 3 + 1) * $height * $width + pixel_id_no_batch] = rgb[1];
-                        $final_color[(batch_idx * 3 + 2) * $height * $width + pixel_id_no_batch] = rgb[2];
+                        $final_color[(batch_idx * {num_channels} + 0) * $height * $width + pixel_id_no_batch] = rgb[0];
+                        $final_color[(batch_idx * {num_channels} + 1) * $height * $width + pixel_id_no_batch] = rgb[1];
+                        $final_color[(batch_idx * {num_channels} + 2) * $height * $width + pixel_id_no_batch] = rgb[2];
                         """)
+                        if render_rgba:
+                            code_rasterize.raw(f"""
+                            $final_color[(batch_idx * {num_channels} + 3) * $height * $width + pixel_id_no_batch] = rgb[3];
+                            """)
         # if num_custom_feat:
         #     code_rasterize.raw(f"""
         #     if (inside)
@@ -1315,7 +1434,8 @@ class GaussianSplatOp:
                  out: GaussianSplatOutput,
                  grad: GaussianSplatGradients,
                  return_uv_grad: bool = False,
-                 instance2world_T: torch.Tensor | None = None):
+                 instance2world_T: torch.Tensor | None = None,
+                custom_features: torch.Tensor | None = None):
         # if isinstance(cameras, CameraBundle):
         #     raise NotImplementedError("CameraBundle is not supported yet.")
         num = model.xyz.shape[0]
@@ -1333,7 +1453,8 @@ class GaussianSplatOp:
                                                    ctx,
                                                    out,
                                                    grad,
-                                                   training=True)
+                                                   training=True,
+                                                   custom_features=custom_features)
         assert grad_out is not None
         duv = grad_out.duv
         dconic = grad_out.dconic
@@ -1344,27 +1465,10 @@ class GaussianSplatOp:
         resolution_wh_np = np.array([width, height], np.int32)
         is_cam_bundle = False
         batch_size = 1
-        # if isinstance(camera, BasicPinholeCamera):
-        #     intrinsic = camera.intrinsic
-        #     cam2world = camera.pose.to_world
-
-        #     focal_xy_np = np.array([intrinsic[0, 0], intrinsic[1, 1]], np.float32)
-        #     principal_point_np = np.array([intrinsic[0, 2], intrinsic[1, 2]],
-        #                                 np.float32)
-        #     cam2world_T_np = np.ascontiguousarray(cam2world[:3].T)
-        #     cam2world_R_np = cam2world_T_np[:3]
-        #     cam2world_center_np = cam2world_T_np[3]
-        # else:
-        #     is_cam_bundle = True
-        #     cam2world_T_ten = camera.cam2world_T
-        #     assert cam2world_T_ten.ndim == 3
-        #     focal_xy_ppoint_ten = camera.focal_xy_ppoint
-        #     batch_size = cam2world_T_ten.shape[0]
         enable_instance_render = False
         if isinstance(camera, BasicPinholeCamera):
             intrinsic = camera.intrinsic
             cam2world = camera.pose.to_world
-
             focal_xy_np = np.array([intrinsic[0, 0], intrinsic[1, 1]], np.float32)
             principal_point_np = np.array([intrinsic[0, 2], intrinsic[1, 2]],
                                         np.float32)
@@ -1507,7 +1611,7 @@ class GaussianSplatOp:
                         auto world2instance_center = - (instance2world_R_T.op<op::mv_rowmajor>(instance2world_center));
                         
                         // get cam2instance_R_T
-                        auto cam2instance_R_T = cam2world_R_T.op<op::mm_tt>(instance2world_R_T.op<op::transpose>());
+                        auto cam2instance_R_T = cam2world_R_T.op<op::mm_ttt>(instance2world_R_T.op<op::transpose>());
                         // get cam2instance_center 
                         // y2 = R2 @ (R1 @ x + t1) + t2 = R2 @ R1 @ x + R2 @ t1 + t2
                         auto cam2instance_center = cam2world_R_T.op<op::mv_rowmajor>(world2instance_center) + cam2world_center;
@@ -1663,11 +1767,10 @@ class GaussianSplatOp:
                 op::reinterpret_cast_array_nd<3>($dscale_res)[i] = dscale_acc;
                 $dopacity_res[i] = dopacity_val_acc;
                 """)
-
             self._inliner.kernel_1d(prep_kernel_name, num, 0, code_prep)
         if return_uv_grad:
-            return grad_model, duv.view(batch_size, -1, 2)
-        return grad_model, None
+            return grad_model, duv.view(batch_size, -1, 2), grad_out.dcustom_features
+        return grad_model, None, grad_out.dcustom_features
 
 
 class _RasterizeGaussians(torch.autograd.Function):
@@ -1684,6 +1787,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         opacity,
         cur_sh_degree,
         instance_id,
+        custom_features,
         model_cls: type[GaussianModelBase],
         # cameras
         camera_params: CameraParamBundle | BasicPinholeCamera,
@@ -1722,7 +1826,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 act_applied=True,
             )
         with tv.measure_and_print("FWD-all-torch", enable=enable_verbose):
-            out, fwd_ctx = op.forward(model, cam_bundle, training=training, instance2world_T=instance2world_T)
+            out, fwd_ctx = op.forward(model, cam_bundle, training, instance2world_T, custom_features)
         with tv.measure_and_print("FWD-all-torch-2", enable=enable_verbose):
 
             if fwd_ctx is not None:
@@ -1746,6 +1850,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                     quaternion_xyzw,
                     opacity,
                     instance_id,
+                    custom_features,
                     # cam bundle
                     cam2world_T,
                     frame_ids,
@@ -1776,7 +1881,7 @@ class _RasterizeGaussians(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, drgb, ddepth, dcustom_features, dT, dn_contrib, dradii):
         if len(ctx.saved_tensors) == 0:
-            return (None, ) * 16
+            return (None, ) * 17
         op: GaussianSplatOp = ctx.op
 
         with tv.measure_and_print("BWD-all-torch", enable=False):
@@ -1811,10 +1916,11 @@ class _RasterizeGaussians(torch.autograd.Function):
                 act_applied=True,
                 cur_sh_degree=ctx.cur_sh_degree,
             )
-            cam2world_T = ctx.saved_tensors[17]
-            frame_ids = ctx.saved_tensors[18]
-            focal_xy_ppoint = ctx.saved_tensors[19]
-            instance2world_T = ctx.saved_tensors[20]
+            custom_features = ctx.saved_tensors[17]
+            cam2world_T = ctx.saved_tensors[18]
+            frame_ids = ctx.saved_tensors[19]
+            focal_xy_ppoint = ctx.saved_tensors[20]
+            instance2world_T = ctx.saved_tensors[21]
             if cam2world_T is not None:
                 cam_bundle = CameraBundle(
                     focal_xy_ppoint=focal_xy_ppoint,
@@ -1841,9 +1947,10 @@ class _RasterizeGaussians(torch.autograd.Function):
             # print("Model Size", model.get_all_torch_tensor_byte_size())
             # print("FwdCtx Size", fwd_ctx.get_all_torch_tensor_byte_size())
             # print("Gradient Size", gradient.get_all_torch_tensor_byte_size())
-        grad_out, duv = op.backward(model, cam_bundle, fwd_ctx, out, gradient,
-                                    ctx.return_uv_grad, instance2world_T)
-        return grad_out.xyz, grad_out.color_sh, grad_out.color_sh_base, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, None, None, None, None, None, None, None, duv
+        grad_out, duv, dcf = op.backward(model, cam_bundle, fwd_ctx, out, gradient,
+                                    ctx.return_uv_grad, instance2world_T, 
+                                    custom_features)
+        return grad_out.xyz, grad_out.color_sh, grad_out.color_sh_base, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, dcf, None, None, None, None, None, None, None, duv
 
 
 def rasterize_gaussians(
@@ -1854,6 +1961,7 @@ def rasterize_gaussians(
     # background_tensor: torch.Tensor | None = None,
     uv_grad_holder: torch.Tensor | None = None,
     instance2world_T: torch.Tensor | None = None,
+    custom_features: torch.Tensor | None = None,
 ):
     # if not training:
     #     assert background_tensor is None, "background_tensor is only used in training mode"
@@ -1874,6 +1982,7 @@ def rasterize_gaussians(
         model.opacity,
         model.cur_sh_degree,
         model.instance_id,
+        custom_features,
         type(model),
         cameras,
         c2w_T,

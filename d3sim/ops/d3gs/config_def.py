@@ -68,11 +68,11 @@ class GaussianSplatConfig:
     depth_32bit_prec: float = 0.001
 
     enable_32bit_sort: bool = False
-    render_depth: bool = False
+    render_depth: bool = True
     bg_color: np.ndarray = dataclasses.field(
         default_factory=lambda: np.zeros((3), np.float32))
     scale_global: float = 1.0
-    use_nchw: bool = True
+    use_nchw: bool = False
     render_rgba: bool = False
 
     transmittance_is_double = False

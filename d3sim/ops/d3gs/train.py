@@ -95,9 +95,13 @@ class Trainer:
             cam = original_cam_to_d3sim_cam(cam_raw)
             out = rasterize_gaussians(self.model, cam, op=self.gauss_op, training=False)
             gt_image = cam_raw.original_image.to(self.device)
-            metrics["psnr"].append(psnr(out.color, gt_image[None]))
-            metrics["ssim"].append(ssim(out.color, gt_image[None]))
-            metrics["lpips"].append(lpips(out.color, gt_image[None]))
+            color = out.color
+            if not self.cfg.model.op.use_nchw:
+                color = out.color.permute(0, 3, 1, 2)
+
+            metrics["psnr"].append(psnr(color, gt_image[None]))
+            metrics["ssim"].append(ssim(color, gt_image[None]))
+            metrics["lpips"].append(lpips(color, gt_image[None]))
 
         psnr_val = torch.stack(metrics["psnr"]).mean()
         ssim_val = torch.stack(metrics["ssim"]).mean()
@@ -123,11 +127,19 @@ class Trainer:
         ssim_loss = StructuralSimilarityIndexMeasure(data_range=1.0).to(D3SIM_DEFAULT_DEVICE)
         verbose = False
         total = self.cfg.train.iterations
+        # vs gsplat
+        # on 7000 step (4500000 gaussians):
+        # gsplat forward: 8ms
+        # gsplat backward: 17ms
+        # our forward: 6ms
+        # our backward: 10ms
+        # our impl is 55% faster than gsplat.
         with contextlib.nullcontext():
         # with prog as progress:
             # task1 = progress.add_task("[red]Training...", total=self.cfg.train.iterations)
             for ev in tqdm.tqdm((self.engine.train_step_generator(0, range(total), total_step=total, 
                     step_ctx_creator=self.train_step_ctx)), total=total):
+                # verbose = ev.cur_step > 6500
                 with measure_and_print_torch("prep", enable=False):
 
             # for ev in (self.engine.train_step_generator(0, range(self.cfg.train.iterations), total_step=self.cfg.train.iterations, step_ctx_creator=self.train_step_ctx)):
@@ -149,14 +161,19 @@ class Trainer:
                     if uv_grad_holder.shape[0] != self.model.xyz.shape[0]:
                         uv_grad_holder = torch.empty([self.cfg.train.batch_size, self.model.xyz.shape[0], 2], dtype=torch.float32, device=self.model.xyz.device)
                         uv_grad_holder.requires_grad_(True)
-                with measure_and_print_torch(f"fwd-bwd-{self.model.xyz.shape[0]}", enable=verbose):
+                with measure_and_print_torch(f"fwd-{self.model.xyz.shape[0]}", enable=verbose):
                     # with tv.measure_and_print("rasterize"):
                     out = rasterize_gaussians(self.model, cam_bundle, op=self.gauss_op, training=True, uv_grad_holder=uv_grad_holder)
                     assert ev.step_ctx_value is not None 
                     ev.step_ctx_value.output = out
-                    Ll1 = l1_loss(out.color, gt_image)
-                    loss = (1.0 - self.cfg.train.lambda_dssim) * Ll1 + self.cfg.train.lambda_dssim * (1.0 - ssim(out.color, gt_image))
+                    color = out.color
+                    if not self.cfg.model.op.use_nchw:
+                        color = out.color.permute(0, 3, 1, 2)
+                    Ll1 = l1_loss(color, gt_image)
+
+                    loss = (1.0 - self.cfg.train.lambda_dssim) * Ll1 + self.cfg.train.lambda_dssim * (1.0 - ssim(color, gt_image))
                     # with tv.measure_and_print("rasterize-bwd"):
+                with measure_and_print_torch(f"bwd-{self.model.xyz.shape[0]}", enable=verbose):
 
                     loss.backward()
                 duv = uv_grad_holder.grad
@@ -202,32 +219,17 @@ class Trainer:
                             "radii": out.radii,
                         }
                     )
-                    # if (ev.cur_step + 1) > self.cfg.train.strategy.refine_start_iter and (ev.cur_step + 1) % 100 == 0:
-                    # # if (ev.cur_step + 1) > 200:
-                    #     self.strategy.refine_gs(self.model, self.optims, self.train_state, ev.cur_step + 1) 
-                    #     # breakpoint()
-                    #     torch.cuda.empty_cache()
-
-                    # if (ev.cur_step + 1) > self.cfg.train.strategy.refine_start_iter and (ev.cur_step + 1) % 100 == 0:
-                    #     print(torch.linalg.norm(self.train_state_ref.duv_ndc_length - self.train_state.duv_ndc_length))
-                    #     print(torch.linalg.norm(self.train_state_ref.count - self.train_state.count))
-                    #     breakpoint()
                     for k, p in params.items():
                         setattr(self.model, k, p)
                     for k, p in state_dict.items():
                         setattr(self.train_state_ref, k, p)
-                # if not self.use_strategy_ref:
-                #     if (ev.cur_step + 1) > self.cfg.train.strategy.refine_start_iter and (ev.cur_step + 1) % self.cfg.train.strategy.refine_every == 0:
-                #     # if (ev.cur_step + 1) > 200:
-                #         print("REFINE GS!!!")
-                #         self.strategy.refine_gs(self.model, self.optims, self.train_state, ev.cur_step + 1) 
-                #         # breakpoint()
-                #         torch.cuda.empty_cache()
 
                 save_root = PACKAGE_ROOT / "build/debug"
                 with torch.no_grad():
                     if (ev.cur_step + 1) % (1000 // self.cfg.train.batch_size) == 0:
                         out_color = out.color[0]
+                        if not self.cfg.model.op.use_nchw:
+                            out_color = out_color.permute(2, 0, 1)
                         out_color_u8 = out_color.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
                         out_color_u8 = out_color_u8[..., ::-1]
                         gt_image_u8 = gt_image[0].mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
@@ -241,18 +243,6 @@ class Trainer:
                     if (ev.cur_step + 1) % (1000 // self.cfg.train.batch_size) == 0:
                         self._on_eval(ev.cur_step + 1, scene)
                     # progress.print(f"LosVals: {loss.item():.{7}f}", self.model.xyz.shape[0])
-                    # if loss.item() > 1 or loss .item() < 0:
-                    #     out_color = out.color
-                    #     out_color_u8 = out_color.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
-                    #     out_color_u8 = out_color_u8[..., ::-1]
-                    #     gt_image_u8 = gt_image.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
-                    #     gt_image_u8 = gt_image_u8[..., ::-1]
-                    #     out_color_u8 = np.concatenate([out_color_u8, gt_image_u8], axis=0)
-                    #     # out_color_u8 = (out_color.permute(1, 2, 0) * 255).to(torch.uint8).cpu().numpy()
-                    #     import cv2 
-                    #     cv2.imwrite(str(save_root / f"test_train_problem_{ev.cur_step}.png"), out_color_u8)
-
-                    #     breakpoint()
 
                     ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
                     if (ev.cur_step + 1) % (100 // self.cfg.train.batch_size) == 0:
@@ -329,7 +319,7 @@ class Trainer:
 def __main():
 
     path = "/Users/yanyan/Downloads/360_v2/garden"
-    # path = "/root/autodl-tmp/garden_scene/garden"
+    path = "/root/autodl-tmp/garden_scene/garden"
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
@@ -344,8 +334,8 @@ def __main():
         )
     else:
         cfg = config_def.Config(
-            model=config_def.Model(config_def.GaussianSplatConfig()),
-            train=config_def.Train(iterations=7000)
+            model=config_def.Model(config_def.GaussianSplatConfig(enable_32bit_sort=False, gaussian_std_sigma=3.0)),
+            train=config_def.Train(iterations=7000, batch_size=8)
         )
     model = GaussianModelOriginFused.empty_parameter(points.shape[0], 3, True, device=torch.device(D3SIM_DEFAULT_DEVICE)) 
     init_original_3dgs_model(model, points, scene_info.point_cloud.colors)
