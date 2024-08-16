@@ -74,7 +74,7 @@ class GaussianSplatOutput(DataClassWithArrayCheck):
                      ac.ArrayCheck(["B", "H", "W"], ac.F32)] = None
     n_contrib: Annotated[torch.Tensor | None,
                          ac.ArrayCheck(["B", "H", "W"], ac.I32)] = None
-    radii: Annotated[torch.Tensor | None, ac.ArrayCheck([-1], ac.I32)] = None
+    radii: Annotated[torch.Tensor | None, ac.ArrayCheck(["B", -1], ac.I32)] = None
 
     @property
     def image_shape_wh(self) -> tuple[int, int]:
@@ -185,7 +185,7 @@ class GaussianSplatOp:
             tile_num_x = div_up(width, self._cfg.tile_size[0])
             tile_num_y = div_up(height, self._cfg.tile_size[1])
             if enable_32bit_sort:
-                assert batch_size * tile_num_x * tile_num_y < 2**13, "32bit sort only support 13 bits tile idx"
+                assert batch_size * tile_num_x * tile_num_y < 2**14, "32bit sort only support 14 bits tile idx"
             block_size = self._cfg.block_size
             tile_num_xy_np = np.array([tile_num_x, tile_num_y], np.int32)
             xyz = model.xyz
@@ -487,9 +487,24 @@ class GaussianSplatOp:
                             "int x = gaussian_rect_min[0]; x < gaussian_rect_max[0]; ++x"
                     ):
                         shift_bits = 32 if not enable_32bit_sort else 18
+                        key_real_dtype = "uint64_t" if not enable_32bit_sort else "uint32_t"
                         if enable_32bit_sort:
                             code.raw(f"""
                             uint32_t key = batch_idx * tile_num_xy[0] * tile_num_xy[1] + y * tile_num_xy[0] + x;
+                            """)
+                            if IsAppleSiliconMacOs:
+                                code.raw(f"""
+                                int bitcount = metal::popcount(key);
+                                """)
+                            else:
+                                code.raw(f"""
+                                int bitcount = __popc(key);
+                                """)
+                            code.raw(f"""
+                            if (bitcount == 14){{
+                                // inverse order of depth because of sign bit is set
+                                depth_uint = 0x3FFFFu - depth_uint;
+                            }}
                             """)
                         else:
                             code.raw(f"""
@@ -502,7 +517,7 @@ class GaussianSplatOp:
                         code.raw(f"""
                         key <<= {shift_bits};
                         key |= depth_uint; // assume depth always > 0
-                        $keys_tile_idx_depth[offset] = key;
+                        reinterpret_cast<TV_METAL_DEVICE {key_real_dtype}*>($keys_tile_idx_depth)[offset] = key;
                         $gaussian_idx[offset] = i;
                         ++offset;
                         """)
@@ -562,9 +577,11 @@ class GaussianSplatOp:
                                           dtype=torch.int32,
                                           device=xyz.device)
             shift_bits = 32 if not enable_32bit_sort else 18
+            key_real_dtype = "uint64_t" if not enable_32bit_sort else "uint32_t"
+
             code = pccm.code()
             code.raw(f"""
-            auto key = $sorted_vals[i];
+            auto key = reinterpret_cast<TV_METAL_DEVICE {key_real_dtype}*>($sorted_vals)[i];
             uint32_t tile_idx = key >> {shift_bits};
             """)
             if self._cfg.enable_device_asserts:
@@ -577,7 +594,7 @@ class GaussianSplatOp:
                 """)
             with code.else_():
                 code.raw(f"""
-                auto last_key = $sorted_vals[i - 1];
+                auto last_key = reinterpret_cast<TV_METAL_DEVICE {key_real_dtype}*>($sorted_vals)[i - 1];
                 uint32_t last_tile_idx = last_key >> {shift_bits};
                 """)
                 if self._cfg.enable_device_asserts:

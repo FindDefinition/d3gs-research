@@ -1,7 +1,7 @@
 import random
 
 import tqdm
-from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT
+from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT, IsAppleSiliconMacOs
 from d3sim.core.train import BasicTrainEngine, StepEvent, TrainEvent, TrainEventType
 from d3sim.csrc.inliner import INLINER
 from d3sim.data.scene_def.camera import BasicPinholeCamera
@@ -25,11 +25,13 @@ from d3sim.core.debugtools import create_enter_debug_store
 import numpy as np 
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-
+from cumm.inliner import measure_and_print_torch
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
 def get_used_gpu_mem_GB():
+    if IsAppleSiliconMacOs:
+        return torch.mps.current_allocated_memory() / 1024 ** 3
     return torch.cuda.max_memory_allocated() / 1024**3
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
@@ -126,7 +128,7 @@ class Trainer:
             # task1 = progress.add_task("[red]Training...", total=self.cfg.train.iterations)
             for ev in tqdm.tqdm((self.engine.train_step_generator(0, range(total), total_step=total, 
                     step_ctx_creator=self.train_step_ctx)), total=total):
-                with tv.measure_and_print("prep", enable=verbose):
+                with measure_and_print_torch("prep", enable=False):
 
             # for ev in (self.engine.train_step_generator(0, range(self.cfg.train.iterations), total_step=self.cfg.train.iterations, step_ctx_creator=self.train_step_ctx)):
                     cams = []
@@ -147,7 +149,7 @@ class Trainer:
                     if uv_grad_holder.shape[0] != self.model.xyz.shape[0]:
                         uv_grad_holder = torch.empty([self.cfg.train.batch_size, self.model.xyz.shape[0], 2], dtype=torch.float32, device=self.model.xyz.device)
                         uv_grad_holder.requires_grad_(True)
-                with tv.measure_and_print("fwd-bwd", enable=verbose):
+                with measure_and_print_torch(f"fwd-bwd-{self.model.xyz.shape[0]}", enable=verbose):
                     # with tv.measure_and_print("rasterize"):
                     out = rasterize_gaussians(self.model, cam_bundle, op=self.gauss_op, training=True, uv_grad_holder=uv_grad_holder)
                     assert ev.step_ctx_value is not None 
@@ -161,16 +163,17 @@ class Trainer:
                 uv_grad_holder.grad = None
                 ev.step_ctx_value.loss = loss
                 assert duv is not None 
-                with tv.measure_and_print("optim", enable=verbose):
+                with measure_and_print_torch("optim", enable=verbose):
 
                     for optim in self.optims.values():
                         optim.step()
                         # optim.zero_grad(set_to_none = True)
-                with tv.measure_and_print("optim zero_grad", enable=verbose):
+                # with measure_and_print_torch("optim zero_grad", enable=verbose):
 
                     for optim in self.optims.values():
                         # optim.step()
                         optim.zero_grad(set_to_none = True)
+                # with measure_and_print_torch("remain", enable=verbose):
 
                 if (ev.cur_step + 1) < self.cfg.train.strategy.refine_stop_iter:
                     if not self.use_strategy_ref:
@@ -235,7 +238,7 @@ class Trainer:
                         cv2.imwrite(str(save_root / f"test_train_{ev.cur_step}.png"), out_color_u8)
 
                 with torch.no_grad():
-                    if (ev.cur_step + 1) % (1000 // self.cfg.train.batch_size) == 0 and (ev.cur_step + 1) >= (3000 // self.cfg.train.batch_size):
+                    if (ev.cur_step + 1) % (1000 // self.cfg.train.batch_size) == 0:
                         self._on_eval(ev.cur_step + 1, scene)
                     # progress.print(f"LosVals: {loss.item():.{7}f}", self.model.xyz.shape[0])
                     # if loss.item() > 1 or loss .item() < 0:
@@ -326,18 +329,24 @@ class Trainer:
 def __main():
 
     path = "/Users/yanyan/Downloads/360_v2/garden"
-    path = "/root/autodl-tmp/garden_scene/garden"
+    # path = "/root/autodl-tmp/garden_scene/garden"
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
-    scene_info, first_cam = load_scene_info_and_first_cam(path)
+    scene_info, first_cam = load_scene_info_and_first_cam(path, image_folder="images_8" if IsAppleSiliconMacOs else "images_4")
     scene = Scene(scene_info, True)
     print("Load Dataset GPU Memory", get_used_gpu_mem_GB())
     points = scene_info.point_cloud.points
-    cfg = config_def.Config(
-        model=config_def.Model(config_def.GaussianSplatConfig()),
-        train=config_def.Train(iterations=7000)
-    )
+    if IsAppleSiliconMacOs:
+        cfg = config_def.Config(
+            model=config_def.Model(config_def.GaussianSplatConfig(enable_32bit_sort=False, gaussian_std_sigma=2.0)),
+            train=config_def.Train(iterations=7000, batch_size=2)
+        )
+    else:
+        cfg = config_def.Config(
+            model=config_def.Model(config_def.GaussianSplatConfig()),
+            train=config_def.Train(iterations=7000)
+        )
     model = GaussianModelOriginFused.empty_parameter(points.shape[0], 3, True, device=torch.device(D3SIM_DEFAULT_DEVICE)) 
     init_original_3dgs_model(model, points, scene_info.point_cloud.colors)
     print("Init Model GPU Memory", get_used_gpu_mem_GB())

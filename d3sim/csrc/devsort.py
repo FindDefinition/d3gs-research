@@ -80,6 +80,10 @@ class DeviceSort(pccm.Class):
         code.arg("bit_start, bit_end", "int")
         code.arg("double_buffer", "bool")
         code.arg("stream_int", "std::uintptr_t")
+        code.raw(f"""
+        bool key_swap = false;
+        bool value_swap = false;
+        """)
         if IsAppleSiliconMacOs:
             code.raw(f"""
             
@@ -90,8 +94,6 @@ class DeviceSort(pccm.Class):
             code.raw(f"""
             cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_int);
             size_t storage_size = workspace.raw_size();
-            bool key_swap = false;
-            bool value_swap = false;
             """)
             for key_dtype in dispatch(code, [dtypes.uint32, dtypes.uint64, dtypes.int32, dtypes.int64], "keys_in.dtype()"):
                 for val_dtype in dispatch(code, [dtypes.float32, dtypes.uint32, dtypes.uint64, dtypes.int32, dtypes.int64], "values_in.dtype()"):

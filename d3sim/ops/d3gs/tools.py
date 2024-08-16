@@ -1,7 +1,7 @@
 import math
 from plyfile import PlyData
 import torch 
-from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT
+from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT, IsAppleSiliconMacOs
 from d3sim.ops.d3gs.base import GaussianModelBase, GaussianModelOrigin, GaussianModelOriginFused
 import numpy as np
 from d3sim.csrc.inliner import INLINER
@@ -152,6 +152,8 @@ def create_origin_3dgs_optimizers(model: GaussianModelBase, optim_cfg: config_de
         {'params': [model.scale], 'lr': optim_cfg.scaling_lr * bs_scale, "name": "scale"},
         {'params': [model.quaternion_xyzw], 'lr': optim_cfg.rotation_lr * bs_scale, "name": "quaternion_xyzw"}
     ]
+    if IsAppleSiliconMacOs:
+        fused = False
     optimizers = {
         pg["name"] :torch.optim.Adam(
             [{"params": pg["params"], "lr": pg["lr"], "name": pg["name"]}],

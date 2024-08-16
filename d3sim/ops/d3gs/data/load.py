@@ -38,8 +38,8 @@ class Scene:
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
 
-def load_scene_info_and_first_cam(data_path: str):
-    scene_info = readColmapSceneInfo(data_path, "images_4", True)
+def load_scene_info_and_first_cam(data_path: str, image_folder: str = "images_4"):
+    scene_info = readColmapSceneInfo(data_path, image_folder, True)
     train_camera_infos = scene_info.train_cameras
     train_camera_first = next(cameraList_from_camInfos_gen(train_camera_infos, 1, _Args()))
     intrinsic = train_camera_first.get_intrinsic()
