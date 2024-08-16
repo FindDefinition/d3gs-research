@@ -1,6 +1,7 @@
 from typing import Literal
 import numpy as np
 import torch 
+from d3sim.constants import IsAppleSiliconMacOs
 from d3sim.core import dataclass_dispatch as dataclasses
 
 @dataclasses.dataclass
@@ -21,6 +22,12 @@ class Strategy:
     revised_opacity: bool = False
     verbose: bool = False
 
+    def rescale_steps_by_batch_size(self, batch_size: int):
+        self.refine_start_iter = self.refine_start_iter // batch_size
+        self.refine_stop_iter = self.refine_stop_iter // batch_size
+        self.refine_every = self.refine_every // batch_size
+        self.reset_opacity_every = self.reset_opacity_every // batch_size
+
 @dataclasses.dataclass
 class Optimizer:
     position_lr_init: float = 0.00016
@@ -32,6 +39,8 @@ class Optimizer:
     rotation_lr: float = 0.001
 
     position_lr_max_steps: int = 30_000
+    def rescale_steps_by_batch_size(self, batch_size: int):
+        self.position_lr_max_steps = self.position_lr_max_steps // batch_size
 
 @dataclasses.dataclass
 class Train:
@@ -39,6 +48,12 @@ class Train:
     strategy: Strategy = dataclasses.field(default_factory=Strategy)
     iterations: int = 30_000
     lambda_dssim: float = 0.2
+    batch_size: int = 1
+
+    def rescale_steps_by_batch_size(self, batch_size: int):
+        self.iterations = self.iterations // batch_size
+        self.optim.rescale_steps_by_batch_size(batch_size)
+        self.strategy.rescale_steps_by_batch_size(batch_size)
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatConfig:
@@ -67,7 +82,7 @@ class GaussianSplatConfig:
     recalc_cov3d_in_bwd: bool = True
     enable_device_asserts: bool = False
 
-    use_cub_sort: bool = True
+    use_cub_sort: bool = False if IsAppleSiliconMacOs else True
 
     use_int64_tile_touched: bool = False
 

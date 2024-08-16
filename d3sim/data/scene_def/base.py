@@ -180,7 +180,7 @@ class Sensor:
     fields: dict[str, Resource] = dataclasses.field(default_factory=dict)
     # if not None, indicate the coordinate system of sensor data (e.g. pointcloud)
     data_coord: CoordSystem | None = None
-
+    frame_local_id: int | None = None
     def apply_world_transform(self, world2new: np.ndarray):
         new_self = copy.deepcopy(self)
         new_self.apply_world_transform_inplace(world2new)

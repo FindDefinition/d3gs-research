@@ -1,3 +1,4 @@
+import math
 from plyfile import PlyData
 import torch 
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT
@@ -141,26 +142,29 @@ def create_origin_3dgs_optimizer(model: GaussianModelBase, optim_cfg: config_def
                                                     max_steps=optim_cfg.position_lr_max_steps)
     return optim, xyz_schedule_xyz
 
-def create_origin_3dgs_optimizers(model: GaussianModelBase, optim_cfg: config_def.Optimizer, spatial_lr_scale: float, fused: bool = True):
-
+def create_origin_3dgs_optimizers(model: GaussianModelBase, optim_cfg: config_def.Optimizer, batch_size: int, spatial_lr_scale: float, fused: bool = True):
+    bs_scale = math.sqrt(batch_size)
     pgs = [
-        {'params': [model.xyz], 'lr': optim_cfg.position_lr_init * spatial_lr_scale, "name": "xyz"},
-        {'params': [model.color_sh_base], 'lr': optim_cfg.feature_lr, "name": "color_sh_base"},
-        {'params': [model.color_sh], 'lr': optim_cfg.feature_lr / 20.0, "name": "color_sh"},
-        {'params': [model.opacity], 'lr': optim_cfg.opacity_lr, "name": "opacity"},
-        {'params': [model.scale], 'lr': optim_cfg.scaling_lr, "name": "scale"},
-        {'params': [model.quaternion_xyzw], 'lr': optim_cfg.rotation_lr, "name": "quaternion_xyzw"}
+        {'params': [model.xyz], 'lr': optim_cfg.position_lr_init * spatial_lr_scale * bs_scale, "name": "xyz"},
+        {'params': [model.color_sh_base], 'lr': optim_cfg.feature_lr * bs_scale, "name": "color_sh_base"},
+        {'params': [model.color_sh], 'lr': optim_cfg.feature_lr * bs_scale / 20.0, "name": "color_sh"},
+        {'params': [model.opacity], 'lr': optim_cfg.opacity_lr * bs_scale, "name": "opacity"},
+        {'params': [model.scale], 'lr': optim_cfg.scaling_lr * bs_scale, "name": "scale"},
+        {'params': [model.quaternion_xyzw], 'lr': optim_cfg.rotation_lr * bs_scale, "name": "quaternion_xyzw"}
     ]
     optimizers = {
         pg["name"] :torch.optim.Adam(
             [{"params": pg["params"], "lr": pg["lr"], "name": pg["name"]}],
-            eps=1e-15, fused=fused
+            fused=fused,
+            eps=1e-15 / bs_scale,
+            betas=(1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.999)),
+
         )
         for pg in pgs
     }
 
-    xyz_schedule_xyz = get_expon_lr_func(lr_init=optim_cfg.position_lr_init*spatial_lr_scale,
-                                                    lr_final=optim_cfg.position_lr_final*spatial_lr_scale,
+    xyz_schedule_xyz = get_expon_lr_func(lr_init=optim_cfg.position_lr_init*spatial_lr_scale * bs_scale,
+                                                    lr_final=optim_cfg.position_lr_final*spatial_lr_scale * bs_scale,
                                                     lr_delay_mult=optim_cfg.position_lr_delay_mult,
                                                     max_steps=optim_cfg.position_lr_max_steps)
     return optimizers, xyz_schedule_xyz

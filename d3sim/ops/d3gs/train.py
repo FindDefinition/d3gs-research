@@ -4,12 +4,13 @@ import tqdm
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT
 from d3sim.core.train import BasicTrainEngine, StepEvent, TrainEvent, TrainEventType
 from d3sim.csrc.inliner import INLINER
+from d3sim.data.scene_def.camera import BasicPinholeCamera
 from d3sim.ops.d3gs.base import GaussianModelBase, GaussianModelOrigin, GaussianModelOriginFused
 from d3sim.ops.d3gs import config_def
 from d3sim.core import dataclass_dispatch as dataclasses
 
 from d3sim.ops.d3gs.data.load import load_scene_info_and_first_cam, Scene, original_cam_to_d3sim_cam
-from d3sim.ops.d3gs.render import GaussianSplatOp, GaussianSplatOutput, rasterize_gaussians
+from d3sim.ops.d3gs.render import CameraBundle, GaussianSplatOp, GaussianSplatOutput, rasterize_gaussians
 from d3sim.ops.d3gs.strategy import GaussianTrainState, GaussianStrategyBase, reset_param_in_optim
 from d3sim.ops.d3gs.losses import l1_loss, ssim
 from cumm import tensorview as tv
@@ -36,12 +37,26 @@ class StepCtx:
     output: GaussianSplatOutput | None = None
     loss: torch.Tensor | None = None
 
+def cams_to_cam_bundle(cams: list[BasicPinholeCamera]):
+    cam2worlds = [cam.pose.to_world for cam in cams]
+    cam2world_Ts = [cam2world[:3].T for cam2world in cam2worlds]
+    cam2world_Ts_onearray = np.stack(cam2world_Ts, axis=0).reshape(-1, 4, 3)
+    cam2world_Ts_th = torch.from_numpy(np.ascontiguousarray(cam2world_Ts_onearray)).to(D3SIM_DEFAULT_DEVICE)
+
+    focal_xys = np.stack([cam.focal_length for cam in cams], axis=0).reshape(-1, 2)
+    ppoints = np.stack([cam.principal_point for cam in cams], axis=0).reshape(-1, 2)
+    focal_xy_ppoints = np.concatenate([focal_xys, ppoints], axis=1)
+    focal_xy_ppoints_th = torch.from_numpy(np.ascontiguousarray(focal_xy_ppoints)).to(D3SIM_DEFAULT_DEVICE)
+    cam_bundle = CameraBundle(focal_xy_ppoints_th, cams[0].image_shape_wh, None, cam2world_Ts_th)
+    return cam_bundle
+
 class Trainer:
     def __init__(self, model: GaussianModelBase, cfg: config_def.Config, scene_extent: float) -> None:
         self.engine = BasicTrainEngine()
         self.model = model
+        cfg.train.rescale_steps_by_batch_size(cfg.train.batch_size)
         self.device = torch.device(D3SIM_DEFAULT_DEVICE)
-        optim, scheduler = create_origin_3dgs_optimizers(model, cfg.train.optim, scene_extent)
+        optim, scheduler = create_origin_3dgs_optimizers(model, cfg.train.optim, cfg.train.batch_size, scene_extent)
         self.optims = optim 
         self.scheduler = scheduler
         self.cfg = cfg
@@ -59,7 +74,7 @@ class Trainer:
 
         self.use_strategy_ref = False
         self.engine.register_period_event("log", 1000, self._on_log)
-        self.engine.register_period_event("up_sh", 1000, self._on_up_sh_degree_log)
+        self.engine.register_period_event("up_sh", 1000 // cfg.train.batch_size, self._on_up_sh_degree_log)
         self.engine.register_base_event(TrainEventType.BeginIteration, self._on_iter_start)
         self.engine.register_period_event("update_gs", cfg.train.strategy.refine_every, self._on_refine_gs)
         self.engine.register_period_event("reset_opacity", cfg.train.strategy.reset_opacity_every, self._on_reset_opacity)
@@ -78,9 +93,9 @@ class Trainer:
             cam = original_cam_to_d3sim_cam(cam_raw)
             out = rasterize_gaussians(self.model, cam, op=self.gauss_op, training=False)
             gt_image = cam_raw.original_image.to(self.device)
-            metrics["psnr"].append(psnr(out.color[None], gt_image[None]))
-            metrics["ssim"].append(ssim(out.color[None], gt_image[None]))
-            metrics["lpips"].append(lpips(out.color[None], gt_image[None]))
+            metrics["psnr"].append(psnr(out.color, gt_image[None]))
+            metrics["ssim"].append(ssim(out.color, gt_image[None]))
+            metrics["lpips"].append(lpips(out.color, gt_image[None]))
 
         psnr_val = torch.stack(metrics["psnr"]).mean()
         ssim_val = torch.stack(metrics["ssim"]).mean()
@@ -92,7 +107,7 @@ class Trainer:
 
     def train(self, scene: Scene):
         viewpoint_stack = None
-        uv_grad_holder = torch.empty([self.model.xyz.shape[0], 2], dtype=torch.float32, device=self.model.xyz.device)
+        uv_grad_holder = torch.empty([self.cfg.train.batch_size, self.model.xyz.shape[0], 2], dtype=torch.float32, device=self.model.xyz.device)
         uv_grad_holder.requires_grad = True
         ema_loss_for_log = 0.0
         prog = Progress(
@@ -105,25 +120,36 @@ class Trainer:
         )
         ssim_loss = StructuralSimilarityIndexMeasure(data_range=1.0).to(D3SIM_DEFAULT_DEVICE)
         verbose = False
+        total = self.cfg.train.iterations
         with contextlib.nullcontext():
         # with prog as progress:
             # task1 = progress.add_task("[red]Training...", total=self.cfg.train.iterations)
-            for ev in tqdm.tqdm((self.engine.train_step_generator(0, range(self.cfg.train.iterations), total_step=self.cfg.train.iterations, 
-                    step_ctx_creator=self.train_step_ctx)), total=self.cfg.train.iterations):
+            for ev in tqdm.tqdm((self.engine.train_step_generator(0, range(total), total_step=total, 
+                    step_ctx_creator=self.train_step_ctx)), total=total):
                 with tv.measure_and_print("prep", enable=verbose):
 
             # for ev in (self.engine.train_step_generator(0, range(self.cfg.train.iterations), total_step=self.cfg.train.iterations, step_ctx_creator=self.train_step_ctx)):
-                    if not viewpoint_stack:
-                        viewpoint_stack = scene.getTrainCameras().copy()
-                    viewpoint_cam = viewpoint_stack.pop(random.randint(0, len(viewpoint_stack)-1))
+                    cams = []
+                    gt_imgs = []
+                    for j in range(self.cfg.train.batch_size):
+                        if not viewpoint_stack:
+                            viewpoint_stack = scene.getTrainCameras().copy()
+                        viewpoint_cam = viewpoint_stack.pop(random.randint(0, len(viewpoint_stack)-1))
+                        cam = original_cam_to_d3sim_cam(viewpoint_cam)
+                        gt_image = viewpoint_cam.original_image.to(D3SIM_DEFAULT_DEVICE)
+                        cams.append(cam)
+                        gt_imgs.append(gt_image)
+                    gt_image = torch.stack(gt_imgs, dim=0)
+                    if len(cams) == 1:
+                        cam_bundle = cams[0]
+                    else:
+                        cam_bundle = cams_to_cam_bundle(cams)
                     if uv_grad_holder.shape[0] != self.model.xyz.shape[0]:
-                        uv_grad_holder = torch.empty([self.model.xyz.shape[0], 2], dtype=torch.float32, device=self.model.xyz.device)
+                        uv_grad_holder = torch.empty([self.cfg.train.batch_size, self.model.xyz.shape[0], 2], dtype=torch.float32, device=self.model.xyz.device)
                         uv_grad_holder.requires_grad_(True)
-                    cam = original_cam_to_d3sim_cam(viewpoint_cam)
-                    gt_image = viewpoint_cam.original_image.to(D3SIM_DEFAULT_DEVICE)
                 with tv.measure_and_print("fwd-bwd", enable=verbose):
                     # with tv.measure_and_print("rasterize"):
-                    out = rasterize_gaussians(self.model, cam, op=self.gauss_op, training=True, uv_grad_holder=uv_grad_holder)
+                    out = rasterize_gaussians(self.model, cam_bundle, op=self.gauss_op, training=True, uv_grad_holder=uv_grad_holder)
                     assert ev.step_ctx_value is not None 
                     ev.step_ctx_value.output = out
                     Ll1 = l1_loss(out.color, gt_image)
@@ -148,7 +174,8 @@ class Trainer:
 
                 if (ev.cur_step + 1) < self.cfg.train.strategy.refine_stop_iter:
                     if not self.use_strategy_ref:
-                        self.strategy.update_v2(self.train_state, out, duv)
+                        for i in range(self.cfg.train.batch_size):
+                            self.strategy.update_v2(self.train_state, out.select_batch(i), duv[i], batch_size=self.cfg.train.batch_size)
                     # self.strategy.update(self.train_state_ref, out, duv)
                     # print(torch.linalg.norm(self.train_state_ref.duv_ndc_length - self.train_state.duv_ndc_length))
                     # print(torch.linalg.norm(self.train_state_ref.count - self.train_state.count))
@@ -196,11 +223,11 @@ class Trainer:
 
                 save_root = PACKAGE_ROOT / "build/debug"
                 with torch.no_grad():
-                    if (ev.cur_step + 1) % 1000 == 0:
-                        out_color = out.color
+                    if (ev.cur_step + 1) % (1000 // self.cfg.train.batch_size) == 0:
+                        out_color = out.color[0]
                         out_color_u8 = out_color.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
                         out_color_u8 = out_color_u8[..., ::-1]
-                        gt_image_u8 = gt_image.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
+                        gt_image_u8 = gt_image[0].mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
                         gt_image_u8 = gt_image_u8[..., ::-1]
                         out_color_u8 = np.concatenate([out_color_u8, gt_image_u8], axis=0)
                         # out_color_u8 = (out_color.permute(1, 2, 0) * 255).to(torch.uint8).cpu().numpy()
@@ -208,8 +235,8 @@ class Trainer:
                         cv2.imwrite(str(save_root / f"test_train_{ev.cur_step}.png"), out_color_u8)
 
                 with torch.no_grad():
-                    # if (ev.cur_step + 1) % 1000 == 0 and (ev.cur_step + 1) >= 3000:
-                    #     self._on_eval(ev.cur_step + 1, scene)
+                    if (ev.cur_step + 1) % (1000 // self.cfg.train.batch_size) == 0 and (ev.cur_step + 1) >= (3000 // self.cfg.train.batch_size):
+                        self._on_eval(ev.cur_step + 1, scene)
                     # progress.print(f"LosVals: {loss.item():.{7}f}", self.model.xyz.shape[0])
                     # if loss.item() > 1 or loss .item() < 0:
                     #     out_color = out.color
@@ -225,7 +252,7 @@ class Trainer:
                     #     breakpoint()
 
                     ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-                    if (ev.cur_step + 1) % 100 == 0:
+                    if (ev.cur_step + 1) % (100 // self.cfg.train.batch_size) == 0:
                         print(f"Loss: {ema_loss_for_log:.{7}f}, Mem: {get_used_gpu_mem_GB():.3f} GB")
                     # progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
                 # if ev.cur_step >= 10:

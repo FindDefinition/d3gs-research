@@ -80,6 +80,16 @@ class GaussianSplatOutput(DataClassWithArrayCheck):
     def image_shape_wh(self) -> tuple[int, int]:
         return (self.T.shape[1], self.T.shape[0])
 
+    def select_batch(self, batch_idx: int):
+        return GaussianSplatOutput(
+            custom_features=None if self.custom_features is None else self.custom_features[batch_idx],
+            T=self.T[batch_idx],
+            color=self.color[batch_idx],
+            depth=None if self.depth is None else self.depth[batch_idx],
+            n_contrib=None if self.n_contrib is None else self.n_contrib[batch_idx],
+            radii=None if self.radii is None else self.radii[batch_idx],
+        )
+
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class RasterizeGradientOutput(DataClassWithArrayCheck):
@@ -103,6 +113,8 @@ class GaussianSplatGradients(DataClassWithArrayCheck):
 class CameraParamBundle:
     focal_xy_ppoint: torch.Tensor
     image_shape_wh: tuple[int, int]
+    # frame id of each camera, used for object instance.
+    frame_ids: torch.Tensor | None
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class CameraBundle(CameraParamBundle):
@@ -121,7 +133,7 @@ class GaussianSplatOp:
         model: GaussianModelBase,
         cameras: BasicPinholeCamera | CameraBundle,
         training: bool = False,
-        instance_poses: torch.Tensor | None = None,
+        instance2world_T: torch.Tensor | None = None,
     ):
         enable_verbose = self._cfg.verbose
         # enable_verbose = False
@@ -142,7 +154,7 @@ class GaussianSplatOp:
             width = image_shape_wh[0]
             height = image_shape_wh[1]
             resolution_wh_np = np.array([width, height], np.int32)
-
+            enable_instance_render = False
             if isinstance(camera, BasicPinholeCamera):
                 intrinsic = camera.intrinsic
                 cam2world = camera.pose.to_world
@@ -152,7 +164,21 @@ class GaussianSplatOp:
                                             np.float32)
                 cam2world_T_np = np.ascontiguousarray(cam2world[:3].T)
                 cam2world_center_np = cam2world_T_np[3]
+                if instance2world_T is not None:
+                    assert camera.frame_local_id is not None 
+                    assert model.instance_id is not None, "instance_id must be provided in model when render with instance"
+                    enable_instance_render = True
+                    frame_local_id = camera.frame_local_id
+
             else:
+                if instance2world_T is not None:
+                    assert camera.frame_ids is not None, "frame_ids must be provided when render with instance"
+                    assert model.instance_id is not None, "instance_id must be provided in model when render with instance"
+                    enable_instance_render = True
+                    assert instance2world_T.ndim == 4, "instance2world_T must be 4D tensor [num_frame, num_instance, 4, 3]"
+                    # instance2world_T: [num_frame, num_instance, 4, 3]
+                    num_instance = instance2world_T.shape[1]
+                frame_ids = camera.frame_ids
                 cam2world_T_ten = camera.cam2world_T
                 focal_xy_ppoint_ten = camera.focal_xy_ppoint
 
@@ -171,6 +197,7 @@ class GaussianSplatOp:
             color_sh_base = model.color_sh_base
             degree = model.color_sh_degree
             cur_degree = model.cur_sh_degree
+            instance_ids = model.instance_id
 
             depths = torch.empty(batch_size * num, dtype=torch.float32, device=xyz.device)
             radii = torch.empty(batch_size * num, dtype=torch.int32, device=xyz.device)
@@ -235,20 +262,55 @@ class GaussianSplatOp:
                 auto focal_xy_ppoint = op::reinterpret_cast_array_nd<4>($focal_xy_ppoint_ten)[batch_idx];
                 auto focal_xy = op::slice<0, 2>(focal_xy_ppoint);
                 auto principal_point = op::slice<2, 4>(focal_xy_ppoint);
+                auto cam2world_R_T = op::slice<0, 3>(cam2world_T);
+                auto cam2world_center = cam2world_T[3];
+
                 """)
+                if enable_instance_render:
+                    code_prep.raw(f"""
+                    auto frame_id = $frame_ids[batch_idx];
+                    """)
             else:
                 # cam2world, focal and ppoint are registers
                 code_prep.raw(f"""
                 auto gaussian_idx = i;
-
                 auto cam2world_T = $cam2world_T_np;
                 auto focal_xy = $focal_xy_np;
                 auto principal_point = $principal_point_np;
+                auto cam2world_R_T = op::slice<0, 3>(cam2world_T);
+                auto cam2world_center = cam2world_T[3];
+                """)
+                if enable_instance_render:
+                    code_prep.raw(f"""
+                    auto frame_id = $frame_local_id;
+                    """)
+            if enable_instance_render:
+                code_prep.raw(f"""
+                auto instance_id = $instance_ids[gaussian_idx];
+                if (instance_id >= 0){{
+                    auto instance2world_T = op::reinterpret_cast_array_nd<4, 3>($instance2world_T)[frame_id * $num_instance + instance_id];
+                    // get cam2instance_T, cam2instance = world2instance @ cam2world
+                    // so cam2instance_T = cam2world_T @ world2instance_T = cam2world_T @ instance2world
+                    auto instance2world_R_T = op::slice<0, 3>(instance2world_T);
+                    auto instance2world_center = instance2world_T[3];
+                    // y = R @ x + t, x = R^T @ (y - t) = R^T @ y - R^T @ t, new center = - R^T @ t
+                    auto world2instance_center = - (instance2world_R_T.op<op::mv_rowmajor>(instance2world_center));
+                    
+                    // get cam2instance_R_T
+                    auto cam2instance_R_T = cam2world_R_T.op<op::mm_tt>(instance2world_R_T.op<op::transpose>());
+                    // get cam2instance_center 
+                    // y2 = R2 @ (R1 @ x + t1) + t2 = R2 @ R1 @ x + R2 @ t1 + t2
+                    auto cam2instance_center = cam2world_R_T.op<op::mv_rowmajor>(world2instance_center) + cam2world_center;
+
+                    // assign to cam2world
+                    cam2world_R_T = cam2instance_R_T;
+                    cam2world_center = cam2instance_center;
+                }}
                 """)
             code_prep.raw(f"""
             auto tan_fov = 0.5f * resolution_wh.cast<float>() / focal_xy;
             auto point = op::reinterpret_cast_array_nd<3>($xyz)[gaussian_idx];
-            auto point_cam = op::slice<0, 3>(cam2world_T).op<op::mv_rowmajor>(point - cam2world_T[3]);
+            auto point_cam = cam2world_R_T.op<op::mv_rowmajor>(point - cam2world_center);
 
             auto uvz = CameraOps::pos_cam_to_uv_no_distort<2, 0, 1>(point_cam, principal_point, focal_xy);
             auto uv = std::get<0>(uvz) - 0.5f;
@@ -274,7 +336,7 @@ class GaussianSplatOp:
                 auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale * $scale_global, quat);
                 """)
             code_prep.raw(f"""
-            auto cov2d_vec = Gaussian3D::project_gaussian_to_2d<float, 4>(point_cam, focal_xy, tan_fov, cam2world_T, cov3d_vec, $projected_clamp_factor);
+            auto cov2d_vec = Gaussian3D::project_gaussian_to_2d<float, 3>(point_cam, focal_xy, tan_fov, cam2world_R_T, cov3d_vec, $projected_clamp_factor);
             
             cov2d_vec[0] += $lowpass_filter;
             cov2d_vec[2] += $lowpass_filter;
@@ -318,11 +380,11 @@ class GaussianSplatOp:
                 if has_color_base:
                     code_prep.raw(f"""
                     auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + gaussian_idx;
-                    auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr, sh_base_ptr);
+                    auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr, sh_base_ptr);
                     """)
                 else:
                     code_prep.raw(f"""
-                    auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr);
+                    auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr);
                     """)
                 code_prep.raw(f"""
                 uint8_t ne_0_packed = (uint8_t(rgb[0] < 0) << 2) | (uint8_t(rgb[1] < 0) << 1) | uint8_t(rgb[2] < 0);
@@ -339,11 +401,11 @@ class GaussianSplatOp:
                 if has_color_base:
                     code_prep.raw(f"""
                     auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + gaussian_idx;
-                    op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr, sh_base_ptr).op<op::maximum>(0.0f);
+                    op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr, sh_base_ptr).op<op::maximum>(0.0f);
                     """)
                 else:
                     code_prep.raw(f"""
-                    op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_T[3]).op<op::normalize>(), sh_ptr).op<op::maximum>(0.0f);
+                    op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr).op<op::maximum>(0.0f);
                     """)
             # with measure_and_print_torch("1", enable=True):
             self._inliner.kernel_1d(prep_kernel_name, batch_size * num, 0, code_prep)
@@ -564,7 +626,7 @@ class GaussianSplatOp:
                                             color=out_color,
                                             depth=final_depth,
                                             n_contrib=n_contrib,
-                                            radii=radii)
+                                            radii=radii.view(batch_size, num))
             ctx = GaussianSplatOpContext(
                 conic_opacity=conic_opacity,
                 radii=radii,
@@ -773,7 +835,6 @@ class GaussianSplatOp:
             tv::array<float, 3> rgb{{}};
             int toDo = range[1] - range[0];
             int rounds = tv::div_up(range[1] - range[0], {block_size});
-            float weight_sum = 0.0f;    
             uint32_t contributor = 0;
             """)
         else:
@@ -993,7 +1054,6 @@ class GaussianSplatOp:
                     """)
                     if not is_bwd:
                         code_rasterize.raw(f"""
-                        weight_sum += weight;
                         contributor = i * {block_size} + j;
                         """)
                     gaussian_id_inited = False
@@ -1015,6 +1075,12 @@ class GaussianSplatOp:
                         code_rasterize.raw(f"""
                         render_rgb -= weight * rgb_val;
                         """)
+                        if render_depth:
+                            code_rasterize.raw(f"""
+                            auto depth_val = collected_depth[j];
+                            render_depth -= weight * depth_val;
+                            """)
+
                     if not is_bwd:
                         code_rasterize.raw(f"""
                         rgb += weight * rgb_val;
@@ -1032,7 +1098,7 @@ class GaussianSplatOp:
                         """)
                         if render_depth:
                             code_rasterize.raw(f"""
-                            dL_dalpha_without_div += ddepth * (T * depth_val - (render_depth - depth_accum));
+                            dL_dalpha_without_div += ddepth * (T * depth_val - render_depth);
                             """)
                         code_rasterize.raw(f"""
                         auto dL_dalpha = dL_dalpha_without_div / (1.0f - alpha);
@@ -1169,8 +1235,9 @@ class GaussianSplatOp:
                 """)
                 if render_depth:
                     if not training:
+                        # TODO should we apply (1 - T) here?
                         code_rasterize.raw(f"""
-                        $final_depth[pixel_id] = depth_accum / (1e-6f + weight_sum);
+                        $final_depth[pixel_id] = depth_accum / (1e-10f + 1.0f - T);
                         """)
                     else:
                         code_rasterize.raw(f"""
@@ -1230,7 +1297,8 @@ class GaussianSplatOp:
                  ctx: GaussianSplatOpContext,
                  out: GaussianSplatOutput,
                  grad: GaussianSplatGradients,
-                 return_uv_grad: bool = False):
+                 return_uv_grad: bool = False,
+                 instance2world_T: torch.Tensor | None = None):
         # if isinstance(cameras, CameraBundle):
         #     raise NotImplementedError("CameraBundle is not supported yet.")
         num = model.xyz.shape[0]
@@ -1259,6 +1327,23 @@ class GaussianSplatOp:
         resolution_wh_np = np.array([width, height], np.int32)
         is_cam_bundle = False
         batch_size = 1
+        # if isinstance(camera, BasicPinholeCamera):
+        #     intrinsic = camera.intrinsic
+        #     cam2world = camera.pose.to_world
+
+        #     focal_xy_np = np.array([intrinsic[0, 0], intrinsic[1, 1]], np.float32)
+        #     principal_point_np = np.array([intrinsic[0, 2], intrinsic[1, 2]],
+        #                                 np.float32)
+        #     cam2world_T_np = np.ascontiguousarray(cam2world[:3].T)
+        #     cam2world_R_np = cam2world_T_np[:3]
+        #     cam2world_center_np = cam2world_T_np[3]
+        # else:
+        #     is_cam_bundle = True
+        #     cam2world_T_ten = camera.cam2world_T
+        #     assert cam2world_T_ten.ndim == 3
+        #     focal_xy_ppoint_ten = camera.focal_xy_ppoint
+        #     batch_size = cam2world_T_ten.shape[0]
+        enable_instance_render = False
         if isinstance(camera, BasicPinholeCamera):
             intrinsic = camera.intrinsic
             cam2world = camera.pose.to_world
@@ -1269,10 +1354,23 @@ class GaussianSplatOp:
             cam2world_T_np = np.ascontiguousarray(cam2world[:3].T)
             cam2world_R_np = cam2world_T_np[:3]
             cam2world_center_np = cam2world_T_np[3]
+            if instance2world_T is not None:
+                assert camera.frame_local_id is not None 
+                assert model.instance_id is not None, "instance_id must be provided in model when render with instance"
+                enable_instance_render = True
+                frame_local_id = camera.frame_local_id
+
         else:
             is_cam_bundle = True
+            if instance2world_T is not None:
+                assert camera.frame_ids is not None, "frame_ids must be provided when render with instance"
+                assert model.instance_id is not None, "instance_id must be provided in model when render with instance"
+                enable_instance_render = True
+                assert instance2world_T.ndim == 4, "instance2world_T must be 4D tensor [num_frame, num_instance, 4, 3]"
+                # instance2world_T: [num_frame, num_instance, 4, 3]
+                num_instance = instance2world_T.shape[1]
+            frame_ids = camera.frame_ids
             cam2world_T_ten = camera.cam2world_T
-            assert cam2world_T_ten.ndim == 3
             focal_xy_ppoint_ten = camera.focal_xy_ppoint
             batch_size = cam2world_T_ten.shape[0]
 
@@ -1293,17 +1391,22 @@ class GaussianSplatOp:
         if model.color_sh_base is not None:
             dcolor_base_sh_res = torch.zeros_like(model.color_sh_base)
         # dopacity = torch.zeros_like(model.opacity)
+        if batch_size == 1:
+            dopacity_res = dopacity
+        else:
+            dopacity_res = torch.zeros_like(model.opacity)
         grad_model = GaussianModelOrigin(xyz=dxyz_res,
                                          color_sh=dcolor_sh_res,
                                          scale=dscale_res,
                                          quaternion_xyzw=dquat_res,
-                                         opacity=dopacity,
+                                         opacity=dopacity_res,
                                          color_sh_base=dcolor_base_sh_res)
         xyz = model.xyz
         scales = model.scale
         quat_xyzw = model.quaternion_xyzw
         color_sh = model.color_sh
         opacity = model.opacity
+        instance_ids = model.instance_id
         degree = model.color_sh_degree
         cur_degree = model.cur_sh_degree
         fused_scale_act = model.fused_scale_act_op
@@ -1347,7 +1450,6 @@ class GaussianSplatOp:
                 auto conic_grad = op::reinterpret_cast_array_nd<3>($dconic)[i_with_batch];
                 // auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i_with_batch];
                 """)
-
                 if is_cam_bundle:
                     # cam2world, focal and ppoint are tensor, load from gpu mem
                     code_prep.raw(f"""
@@ -1355,9 +1457,14 @@ class GaussianSplatOp:
                     auto focal_xy_ppoint = op::reinterpret_cast_array_nd<4>($focal_xy_ppoint_ten)[batch_idx];
                     auto focal_xy = op::slice<0, 2>(focal_xy_ppoint);
                     auto principal_point = op::slice<2, 4>(focal_xy_ppoint);
-                    auto cam2world_R_T = cam2world_T.slice<0, 3>();
+                    auto cam2world_R_T = op::slice<0, 3>(cam2world_T);
                     auto cam2world_center = cam2world_T[3];
+
                     """)
+                    if enable_instance_render:
+                        code_prep.raw(f"""
+                        auto frame_id = $frame_ids[batch_idx];
+                        """)
                 else:
                     # cam2world, focal and ppoint are registers
                     code_prep.raw(f"""
@@ -1366,6 +1473,51 @@ class GaussianSplatOp:
                     auto focal_xy = $focal_xy_np;
                     auto principal_point = $principal_point_np;
                     """)
+                    if enable_instance_render:
+                        code_prep.raw(f"""
+                        auto frame_id = $frame_local_id;
+                        """)
+                if enable_instance_render:
+                    code_prep.raw(f"""
+                    auto instance_id = $instance_ids[i];
+                    if (instance_id >= 0){{
+                        auto instance2world_T = op::reinterpret_cast_array_nd<4, 3>($instance2world_T)[frame_id * $num_instance + instance_id];
+                        // get cam2instance_T, cam2instance = world2instance @ cam2world
+                        // so cam2instance_T = cam2world_T @ world2instance_T = cam2world_T @ instance2world
+                        auto instance2world_R_T = op::slice<0, 3>(instance2world_T);
+                        auto instance2world_center = instance2world_T[3];
+                        // y = R @ x + t, x = R^T @ (y - t) = R^T @ y - R^T @ t, new center = - R^T @ t
+                        auto world2instance_center = - (instance2world_R_T.op<op::mv_rowmajor>(instance2world_center));
+                        
+                        // get cam2instance_R_T
+                        auto cam2instance_R_T = cam2world_R_T.op<op::mm_tt>(instance2world_R_T.op<op::transpose>());
+                        // get cam2instance_center 
+                        // y2 = R2 @ (R1 @ x + t1) + t2 = R2 @ R1 @ x + R2 @ t1 + t2
+                        auto cam2instance_center = cam2world_R_T.op<op::mv_rowmajor>(world2instance_center) + cam2world_center;
+
+                        // assign to cam2world
+                        cam2world_R_T = cam2instance_R_T;
+                        cam2world_center = cam2instance_center;
+                    }}
+                    """)
+                # if is_cam_bundle:
+                #     # cam2world, focal and ppoint are tensor, load from gpu mem
+                #     code_prep.raw(f"""
+                #     auto cam2world_T = op::reinterpret_cast_array_nd<4, 3>($cam2world_T_ten)[batch_idx];
+                #     auto focal_xy_ppoint = op::reinterpret_cast_array_nd<4>($focal_xy_ppoint_ten)[batch_idx];
+                #     auto focal_xy = op::slice<0, 2>(focal_xy_ppoint);
+                #     auto principal_point = op::slice<2, 4>(focal_xy_ppoint);
+                #     auto cam2world_R_T = op::slice<0, 3>(cam2world_T);
+                #     auto cam2world_center = cam2world_T[3];
+                #     """)
+                # else:
+                #     # cam2world, focal and ppoint are registers
+                #     code_prep.raw(f"""
+                #     auto cam2world_R_T = $cam2world_R_np;
+                #     auto cam2world_center = $cam2world_center_np;
+                #     auto focal_xy = $focal_xy_np;
+                #     auto principal_point = $principal_point_np;
+                #     """)
 
                 code_prep.raw(f"""
 
@@ -1492,12 +1644,12 @@ class GaussianSplatOp:
                 op::reinterpret_cast_array_nd<3>($dxyz_res)[i] = dxyz_acc;
                 op::reinterpret_cast_array_nd<4>($dquat_res)[i] = dquat_acc;
                 op::reinterpret_cast_array_nd<3>($dscale_res)[i] = dscale_acc;
-                $dopacity[i] = dopacity_val_acc;
+                $dopacity_res[i] = dopacity_val_acc;
                 """)
 
             self._inliner.kernel_1d(prep_kernel_name, num, 0, code_prep)
         if return_uv_grad:
-            return grad_model, duv
+            return grad_model, duv.view(batch_size, -1, 2)
         return grad_model, None
 
 
@@ -1519,7 +1671,8 @@ class _RasterizeGaussians(torch.autograd.Function):
         # cameras
         camera_params: CameraParamBundle | BasicPinholeCamera,
         cam2world_T: torch.Tensor | None,
-        instance_poses,
+        frame_ids: torch.Tensor | None,
+        instance2world_T,
         # options
         training,
         op: GaussianSplatOp,
@@ -1532,6 +1685,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 focal_xy_ppoint=camera_params.focal_xy_ppoint,
                 image_shape_wh=camera_params.image_shape_wh,
                 cam2world_T=cam2world_T,
+                frame_ids=frame_ids,
             )
             focal_xy_ppoint = camera_params.focal_xy_ppoint
         else:
@@ -1551,7 +1705,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 act_applied=True,
             )
         with tv.measure_and_print("FWD-all-torch", enable=enable_verbose):
-            out, fwd_ctx = op.forward(model, cam_bundle, training=training, instance_poses=instance_poses)
+            out, fwd_ctx = op.forward(model, cam_bundle, training=training, instance2world_T=instance2world_T)
         with tv.measure_and_print("FWD-all-torch-2", enable=enable_verbose):
 
             if fwd_ctx is not None:
@@ -1577,9 +1731,10 @@ class _RasterizeGaussians(torch.autograd.Function):
                     instance_id,
                     # cam bundle
                     cam2world_T,
+                    frame_ids,
                     focal_xy_ppoint,
                     # instance pose
-                    instance_poses,
+                    instance2world_T,
                     # outputs
                     out.n_contrib,
                     out.color,
@@ -1604,7 +1759,7 @@ class _RasterizeGaussians(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, drgb, ddepth, dcustom_features, dT, dn_contrib, dradii):
         if len(ctx.saved_tensors) == 0:
-            return (None, ) * 15
+            return (None, ) * 16
         op: GaussianSplatOp = ctx.op
 
         with tv.measure_and_print("BWD-all-torch", enable=False):
@@ -1640,13 +1795,15 @@ class _RasterizeGaussians(torch.autograd.Function):
                 cur_sh_degree=ctx.cur_sh_degree,
             )
             cam2world_T = ctx.saved_tensors[17]
-            focal_xy_ppoint = ctx.saved_tensors[18]
-            instance_poses = ctx.saved_tensors[19]
+            frame_ids = ctx.saved_tensors[18]
+            focal_xy_ppoint = ctx.saved_tensors[19]
+            instance2world_T = ctx.saved_tensors[20]
             if cam2world_T is not None:
                 cam_bundle = CameraBundle(
                     focal_xy_ppoint=focal_xy_ppoint,
                     image_shape_wh=fwd_ctx.image_shape_wh,
                     cam2world_T=cam2world_T,
+                    frame_ids=frame_ids,
                 )
             else:
                 cam_bundle = ctx.cams
@@ -1668,8 +1825,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             # print("FwdCtx Size", fwd_ctx.get_all_torch_tensor_byte_size())
             # print("Gradient Size", gradient.get_all_torch_tensor_byte_size())
         grad_out, duv = op.backward(model, cam_bundle, fwd_ctx, out, gradient,
-                                    ctx.return_uv_grad)
-        return grad_out.xyz, grad_out.color_sh, grad_out.color_sh_base, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, None, None, None, None, None, None, duv
+                                    ctx.return_uv_grad, instance2world_T)
+        return grad_out.xyz, grad_out.color_sh, grad_out.color_sh_base, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, None, None, None, None, None, None, None, duv
 
 
 def rasterize_gaussians(
@@ -1677,16 +1834,20 @@ def rasterize_gaussians(
     cameras: BasicPinholeCamera | CameraBundle,
     op: GaussianSplatOp,
     training=False,
-    background_tensor: torch.Tensor | None = None,
+    # background_tensor: torch.Tensor | None = None,
     uv_grad_holder: torch.Tensor | None = None,
-    instance_poses: torch.Tensor | None = None,
+    instance2world_T: torch.Tensor | None = None,
 ):
-    if not training:
-        assert background_tensor is None, "background_tensor is only used in training mode"
+    # if not training:
+    #     assert background_tensor is None, "background_tensor is only used in training mode"
     model = model.create_model_with_act()  # apply activation
     c2w_T = None 
+    frame_ids = None 
     if isinstance(cameras, CameraBundle):
         c2w_T = cameras.cam2world_T
+        frame_ids = cameras.frame_ids
+    if instance2world_T is not None:
+        assert frame_ids is not None
     res = _RasterizeGaussians.apply(
         model.xyz,
         model.color_sh,
@@ -1699,7 +1860,8 @@ def rasterize_gaussians(
         type(model),
         cameras,
         c2w_T,
-        instance_poses,
+        frame_ids,
+        instance2world_T,
         training,
         op,
         uv_grad_holder,
@@ -1712,10 +1874,10 @@ def rasterize_gaussians(
         n_contrib=res[4],
         radii=res[5],
     )
-    if background_tensor is not None:
-        out.color = out.color + out.T * background_tensor
-    else:
-        if training:
-            bg_in_cfg_device = op._cfg.get_bg_color_device(model.xyz.device)
-            out.color = out.color + out.T * bg_in_cfg_device.view(1, 3, 1, 1)
+    # if background_tensor is not None:
+    #     out.color = out.color + out.T * background_tensor
+    # else:
+    #     if training:
+    #         bg_in_cfg_device = op._cfg.get_bg_color_device(model.xyz.device)
+    #         out.color = out.color + out.T.reshape(out.color.shape[0], 1, *out.color.shape[2:]) * bg_in_cfg_device.view(1, 3, 1, 1)
     return out

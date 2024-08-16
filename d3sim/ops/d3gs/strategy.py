@@ -140,7 +140,7 @@ class GaussianStrategyBase:
             )
         
     @torch.no_grad()
-    def update_v2(self, state: GaussianTrainState, out: GaussianSplatOutput, duv: torch.Tensor):
+    def update_v2(self, state: GaussianTrainState, out: GaussianSplatOutput, duv: torch.Tensor, batch_size: int = 1):
         width, height = out.image_shape_wh
         max_width_height = max(width, height)
         N = duv.reshape(-1, 2).shape[0]
@@ -160,8 +160,8 @@ class GaussianStrategyBase:
         using math_op_t = tv::arrayops::MathScalarOp<float>;
         auto duv_val = op::reinterpret_cast_array_nd<2>($duv)[i];
         auto radii_val = $radii[i];
-        duv_val[0] *= 0.5f * $width;
-        duv_val[1] *= 0.5f * $height;
+        duv_val[0] *= 0.5f * $width * $batch_size;
+        duv_val[1] *= 0.5f * $height * $batch_size;
         auto duv_length = duv_val.op<op::length>();
         if (radii_val > 0){{
             $duv_ndc_length[i] += duv_length;
