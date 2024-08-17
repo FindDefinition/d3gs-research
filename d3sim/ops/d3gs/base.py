@@ -233,12 +233,12 @@ class GaussianModelOriginFused(GaussianModelBase):
 
     @property
     def fused_quaternion_xyzw_act_op(self) -> tuple[str, str] | None:
-        return ("normalize", "normalize_grad")
+        return ("normalize", "normalize_grad_out")
 
     @property
     def fused_scale_act_op(self) -> tuple[str, str] | None:
-        return ("exponential", "exponential_grad")
+        return ("exponential", "exponential_grad_out")
 
     @property
     def fused_opacity_act_op(self) -> tuple[str, str] | None:
-        return ("sigmoid", "sigmoid_grad")
+        return ("sigmoid", "sigmoid_grad_out")

@@ -303,23 +303,11 @@ class GaussianSplatOp:
                 code_prep.raw(f"""
                 auto instance_id = $instance_ids[gaussian_idx];
                 if (instance_id >= 0){{
-                    auto instance2world_T = op::reinterpret_cast_array_nd<4, 3>($instance2world_T)[frame_id * $num_instance + instance_id];
+                    auto instance2world_T_val = op::reinterpret_cast_array_nd<4, 3>($instance2world_T)[frame_id * $num_instance + instance_id];
                     // get cam2instance_T, cam2instance = world2instance @ cam2world
-                    // so cam2instance_T = cam2world_T @ world2instance_T = cam2world_T @ instance2world
-                    auto instance2world_R_T = op::slice<0, 3>(instance2world_T);
-                    auto instance2world_center = instance2world_T[3];
-                    // y = R @ x + t, x = R^T @ (y - t) = R^T @ y - R^T @ t, new center = - R^T @ t
-                    auto world2instance_center = - (instance2world_R_T.op<op::mv_rowmajor>(instance2world_center));
-                    
-                    // get cam2instance_R_T
-                    auto cam2instance_R_T = cam2world_R_T.op<op::mm_ttt>(instance2world_R_T.op<op::transpose>());
-                    // get cam2instance_center 
-                    // y2 = R2 @ (R1 @ x + t1) + t2 = R2 @ R1 @ x + R2 @ t1 + t2
-                    auto cam2instance_center = cam2world_R_T.op<op::mv_rowmajor>(world2instance_center) + cam2world_center;
-
-                    // assign to cam2world
-                    cam2world_R_T = cam2instance_R_T;
-                    cam2world_center = cam2instance_center;
+                    auto cam2instance_T = instance2world_T_val.op<op::transform_matrix_colmajor_inverse>().op<op::transform_matrix_mm_nnn>(cam2world_T);
+                    cam2world_R_T = op::slice<0, 3>(cam2instance_T);
+                    cam2world_center = cam2instance_T[3];
                 }}
                 """)
             code_prep.raw(f"""
@@ -1602,44 +1590,13 @@ class GaussianSplatOp:
                     code_prep.raw(f"""
                     auto instance_id = $instance_ids[i];
                     if (instance_id >= 0){{
-                        auto instance2world_T = op::reinterpret_cast_array_nd<4, 3>($instance2world_T)[frame_id * $num_instance + instance_id];
+                        auto instance2world_T_val = op::reinterpret_cast_array_nd<4, 3>($instance2world_T)[frame_id * $num_instance + instance_id];
                         // get cam2instance_T, cam2instance = world2instance @ cam2world
-                        // so cam2instance_T = cam2world_T @ world2instance_T = cam2world_T @ instance2world
-                        auto instance2world_R_T = op::slice<0, 3>(instance2world_T);
-                        auto instance2world_center = instance2world_T[3];
-                        // y = R @ x + t, x = R^T @ (y - t) = R^T @ y - R^T @ t, new center = - R^T @ t
-                        auto world2instance_center = - (instance2world_R_T.op<op::mv_rowmajor>(instance2world_center));
-                        
-                        // get cam2instance_R_T
-                        auto cam2instance_R_T = cam2world_R_T.op<op::mm_ttt>(instance2world_R_T.op<op::transpose>());
-                        // get cam2instance_center 
-                        // y2 = R2 @ (R1 @ x + t1) + t2 = R2 @ R1 @ x + R2 @ t1 + t2
-                        auto cam2instance_center = cam2world_R_T.op<op::mv_rowmajor>(world2instance_center) + cam2world_center;
-
-                        // assign to cam2world
-                        cam2world_R_T = cam2instance_R_T;
-                        cam2world_center = cam2instance_center;
+                        auto cam2instance_T = instance2world_T_val.op<op::transform_matrix_colmajor_inverse>().op<op::transform_matrix_mm_nnn>(cam2world_T);
+                        cam2world_R_T = op::slice<0, 3>(cam2instance_T);
+                        cam2world_center = cam2instance_T[3];
                     }}
                     """)
-                # if is_cam_bundle:
-                #     # cam2world, focal and ppoint are tensor, load from gpu mem
-                #     code_prep.raw(f"""
-                #     auto cam2world_T = op::reinterpret_cast_array_nd<4, 3>($cam2world_T_ten)[batch_idx];
-                #     auto focal_xy_ppoint = op::reinterpret_cast_array_nd<4>($focal_xy_ppoint_ten)[batch_idx];
-                #     auto focal_xy = op::slice<0, 2>(focal_xy_ppoint);
-                #     auto principal_point = op::slice<2, 4>(focal_xy_ppoint);
-                #     auto cam2world_R_T = op::slice<0, 3>(cam2world_T);
-                #     auto cam2world_center = cam2world_T[3];
-                #     """)
-                # else:
-                #     # cam2world, focal and ppoint are registers
-                #     code_prep.raw(f"""
-                #     auto cam2world_R_T = $cam2world_R_np;
-                #     auto cam2world_center = $cam2world_center_np;
-                #     auto focal_xy = $focal_xy_np;
-                #     auto principal_point = $principal_point_np;
-                #     """)
-
                 code_prep.raw(f"""
 
                 auto tan_fov = 0.5f * resolution_wh.cast<float>() / focal_xy;
@@ -1663,7 +1620,7 @@ class GaussianSplatOp:
                     """)
                 if fused_q_act:
                     code_prep.raw(f"""
-                    auto quat_act = quat.op<op::normalize>();
+                    auto quat_act = quat.op<op::{fused_q_act[0]}>();
                     """)
                 else:
                     code_prep.raw(f"""
@@ -1688,17 +1645,17 @@ class GaussianSplatOp:
                 """)
                 if fused_scale_act:
                     code_prep.raw(f"""
-                    dscale = dscale.op<op::{fused_scale_act[1]}>(scale);
+                    dscale = dscale.op<op::{fused_scale_act[1]}>(scale_act, scale);
                     """)
                 if fused_q_act:
                     code_prep.raw(f"""
-                    dquat = dquat.op<op::{fused_q_act[1]}>(quat);
+                    dquat = dquat.op<op::{fused_q_act[1]}>(quat_act, quat);
                     """)
                 if fused_opacity_act:
                     code_prep.raw(f"""
                     tv::array<float, 1> opacity_val{{$opacity[i]}};
                     tv::array<float, 1> dopacity_val{{$dopacity[i_with_batch]}};
-                    dopacity_val = dopacity_val.op<op::{fused_opacity_act[1]}>(opacity_val);
+                    dopacity_val = dopacity_val.op<op::{fused_opacity_act[1]}>(opacity_val.op<op::{fused_opacity_act[0]}>(), opacity_val);
                     """)
                     if batch_size > 1:
                         code_prep.raw(f"""
