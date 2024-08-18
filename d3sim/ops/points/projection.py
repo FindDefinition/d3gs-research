@@ -39,12 +39,12 @@ def project_points_to_camera(
     INLINER.kernel_1d(
         f"project_points_to_cam_{distort.shape[0]}_{axes_front_u_v}", num, 0, f"""
     namespace op = tv::arrayops;
-    auto point = op::reinterpret_cast_array_nd<float, 3>($points + i * $point_stride)[0];
+    auto point = op::reinterpret_cast_array_nd<3>($points + i * $point_stride)[0];
     auto center_val = $center;
     auto focal_length_val = $focal_length;
     auto distort_val = $distort;
     auto c2w_T = $cam_to_point_T;
-    auto uvd_res = CameraOps::pos_to_uv<{axes_front_u_v[0]}, {axes_front_u_v[1]}, {axes_front_u_v[2]}>(
+    auto uvd_res = CameraOps::pos_to_uv(
         point, $resolution, center_val, 
         focal_length_val, distort_val.data(), 
         static_cast<CameraDefs::DistortType>($distort_type), c2w_T, {{}});
@@ -55,7 +55,7 @@ def project_points_to_camera(
     valid &= (uv[0] > 0 && uv[1] > 0 && uv[0] < 1.0f && uv[1] < 1.0f);
     auto dir = (point - c2w_T[3]).op<op::normalize>();
     // assume front axis in camera space is pointing forward
-    valid &= (dir.op<op::dot>(c2w_T[{axes_front_u_v[0]}]) >= 1e-4f);
+    valid &= (dir.op<op::dot>(c2w_T[2]) >= 1e-4f);
     $res[i * 3] = uv[0];
     $res[i * 3 + 1] = uv[1];
     $res[i * 3 + 2] = z;
@@ -88,7 +88,7 @@ def get_depth_map_from_uvd(
         "fill_depth", points_uvd.shape[0], 0, f"""
     namespace op = tv::arrayops;
     using math_op_t = op::MathScalarOp<float>;
-    auto point_uvd = op::reinterpret_cast_array_nd<float, 3>($points_uvd)[i];
+    auto point_uvd = op::reinterpret_cast_array_nd<3>($points_uvd)[i];
     // uv is unified, convert to pixel
     auto u = point_uvd[0] * $width;
     auto v = point_uvd[1] * $height;
@@ -121,7 +121,7 @@ def projected_point_uvd_to_jet_rgb(
         "projected_point_uvd_to_rgb", points_uvd.shape[0], 0, f"""
     namespace op = tv::arrayops;
     using math_op_t = op::MathScalarOp<float>;
-    auto point_uvd = op::reinterpret_cast_array_nd<float, 3>($points_uvd)[i];
+    auto point_uvd = op::reinterpret_cast_array_nd<3>($points_uvd)[i];
     // uv is unified, convert to pixel
     auto u = point_uvd[0] * $width;
     auto v = point_uvd[1] * $height;
@@ -167,3 +167,62 @@ def depth_map_to_jet_rgb(
     $image_res[i * 3 + 2] = rgb[2];
     """)
     return image_res
+
+@observe_function
+def filter_uvd_keep_one_closest_per_pixel(
+        points_uvd: torch.Tensor,
+        image_size_wh: tuple[int, int],
+        depth_invalid_value: float | None = None,
+        ):
+    """Filter uvd points to keep only one point closest to the camera for each pixel.
+    """
+    depth_map = torch.empty([image_size_wh[1], image_size_wh[0]], dtype=torch.float32, device=points_uvd.device)
+    assert points_uvd.shape[1] == 3
+    width = image_size_wh[0]
+    height = image_size_wh[1]
+    if depth_invalid_value is None:
+        INLINER.kernel_1d(
+            "filter_uvd_fill_depth_with_max_fmax", depth_map.numel(), 0, f"""
+        $depth_map[i] = std::numeric_limits<float>::max();
+        """)
+    else:
+        INLINER.kernel_1d(
+            "filter_uvd_fill_depth_with_max_user_val", depth_map.numel(), 0, f"""
+        $depth_map[i] = $depth_invalid_value;
+        """)
+    res_mask = torch.empty([points_uvd.shape[0]], dtype=torch.uint8, device=points_uvd.device)
+    INLINER.kernel_1d(
+        "filter_uvd_get_min", points_uvd.shape[0], 0, f"""
+    namespace op = tv::arrayops;
+    using math_op_t = op::MathScalarOp<float>;
+    auto point_uvd = op::reinterpret_cast_array_nd<3>($points_uvd)[i];
+    // uv is unified, convert to pixel
+    auto u = point_uvd[0] * $width;
+    auto v = point_uvd[1] * $height;
+    auto depth = point_uvd[2];
+    auto u_int = int(math_op_t::round(u));
+    auto v_int = int(math_op_t::round(v));
+    if (u_int >= 0 && u_int < $width && v_int >= 0 && v_int < $height){{
+        tv::parallel::atomicMin($depth_map + v_int * $width + u_int, depth);
+    }}
+    """)
+    INLINER.kernel_1d(
+        "filter_uvd_get_argmin_and_mask", points_uvd.shape[0], 0, f"""
+    namespace op = tv::arrayops;
+    using math_op_t = op::MathScalarOp<float>;
+    auto point_uvd = op::reinterpret_cast_array_nd<3>($points_uvd)[i];
+    // uv is unified, convert to pixel
+    auto u = point_uvd[0] * $width;
+    auto v = point_uvd[1] * $height;
+    auto depth = point_uvd[2];
+    auto u_int = int(math_op_t::round(u));
+    auto v_int = int(math_op_t::round(v));
+    if (u_int >= 0 && u_int < $width && v_int >= 0 && v_int < $height){{
+        if (depth == $depth_map[v_int * $width + u_int]){{
+            $res_mask[i] = 1;
+        }} else {{
+            $res_mask[i] = 0;
+        }}
+    }}
+    """)
+    return res_mask, depth_map

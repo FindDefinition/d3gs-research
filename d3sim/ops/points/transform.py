@@ -19,7 +19,7 @@ def transform_xyz(points: torch.Tensor, matrix: np.ndarray) -> torch.Tensor:
     with INLINER.enter_inliner_scope():
         INLINER.kernel_1d("transform_xyz", points.shape[0], 0, f"""
         namespace op = tv::arrayops;
-        auto point_ptr = op::reinterpret_cast_array_nd<float, 3>($points + $points_stride * i);
+        auto point_ptr = op::reinterpret_cast_array_nd<3>($points + $points_stride * i);
         auto p = point_ptr[0];
         auto mat = $matrix;
         tv::array<float, 3> res;
@@ -27,7 +27,7 @@ def transform_xyz(points: torch.Tensor, matrix: np.ndarray) -> torch.Tensor:
         res[1] = mat[1][0] * p[0] + mat[1][1] * p[1] + mat[1][2] * p[2] + mat[1][3];
         res[2] = mat[2][0] * p[0] + mat[2][1] * p[1] + mat[2][2] * p[2] + mat[2][3];
 
-        op::reinterpret_cast_array_nd<float, 3>($res_points + $points_stride * i)[0] = res;
+        op::reinterpret_cast_array_nd<3>($res_points + $points_stride * i)[0] = res;
         
         """)
     return res_points

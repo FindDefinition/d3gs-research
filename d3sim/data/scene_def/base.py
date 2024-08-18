@@ -1,8 +1,11 @@
 import copy
 import enum
+
+from proto import Field
+from sqlalchemy import TIMESTAMP
 import d3sim.core.dataclass_dispatch as dataclasses 
 import abc 
-from typing import Any, Hashable, TypeVar, Generic
+from typing import Any, Hashable, Self, TypeVar, Generic, overload
 import numpy as np 
 import torch
 from scipy.spatial.transform import Rotation
@@ -13,6 +16,7 @@ from pydantic import (
     GetCoreSchemaHandler, )
 
 from d3sim.core.ops.rotation import euler_from_matrix_np
+from d3sim.core.thtools import np_to_torch_dev
 
 T = TypeVar("T")
 
@@ -147,6 +151,14 @@ class ObjectBase:
     track_id: int | str 
     type: int | str 
     source: str = ""
+    track_local_id: int = -1
+
+    def to_dict_no_nested(self):
+        res: dict[str, Any] = {}
+        for field in dataclasses.fields(self):
+            field_data = getattr(self, field.name)
+            res[field.name] = field_data
+        return res
 
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class Object3d(ObjectBase):
@@ -164,23 +176,56 @@ class Object3d(ObjectBase):
 
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class Object2d(ObjectBase):
-    bbox_xywh: np.ndarray
+    bbox_xywh: np.ndarray # f32
+    track_id_3d: int | str | None = None
+    track_local_id_3d: int = -1
 
+    def crop(self, crop_xy: tuple[int, int], crop_wh: tuple[int, int]) -> Self | None:
+        x, y = crop_xy
+        w, h = crop_wh
+        rew_xy = np.maximum(self.bbox_xywh[:2], [x, y])
+        new_xy_max = np.minimum(self.bbox_xywh[:2] + self.bbox_xywh[2:], [x + w, y + h])
+        new_wh = new_xy_max - rew_xy
+        if np.any(new_wh <= 0):
+            return None
+        return dataclasses.replace(self, bbox_xywh=np.concatenate([rew_xy, new_wh]))
+    
+    def resize(self, scale: float) -> Self:
+        new_bbox = self.bbox_xywh.copy()
+        new_bbox[:2] *= scale
+        new_bbox[2:] *= scale
+        return dataclasses.replace(self, bbox_xywh=new_bbox)
 
 class CoordSystem(enum.IntEnum):
     WORLD = 0
     VEHICLE = 1
 
+class CameraFieldTypes(enum.Enum):
+    IMAGE = "image"
+    SEGMENTATION = "segmentation"
+    VALID_MASK = "valid_mask"
 
-@dataclasses.dataclass(kw_only=True)
-class Sensor:
+class LidarFieldTypes(enum.Enum):
+    POINT_CLOUD = "point_cloud"
+    SEGMENTATION = "segmentation"
+    INTENSITY = "intensity"
+    VALID_MASK = "valid_mask"
+    TIMESTAMP = "timestamp"
+
+T_field_type = TypeVar("T_field_type", CameraFieldTypes, LidarFieldTypes)
+
+@dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
+class Sensor(Generic[T_field_type]):
     id: str 
     timestamp: int # ns
     pose: Pose
-    fields: dict[str, Resource] = dataclasses.field(default_factory=dict)
     # if not None, indicate the coordinate system of sensor data (e.g. pointcloud)
     data_coord: CoordSystem | None = None
     frame_local_id: int | None = None
+
+    homogeneous_fields: dict[str | T_field_type, np.ndarray] = dataclasses.field(default_factory=dict)
+    _homogeneous_torch_fields: dict[str | T_field_type, torch.Tensor] = dataclasses.field(default_factory=dict)
+
     def apply_world_transform(self, world2new: np.ndarray):
         new_self = copy.deepcopy(self)
         new_self.apply_world_transform_inplace(world2new)
@@ -190,6 +235,59 @@ class Sensor:
         self.pose.apply_world_transform_inplace(world2new)
         return self
 
+    def to_dict_no_nested(self):
+        res: dict[str, Any] = {}
+        for field in dataclasses.fields(self):
+            field_data = getattr(self, field.name)
+            res[field.name] = field_data
+        return res
+
+    def has_field(self, field: T_field_type | str) -> bool:
+        return field in self.homogeneous_fields
+
+    def set_field_np(self, field: T_field_type | str, data: np.ndarray):
+        self.homogeneous_fields[field] = data
+
+    def get_field_np(self, field: T_field_type | str) -> np.ndarray | None:
+        if field not in self.homogeneous_fields:
+            return None
+        return self.homogeneous_fields[field]
+
+    def get_field_np_required(self, field: T_field_type | str) -> np.ndarray:
+        res = self.get_field_np(field)
+        if res is None:
+            raise ValueError(f"Field {field} not found")
+        return res
+
+    def get_field_torch(self, field: T_field_type | str, device: str | torch.device | None = None) -> torch.Tensor | None:
+        npf = self.get_field_np(field)
+        if npf is None:
+            return None
+        return np_to_torch_dev(npf, device)
+
+    def get_and_cache_field_torch(self, field: T_field_type | str, device: str | torch.device | None = None) -> torch.Tensor | None:
+        thf = self.get_field_torch(field, device)
+        if thf is None:
+            return None 
+        if field not in self._homogeneous_torch_fields:
+            self._homogeneous_torch_fields[field] = thf
+        return self._homogeneous_torch_fields[field]
+
+    def remove_field_np(self, field: T_field_type | str):
+        if field in self.homogeneous_fields:
+            self.homogeneous_fields.pop(field)
+
+    def remove_field_torch(self, field: T_field_type | str):
+        if field in self._homogeneous_torch_fields:
+            self._homogeneous_torch_fields.pop(field)
+
+@dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
+class BaseCamera(Sensor[CameraFieldTypes], abc.ABC):
+    objects: list[Object2d] = dataclasses.field(default_factory=list)
+
+@dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
+class BaseLidar(Sensor[LidarFieldTypes], abc.ABC):
+    pass 
 
 @dataclasses.dataclass
 class BaseFrame:
@@ -225,8 +323,8 @@ class BaseFrame:
                 field_data = getattr(sensor, field.name)
                 if isinstance(field_data, Resource):
                     field_data.loader = None
-            for field, resource in sensor.fields.items():
-                resource.loader = None
+            # for field, resource in sensor.fields.items():
+            #     resource.loader = None
 
     def release_all_resource_caches(self):
         for sensor in self.sensors:
@@ -234,8 +332,8 @@ class BaseFrame:
                 field_data = getattr(sensor, field.name)
                 if isinstance(field_data, Resource):
                     field_data.clear_cache()
-            for field, resource in sensor.fields.items():
-                resource.clear_cache()
+            # for field, resource in sensor.fields.items():
+            #     resource.clear_cache()
 
     def get_sensor_by_id(self, sensor_id: str) -> Sensor:
         for sensor in self.sensors:
@@ -283,6 +381,21 @@ class BaseFrame:
             mat_world_dst = self.get_transform_matrix(CoordSystem.WORLD, dst)
             return mat_world_dst @ np.linalg.inv(mat_world_src)
 
+    def to_dict_no_nested(self):
+        res: dict[str, Any] = {}
+        for field in dataclasses.fields(self):
+            field_data = getattr(self, field.name)
+            res[field.name] = field_data
+        return res
+
+    def replace_sensor(self, sensor: Sensor):
+        new_sensors = self.sensors.copy()
+        for i, s in enumerate(self.sensors):
+            if s.id == sensor.id:
+                new_sensors[i] = sensor
+                break
+        return dataclasses.replace(self, sensors=new_sensors)
+
 T_frame = TypeVar("T_frame", bound=BaseFrame)
 
 @dataclasses.dataclass
@@ -292,6 +405,8 @@ class Scene(Generic[T_frame]):
     def __post_init__(self):
         # create resource loaders
         self.init_loaders()
+        self.assign_frame_local_id_inplace()
+        self.assign_track_local_id_inplace()
 
     def init_loaders(self):
         base_uri_type_to_loader: dict[tuple[str, str, Hashable], ResourceLoader] = {}
@@ -307,13 +422,13 @@ class Scene(Generic[T_frame]):
                         if resource.loader is None:
                             loader = base_uri_type_to_loader[key]
                             resource.loader = loader
-                for field, resource in sensor.fields.items():
-                    key = (resource.base_uri, resource.loader_type, resource.uid)
-                    if key not in base_uri_type_to_loader:
-                        base_uri_type_to_loader[key] = ALL_RESOURCE_LOADERS[resource.loader_type]()
-                    if resource.loader is None:
-                        loader = base_uri_type_to_loader[key]
-                        resource.loader = loader
+                # for field, resource in sensor.fields.items():
+                #     key = (resource.base_uri, resource.loader_type, resource.uid)
+                #     if key not in base_uri_type_to_loader:
+                #         base_uri_type_to_loader[key] = ALL_RESOURCE_LOADERS[resource.loader_type]()
+                #     if resource.loader is None:
+                #         loader = base_uri_type_to_loader[key]
+                #         resource.loader = loader
 
     def release_all_loaders(self):
         for frame in self.frames:
@@ -333,6 +448,27 @@ class Scene(Generic[T_frame]):
             f.apply_world_transform_inplace(world2new)
         return self
 
+    def assign_frame_local_id_inplace(self):
+        for i, frame in enumerate(self.frames):
+            for sensor in frame.sensors:
+                sensor.frame_local_id = i
+
+    def assign_track_local_id_inplace(self):
+        track_id_str_to_local_id: dict[str | int, int] = {}
+        cam_track_id_str_to_local_id: dict[str | int, int] = {}
+        for i, frame in enumerate(self.frames):
+            for obj in frame.objects:
+                if obj.track_id not in track_id_str_to_local_id:
+                    track_id_str_to_local_id[obj.track_id] = len(track_id_str_to_local_id)
+                obj.track_local_id = track_id_str_to_local_id[obj.track_id]
+        for i, frame in enumerate(self.frames):
+            for cam in frame.get_sensors_by_type(BaseCamera):
+                for obj in cam.objects:
+                    if obj.track_id not in cam_track_id_str_to_local_id:
+                        cam_track_id_str_to_local_id[obj.track_id] = len(cam_track_id_str_to_local_id)
+                    obj.track_local_id = cam_track_id_str_to_local_id[obj.track_id]
+                    if obj.track_id_3d is not None and obj.track_id_3d in track_id_str_to_local_id:
+                        obj.track_local_id_3d = track_id_str_to_local_id[obj.track_id_3d]
 
 class DistortType(enum.IntEnum):
     kOpencvPinhole = 0

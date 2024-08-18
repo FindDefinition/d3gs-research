@@ -8,7 +8,8 @@ import torch
 from d3sim.constants import D3SIM_DEFAULT_DEVICE
 import d3sim.core.dataclass_dispatch as dataclasses
 
-from d3sim.data.scene_def.base import CoordSystem, Object2d, Object3d, Pose, Scene, Sensor, Resource, BaseFrame, ALL_RESOURCE_LOADERS, ResourceLoader
+from d3sim.core.geodef import EulerIntrinsicOrder
+from d3sim.data.scene_def.base import CameraFieldTypes, CoordSystem, LidarFieldTypes, Object2d, Object3d, Pose, Scene, Sensor, Resource, BaseFrame, ALL_RESOURCE_LOADERS, ResourceLoader
 from d3sim.data.scene_def.camera import BasicCamera, BasicPinholeCamera
 import dask.dataframe as dd
 import numpy as np
@@ -18,7 +19,7 @@ from d3sim.data.scene_def.lidar import BasicLidar
 from cumm import tensorview as tv 
 import cv2
 
-from d3sim.core.ops.rotation import get_rotation_matrix_np
+from d3sim.core.ops.rotation import euler_to_rotmat_np, get_rotation_matrix_np
 
 class CameraName(enum.IntEnum):
     """Name of camera."""
@@ -163,19 +164,16 @@ class WaymoLidarResource(Resource):
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class WaymoCamera(BasicPinholeCamera):
     seg_label_rc: Resource[np.ndarray | None]
-    _seg_cache: np.ndarray | None = None
+
+    def get_field_np(self, field: CameraFieldTypes | str) -> np.ndarray | None:
+        if field == CameraFieldTypes.SEGMENTATION and not self.has_field(field):
+            self._load_seg()
+        return super().get_field_np(field)
 
     def _load_seg(self):
-        if self._seg_cache is not None:
-            return self._seg_cache
         segs = self.seg_label_rc.data
-        if segs is None:
-            return None
-        return segs
-
-    @property
-    def segmentation(self):
-        return self._load_seg()
+        if segs is not None:
+            self.homogeneous_fields[CameraFieldTypes.SEGMENTATION] = segs
 
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class WaymoLidar(BasicLidar):
@@ -185,8 +183,6 @@ class WaymoLidar(BasicLidar):
 
     beam_inclination: np.ndarray
     # xyz, inten, mask
-    _point_load_cache: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
-    _seg_cache: np.ndarray | None = None
 
     _tmp_pixel_pose_transform: np.ndarray = dataclasses.field(default_factory=lambda: np.eye(4))
 
@@ -196,55 +192,26 @@ class WaymoLidar(BasicLidar):
         self._tmp_pixel_pose_transform = world2new @ self._tmp_pixel_pose_transform
         return self
 
-    def _load_xyz_inten_mask(self):
-        enable = False
-        if self._point_load_cache is not None:
-            return self._point_load_cache
-        with tv.measure_and_print_cpu("load_xyz_inten_mask", enable=enable):
-            veh_to_world = torch.from_numpy(self.pose.vehicle_to_world.astype(np.float32)).to(D3SIM_DEFAULT_DEVICE)
-            extrinsic = torch.from_numpy(self.pose.to_vehicle.astype(np.float32)).to(D3SIM_DEFAULT_DEVICE)
-            ris = self.range_images_rc.data 
-            pixel_pose_data = self.point_pose_rc.data
-        with tv.measure_and_print_cpu("read rg", enable=enable):
-            inclination = torch.from_numpy(self.beam_inclination).to(D3SIM_DEFAULT_DEVICE)
-            ri_0 = torch.from_numpy(ris[0]).to(D3SIM_DEFAULT_DEVICE)
-            ri_1 = torch.from_numpy(ris[1]).to(D3SIM_DEFAULT_DEVICE)
-            pixel_pose: torch.Tensor | None = None
-            if self.id == f"lidar_{LaserName.TOP}": # TOP
-                pixel_pose = torch.from_numpy(pixel_pose_data).to(D3SIM_DEFAULT_DEVICE)
-            # breakpoint()
-            pixel_tr_np = self._tmp_pixel_pose_transform.astype(np.float32)
-        with tv.measure_and_print_cpu("range_image_to_point_cloud", enable=enable):
-            res_0, res_0_mask = range_image_to_point_cloud(ri_0, extrinsic, inclination, pixel_pose, veh_to_world, pixel_tr_np)
-            res_1, res_1_mask = range_image_to_point_cloud(ri_1, extrinsic, inclination, pixel_pose, veh_to_world, pixel_tr_np)
-        with tv.measure_and_print_cpu("post", enable=enable):
-            res = torch.cat([res_0, res_1], dim=0).cpu().numpy()
-            inten_0 = ri_0[..., 1].reshape(-1)
-            inten_1 = ri_1[..., 1].reshape(-1)
-            inten = torch.cat([inten_0, inten_1], dim=0).cpu().numpy()
-            mask = torch.cat([res_0_mask, res_1_mask], dim=0).cpu().numpy()
-        # breakpoint()
-        res_all = res, inten, mask
-        self._point_load_cache = res_all
-        return res_all
+    def get_field_np(self, field: LidarFieldTypes | str) -> np.ndarray | None:
+        if field in [LidarFieldTypes.POINT_CLOUD, LidarFieldTypes.INTENSITY, LidarFieldTypes.VALID_MASK]:
+            if not self.has_field(field):
+                self._load_xyz_inten_mask_v2()
+        elif field == LidarFieldTypes.SEGMENTATION:
+            if not self.has_field(field):
+                self._load_seg()
+        return super().get_field_np(field)
+
 
     def _load_xyz_inten_mask_v2(self):
         enable = False
-        if self._point_load_cache is not None:
-            return self._point_load_cache
         with tv.measure_and_print_cpu("load_xyz_inten_mask", enable=enable):
             ris = self.range_images_rc.data 
             pixel_pose_data = self.point_pose_rc.data
         with tv.measure_and_print_cpu("read rg", enable=enable):
-            # veh_to_world = torch.from_numpy(self.pose.vehicle_to_world.astype(np.float32)).to(D3SIM_DEFAULT_DEVICE)
-            # extrinsic = torch.from_numpy(self.pose.to_vehicle.astype(np.float32)).to(D3SIM_DEFAULT_DEVICE)
 
             inclination = torch.from_numpy(self.beam_inclination).to(D3SIM_DEFAULT_DEVICE)
-            # ri_0 = torch.from_numpy(ris[0]).to(D3SIM_DEFAULT_DEVICE)
-            # ri_1 = torch.from_numpy(ris[1]).to(D3SIM_DEFAULT_DEVICE)
             ris = np.stack([ris[0], ris[1]], axis=0)
             ris_th = torch.from_numpy(ris).to(D3SIM_DEFAULT_DEVICE)
-            # ris_th = torch.stack([ri_0, ri_1], dim=0)
 
             pixel_pose: torch.Tensor | None = None
             if self.id == f"lidar_{LaserName.TOP}": # TOP
@@ -254,54 +221,26 @@ class WaymoLidar(BasicLidar):
         with tv.measure_and_print_cpu("range_image_to_point_cloud", enable=enable):
             res, mask = range_image_to_point_cloud_v2(ris_th, self.pose.to_vehicle, 
                 inclination, pixel_pose, self.pose.vehicle_to_world, pixel_tr_np)
-            # res_1, mask = range_image_to_point_cloud_v2(ris_th[1], self.pose.to_vehicle, 
-            #     inclination, pixel_pose, veh_to_world, pixel_tr_np)
-
-            # res_0, res_0_mask = range_image_to_point_cloud(ri_0, extrinsic, inclination, pixel_pose, veh_to_world, pixel_tr_np)
-            # res_1, res_1_mask = range_image_to_point_cloud(ri_1, extrinsic, inclination, pixel_pose, veh_to_world, pixel_tr_np)
-            # res = torch.cat([res_0, res_1], dim=0)
-            # res_0, res_0_mask = range_image_to_point_cloud(ri_0, extrinsic, inclination, pixel_pose, veh_to_world, pixel_tr_np)
-            # res_1, res_1_mask = range_image_to_point_cloud(ri_1, extrinsic, inclination, pixel_pose, veh_to_world, pixel_tr_np)
         with tv.measure_and_print_cpu("post", enable=enable):
-            # resx = torch.cat([res_0, res_1], dim=0)
-            # print(torch.linalg.norm(resx - res))
-            # breakpoint()
-            # inten_0 = ri_0[..., 1].reshape(-1)
-            # inten_1 = ri_1[..., 1].reshape(-1)
-            # inten = torch.cat([inten_0, inten_1], dim=0).cpu().numpy()
             inten = ris[..., 1].reshape(-1)
             # mask = torch.cat([res_0_mask, res_1_mask], dim=0).cpu().numpy()
             res_all = res.cpu().numpy(), inten, mask.cpu().numpy()
-        self._point_load_cache = res_all
-        return res_all
+        # self._point_load_cache = res_all
+
+        self.homogeneous_fields[LidarFieldTypes.POINT_CLOUD] = res_all[0]
+        self.homogeneous_fields[LidarFieldTypes.INTENSITY] = res_all[1]
+        self.homogeneous_fields[LidarFieldTypes.VALID_MASK] = res_all[2]
+        return
 
     def _load_seg(self):
-        if self._seg_cache is not None:
-            return self._seg_cache
         segs = self.seg_label_rc.data
         if segs[0] is None or segs[1] is None:
             return None 
         seg_0 = segs[0].reshape(-1, 2)[:, 1]
         seg_1 = segs[1].reshape(-1, 2)[:, 1]
         seg = np.concatenate([seg_0, seg_1], axis=-1)
-        self._seg_cache = seg
+        self.homogeneous_fields[LidarFieldTypes.SEGMENTATION] = seg
         return seg
-
-    @property 
-    def xyz(self):
-        return self._load_xyz_inten_mask_v2()[0]
-
-    @property
-    def intensity(self):
-        return self._load_xyz_inten_mask_v2()[1]
-
-    @property
-    def mask(self):
-        return self._load_xyz_inten_mask_v2()[2]
-
-    @property
-    def segmentation(self):
-        return self._load_seg()
 
 
 @ALL_RESOURCE_LOADERS.register_no_key
@@ -537,6 +476,7 @@ def load_scene(scene_id: str, folder: str, cache_whole_in_memory: bool = True):
     lidar_pc_path = Path(f"{folder}/lidar/{scene_id}.parquet")
     lidar_pc_pose_path = Path(f"{folder}/lidar_pose/{scene_id}.parquet")
     lidar_seg_path = Path(f"{folder}/lidar_segmentation/{scene_id}.parquet")
+    cam_lidar_acc_path = Path(f"{folder}/camera_to_lidar_box_association/{scene_id}.parquet")
 
     cam_metadata = _read_camera_metadata(scene_id, folder)
     cam_pose = _read_cam_calib(scene_id, folder)
@@ -544,12 +484,13 @@ def load_scene(scene_id: str, folder: str, cache_whole_in_memory: bool = True):
     ego_poses = _read_pose(scene_id, folder)
     lidar_boxes = _read_all(scene_id, folder, 'lidar_box').compute()
     camera_boxes = _read_all(scene_id, folder, 'camera_box').compute()
+    cam_lidar_acc = _read_all(scene_id, folder, 'camera_to_lidar_box_association').compute()
 
     frame_id_to_frame: dict[str, BasicFrame] = {}
     for idx, row in ego_poses.iterrows():
         frame_id = row['key.frame_timestamp_micros']
         world_to_veh = row[
-            '[VehiclePoseComponent].world_from_vehicle.transform'].reshape(4, 4)
+            '[VehiclePoseComponent].world_from_vehicle.transform'].reshape(4, 4).copy()
         frame = BasicFrame(id=str(frame_id),
                       timestamp=frame_id,
                       pose=Pose(to_world=world_to_veh))
@@ -570,8 +511,16 @@ def load_scene(scene_id: str, folder: str, cache_whole_in_memory: bool = True):
         calib_row = cam_name_to_calib_row[camera_name]
 
         sensor_to_vehicle = calib_row[
-            '[CameraCalibrationComponent].extrinsic.transform'].reshape(4, 4)
-        # sensor_to_vehicle = np.linalg.inv(vehicle_to_sensor)
+            '[CameraCalibrationComponent].extrinsic.transform'].reshape(4, 4).copy()
+        # waymo camera coord: https://github.com/lkk688/WaymoObjectDetection/blob/master/README.md
+        # map to opencv camera coord
+        sensor_to_vehicle_x = sensor_to_vehicle[:3, 0].copy()
+        sensor_to_vehicle_y = sensor_to_vehicle[:3, 1].copy()
+        sensor_to_vehicle_z = sensor_to_vehicle[:3, 2].copy()
+
+        sensor_to_vehicle[:3, 2] = sensor_to_vehicle_x
+        sensor_to_vehicle[:3, 1] = -sensor_to_vehicle_z
+        sensor_to_vehicle[:3, 0] = -sensor_to_vehicle_y
         vehicle_to_world = frame.pose.to_world
         cam_to_world = vehicle_to_world @ sensor_to_vehicle
         fu = calib_row['[CameraCalibrationComponent].intrinsic.f_u']
@@ -624,7 +573,7 @@ def load_scene(scene_id: str, folder: str, cache_whole_in_memory: bool = True):
         laser_name = row['key.laser_name']
         calib_row = lidar_name_to_calib_row[laser_name]
         sensor_to_vehicle = calib_row[
-            '[LiDARCalibrationComponent].extrinsic.transform'].reshape(4, 4)
+            '[LiDARCalibrationComponent].extrinsic.transform'].reshape(4, 4).copy()
         vehicle_to_world = frame.pose.to_world
         # sensor_to_vehicle = np.linalg.inv(vehicle_to_sensor)
         sensor_to_world = vehicle_to_world @ sensor_to_vehicle
@@ -710,6 +659,18 @@ def load_scene(scene_id: str, folder: str, cache_whole_in_memory: bool = True):
             acceleration=np.array([acceleration_x, acceleration_y, acceleration_z], dtype=np.float32))
         o3d = Object3d(track_id=obj_id, type=type, pose=pose, size=np.array([size_x, size_y, size_z], dtype=np.float32))
         frame.objects.append(o3d)
+    frame_id_to_cam2lidar = {}
+    for idx, row in cam_lidar_acc.iterrows():
+        frame_id = row['key.frame_timestamp_micros']
+        cam_name = row['key.camera_name']
+        camera_object_id = row['key.camera_object_id']
+        lidar_object_id = row['key.laser_object_id']
+        if frame_id not in frame_id_to_cam2lidar:
+            frame_id_to_cam2lidar[frame_id] = {}
+        if cam_name not in frame_id_to_cam2lidar[frame_id]:
+            frame_id_to_cam2lidar[frame_id][cam_name] = {}
+        frame_id_to_cam2lidar[frame_id][cam_name][camera_object_id] = lidar_object_id
+
     for idx, row in camera_boxes.iterrows():
         frame_id = row['key.frame_timestamp_micros']
         frame = frame_id_to_frame[frame_id]
@@ -723,6 +684,9 @@ def load_scene(scene_id: str, folder: str, cache_whole_in_memory: bool = True):
         cam_name = row[f"key.camera_name"]
         bbox_xywh = np.array([center_x - size_x / 2, center_y - size_y / 2, size_x, size_y], dtype=np.float32)
         obj_2d = Object2d(track_id=obj_id, type=type, bbox_xywh=bbox_xywh)
+        if frame_id in frame_id_to_cam2lidar and cam_name in frame_id_to_cam2lidar[frame_id]:
+            if obj_id in frame_id_to_cam2lidar[frame_id][cam_name]:
+                obj_2d.track_id_3d = frame_id_to_cam2lidar[frame_id][cam_name][obj_id]
         cam = frame.get_camera_by_id(f"camera_{cam_name}")
         cam.objects.append(obj_2d)
 

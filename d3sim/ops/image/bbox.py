@@ -26,7 +26,7 @@ def create_image_bbox_mask(bbox_xywh: torch.Tensor, image_size_wh: tuple[int, in
     int pixel_y = i / $width;
     int pixel_x = i % $width;
     bool inside = false;
-    auto box_ptr = op::reinterpret_cast_array_nd<float, 4>($bbox_xywh);
+    auto box_ptr = op::reinterpret_cast_array_nd<4>($bbox_xywh);
     auto box_pad = $bbox_pad;
     for (int j = 0; j < $num_bboxes; ++j){{
         auto box = box_ptr[j];

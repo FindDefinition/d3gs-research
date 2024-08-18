@@ -52,7 +52,7 @@ def range_image_to_point_cloud(ri: torch.Tensor, extrinsic: torch.Tensor, inclin
     int x_idx = pixel_idx % $width;
     auto ri_val = $ri[i * $channel + 0];
 
-    auto ext_matrix = op::reinterpret_cast_array_nd<float, 4, 4>($extrinsic)[batch_idx];
+    auto ext_matrix = op::reinterpret_cast_array_nd<4, 4>($extrinsic)[batch_idx];
     auto az_correction = math_op_t::atan2(ext_matrix[1][0], ext_matrix[0][0]);
     auto ratios = (($width - x_idx) - 0.5f) / float($width);
     auto azimuth = (ratios * 2 - 1) * M_PI - az_correction;
@@ -89,11 +89,11 @@ def range_image_to_point_cloud(ri: torch.Tensor, extrinsic: torch.Tensor, inclin
             pixel_pose_transform = pixel_pose_transform.astype(np.float32)
         code.raw(f"""
         auto pixel_pose_transform_mat = $pixel_pose_transform; // captured array in metal is constant, which doesn't well supported, so convert it to thread
-        auto pixel_pose_6 = op::reinterpret_cast_array_nd<float, 6>($pixel_pose)[i];
+        auto pixel_pose_6 = op::reinterpret_cast_array_nd<6>($pixel_pose)[i];
         auto pixel_pose_rot = RotationMath::euler_to_rotmat_zyx(pixel_pose_6[0], pixel_pose_6[1], pixel_pose_6[2]);
         tv::array<float, 3> pixel_pose_xyz = {{pixel_pose_6[3], pixel_pose_6[4], pixel_pose_6[5]}};
         auto pixel_pose_mat = pixel_pose_rot.op<op::transform_matrix>(pixel_pose_xyz);
-        auto frame_pose_mat = op::reinterpret_cast_array_nd<float, 4, 4>($frame_pose)[batch_idx];
+        auto frame_pose_mat = op::reinterpret_cast_array_nd<4, 4>($frame_pose)[batch_idx];
         auto final_mat = frame_pose_mat.op<op::inverse>().op<op::mm_ttt>(pixel_pose_transform_mat.op<op::mm_ttt>(pixel_pose_mat.op<op::mm_ttt>(ext_matrix)));        
         """)
     else:
@@ -102,7 +102,7 @@ def range_image_to_point_cloud(ri: torch.Tensor, extrinsic: torch.Tensor, inclin
         """)
     code.raw(f"""
     auto xyz_res = xyz.op<op::transform_3d>(final_mat);
-    op::reinterpret_cast_array_nd<float, 3>($res)[i] = xyz_res;
+    op::reinterpret_cast_array_nd<3>($res)[i] = xyz_res;
     """)
     name = f"waymo_range_image_to_point_cloud_{pixel_pose is None}_{inclination.shape[1] == height}"
     INLINER.kernel_1d(name, num_element, 0, code)
@@ -187,12 +187,12 @@ def range_image_to_point_cloud_v2(ri: torch.Tensor, extrinsic: np.ndarray, incli
             pixel_pose_transform = pixel_pose_transform.astype(np.float32)
         code.raw(f"""
         auto pixel_pose_transform_mat = $pixel_pose_transform; // captured array in metal is constant, which doesn't well supported, so convert it to thread
-        auto pixel_pose_6 = op::reinterpret_cast_array_nd<float, 6>($pixel_pose)[pixel_idx];
+        auto pixel_pose_6 = op::reinterpret_cast_array_nd<6>($pixel_pose)[pixel_idx];
         auto pixel_pose_rot = RotationMath::euler_to_rotmat_zyx(pixel_pose_6[0], pixel_pose_6[1], pixel_pose_6[2]);
         tv::array<float, 3> pixel_pose_xyz = {{pixel_pose_6[3], pixel_pose_6[4], pixel_pose_6[5]}};
         auto pixel_pose_mat = pixel_pose_rot.op<op::transform_matrix>(pixel_pose_xyz);
         auto frame_pose_mat = $frame_pose;
-        // auto frame_pose_mat = op::reinterpret_cast_array_nd<float, 4, 4>($frame_pose)[batch_idx];
+        // auto frame_pose_mat = op::reinterpret_cast_array_nd<4, 4>($frame_pose)[batch_idx];
         auto final_mat = frame_pose_mat.op<op::inverse>().op<op::mm_ttt>(pixel_pose_transform_mat.op<op::mm_ttt>(pixel_pose_mat.op<op::mm_ttt>(ext_matrix)));        
         """)
     else:
@@ -201,7 +201,7 @@ def range_image_to_point_cloud_v2(ri: torch.Tensor, extrinsic: np.ndarray, incli
         """)
     code.raw(f"""
     auto xyz_res = xyz.op<op::transform_3d>(final_mat);
-    op::reinterpret_cast_array_nd<float, 3>($res)[i] = xyz_res;
+    op::reinterpret_cast_array_nd<3>($res)[i] = xyz_res;
     """)
     name = f"waymo_range_image_to_point_cloud_v2_{pixel_pose is None}_{inclination.shape[0] == height}"
     INLINER.kernel_1d(name, num_element, 0, code)

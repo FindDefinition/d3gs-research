@@ -9,11 +9,13 @@ from cumm import tensorview as tv
 
 
 @observe_function
-def points_in_which_3d_box(points: torch.Tensor, box3d: torch.Tensor, box3d_scale: np.ndarray | None = None) -> torch.Tensor:
+def points_in_which_3d_box(points: torch.Tensor, box3d: torch.Tensor, box3d_scale: np.ndarray | None = None, box_ids: torch.Tensor | None = None) -> torch.Tensor:
     point_stride = points.stride(0)
     num = points.shape[0]
     num_box = box3d.shape[0]
     assert box3d.ndim == 2 and box3d.shape[1] == 7 and box3d.dtype == torch.float32
+    if box_ids is not None:
+        assert box_ids.shape[0] == box3d.shape[0]
     if box3d_scale is None:
         box3d_scale = np.ones([3], np.float32)
     else:
@@ -25,15 +27,16 @@ def points_in_which_3d_box(points: torch.Tensor, box3d: torch.Tensor, box3d_scal
     res = torch.empty([points.shape[0]], dtype=torch.int32, device=points.device)
 
     INLINER.kernel_1d(
-        f"create_image_bbox_mask", num, 0, f"""
+        f"create_image_bbox_mask_{box_ids is None}", num, 0, f"""
     namespace op = tv::arrayops;
     using math_op_t = op::MathScalarOp<float>;
-    auto point = op::reinterpret_cast_array_nd<float, 3>($points + i * $point_stride)[0];
-    auto box_ptr = op::reinterpret_cast_array_nd<float, 8>($box3d_sincos);
+    auto point = op::reinterpret_cast_array_nd<3>($points + i * $point_stride)[0];
+    auto box_ptr = op::reinterpret_cast_array_nd<8>($box3d_sincos);
     auto box_scale = $box3d_scale;
     int index = -1;
     for (int j = 0; j < $num_box; ++j){{
         auto box = box_ptr[j];
+        auto box_id = {"$box_ids[j]" if box_ids is not None else "j"};
         auto center = op::slice<0, 3>(box);
         auto size = op::slice<3, 6>(box) * box_scale / 2.0f; // TODO calc this outside
         auto sin_val = box[6];

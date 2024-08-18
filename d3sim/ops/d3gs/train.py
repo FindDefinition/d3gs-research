@@ -12,7 +12,7 @@ from d3sim.core import dataclass_dispatch as dataclasses
 from d3sim.ops.d3gs.data.load import load_scene_info_and_first_cam, Scene, original_cam_to_d3sim_cam
 from d3sim.ops.d3gs.render import CameraBundle, GaussianSplatOp, GaussianSplatOutput, rasterize_gaussians
 from d3sim.ops.d3gs.strategy import GaussianTrainState, GaussianStrategyBase, reset_param_in_optim
-from d3sim.ops.d3gs.losses import l1_loss, ssim
+from d3sim.ops.d3gs.losses import SSimLoss, SSimLossV2, SSimLossV3, l1_loss, ssim
 from cumm import tensorview as tv
 from d3sim.ops.d3gs.tools import create_origin_3dgs_optimizers, init_original_3dgs_model
 import contextlib 
@@ -49,7 +49,10 @@ def cams_to_cam_bundle(cams: list[BasicPinholeCamera]):
     ppoints = np.stack([cam.principal_point for cam in cams], axis=0).reshape(-1, 2)
     focal_xy_ppoints = np.concatenate([focal_xys, ppoints], axis=1)
     focal_xy_ppoints_th = torch.from_numpy(np.ascontiguousarray(focal_xy_ppoints)).to(D3SIM_DEFAULT_DEVICE)
-    cam_bundle = CameraBundle(focal_xy_ppoints_th, cams[0].image_shape_wh, None, cam2world_Ts_th)
+    for cam in cams:
+        assert cam.frame_local_id is not None
+    frame_local_ids = torch.tensor([cam.frame_local_id for cam in cams], dtype=torch.int32, device=D3SIM_DEFAULT_DEVICE)
+    cam_bundle = CameraBundle(focal_xy_ppoints_th, cams[0].image_shape_wh, frame_local_ids, cam2world_Ts_th)
     return cam_bundle
 
 class Trainer:
@@ -73,13 +76,14 @@ class Trainer:
         self.strategy_ref = StrategyRef(verbose=True)
 
         self.gauss_op = GaussianSplatOp(cfg.model.op)
-
+        
         self.use_strategy_ref = False
         self.engine.register_period_event("log", 1000, self._on_log)
         self.engine.register_period_event("up_sh", 1000 // cfg.train.batch_size, self._on_up_sh_degree_log)
         self.engine.register_base_event(TrainEventType.BeginIteration, self._on_iter_start)
-        self.engine.register_period_event("update_gs", cfg.train.strategy.refine_every, self._on_refine_gs)
-        self.engine.register_period_event("reset_opacity", cfg.train.strategy.reset_opacity_every, self._on_reset_opacity)
+        if not self.use_strategy_ref:
+            self.engine.register_period_event("update_gs", cfg.train.strategy.refine_every, self._on_refine_gs)
+            self.engine.register_period_event("reset_opacity", cfg.train.strategy.reset_opacity_every, self._on_reset_opacity)
         # self.engine.register_period_event("do_eval", 2000, self._on_reset_opacity)
 
 
@@ -124,6 +128,9 @@ class Trainer:
             TimeRemainingColumn(),
 
         )
+        ssim_loss_custom = SSimLoss(11, 3)
+        ssim_loss_custom_v2 = SSimLossV3(11, 3)
+
         ssim_loss = StructuralSimilarityIndexMeasure(data_range=1.0).to(D3SIM_DEFAULT_DEVICE)
         verbose = False
         total = self.cfg.train.iterations
@@ -164,20 +171,21 @@ class Trainer:
                 with measure_and_print_torch(f"fwd-{self.model.xyz.shape[0]}", enable=verbose):
                     # with tv.measure_and_print("rasterize"):
                     out = rasterize_gaussians(self.model, cam_bundle, op=self.gauss_op, training=True, uv_grad_holder=uv_grad_holder)
+                with measure_and_print_torch(f"fwd-loss-{self.model.xyz.shape[0]}", enable=verbose):
+
                     assert ev.step_ctx_value is not None 
                     ev.step_ctx_value.output = out
                     color = out.color
                     if not self.cfg.model.op.use_nchw:
                         color = out.color.permute(0, 3, 1, 2)
                     Ll1 = l1_loss(color, gt_image)
-
+                    # WARNING: ssim loss in mps is very slow. 40ms (batch_size=8) in m3.
                     loss = (1.0 - self.cfg.train.lambda_dssim) * Ll1 + self.cfg.train.lambda_dssim * (1.0 - ssim(color, gt_image))
                     # with tv.measure_and_print("rasterize-bwd"):
                 with measure_and_print_torch(f"bwd-{self.model.xyz.shape[0]}", enable=verbose):
 
                     loss.backward()
                 duv = uv_grad_holder.grad
-                uv_grad_holder.grad = None
                 ev.step_ctx_value.loss = loss
                 assert duv is not None 
                 with measure_and_print_torch("optim", enable=verbose):
@@ -194,8 +202,12 @@ class Trainer:
 
                 if (ev.cur_step + 1) < self.cfg.train.strategy.refine_stop_iter:
                     if not self.use_strategy_ref:
-                        for i in range(self.cfg.train.batch_size):
-                            self.strategy.update_v2(self.train_state, out.select_batch(i), duv[i], batch_size=self.cfg.train.batch_size)
+                        # print(uv_grad_holder.shape, )
+                        # for i in range(self.cfg.train.batch_size):
+                        #     self.strategy.update_v2(self.train_state, out.select_batch(i), duv[i], batch_size=self.cfg.train.batch_size)
+                        self.strategy.update_v2_batch(self.train_state, out, duv)
+                        # print(torch.linalg.norm(self.train_state.duv_ndc_length - self.train_state_ref.duv_ndc_length))
+                        # breakpoint()
                     # self.strategy.update(self.train_state_ref, out, duv)
                     # print(torch.linalg.norm(self.train_state_ref.duv_ndc_length - self.train_state.duv_ndc_length))
                     # print(torch.linalg.norm(self.train_state_ref.count - self.train_state.count))
@@ -219,10 +231,16 @@ class Trainer:
                             "radii": out.radii,
                         }
                     )
+                    # if ev.cur_step + 1 == 600:
+                    #     print(torch.linalg.norm(self.train_state_ref.duv_ndc_length - self.train_state.duv_ndc_length))
+                    #     print(torch.linalg.norm(self.train_state_ref.count - self.train_state.count))
+                    #     self.strategy.refine_gs(self.model, self.optims, self.train_state, ev.cur_step + 1) 
+                    #     breakpoint()
                     for k, p in params.items():
                         setattr(self.model, k, p)
                     for k, p in state_dict.items():
                         setattr(self.train_state_ref, k, p)
+                uv_grad_holder.grad = None
 
                 save_root = PACKAGE_ROOT / "build/debug"
                 with torch.no_grad():
@@ -317,9 +335,10 @@ class Trainer:
 
 
 def __main():
-
-    path = "/Users/yanyan/Downloads/360_v2/garden"
-    path = "/root/autodl-tmp/garden_scene/garden"
+    if IsAppleSiliconMacOs:
+        path = "/Users/yanyan/Downloads/360_v2/garden"
+    else:
+        path = "/root/autodl-tmp/garden_scene/garden"
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
@@ -329,8 +348,8 @@ def __main():
     points = scene_info.point_cloud.points
     if IsAppleSiliconMacOs:
         cfg = config_def.Config(
-            model=config_def.Model(config_def.GaussianSplatConfig(enable_32bit_sort=False, gaussian_std_sigma=2.0)),
-            train=config_def.Train(iterations=7000, batch_size=2)
+            model=config_def.Model(config_def.GaussianSplatConfig(enable_32bit_sort=True, gaussian_std_sigma=3.0, verbose=False)),
+            train=config_def.Train(iterations=7000, batch_size=8)
         )
     else:
         cfg = config_def.Config(

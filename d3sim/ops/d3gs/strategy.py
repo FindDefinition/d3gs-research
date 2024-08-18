@@ -138,7 +138,55 @@ class GaussianStrategyBase:
                 # normalize radii to [0, 1] screen space
                 radii / float(max(width, height)),
             )
-        
+
+    @torch.no_grad()
+    def update_v2_batch(self, state: GaussianTrainState, out: GaussianSplatOutput, duv: torch.Tensor):
+        width, height = out.image_shape_wh
+        max_width_height = max(width, height)
+        N = duv.shape[1]
+        assert out.radii is not None 
+        duv_ndc_length = state.duv_ndc_length
+        batch_size = duv.shape[0]
+        count = state.count
+        radii = out.radii
+        assert duv.ndim == 3 and radii.ndim == 2
+        max_radii = state.max_radii
+        need_refine_scale2d = self.cfg.refine_scale2d_stop_iter > 0
+        assert N == radii.shape[1]
+        assert N == state.duv_ndc_length.shape[0]
+        assert N == count.shape[0]
+        assert N == max_radii.shape[0]
+        INLINER.kernel_1d(f"grow gs update_batch_{need_refine_scale2d}", N, 0, f"""
+        namespace op = tv::arrayops;
+        using math_op_t = tv::arrayops::MathScalarOp<float>;
+        float duv_length_acc = 0.0f;
+        float cnt_acc = 0.0f;
+
+        auto max_radii_val = $max_radii[i];
+
+        for (int j = 0; j < $batch_size; ++j){{
+            auto i_with_batch = j * $N + i;
+            tv::array<float, 2> duv_val = op::reinterpret_cast_array_nd<2>($duv)[i_with_batch];
+            auto radii_val = $radii[i_with_batch];
+            duv_val[0] *= 0.5f * $width * $batch_size;
+            duv_val[1] *= 0.5f * $height * $batch_size;
+            auto duv_length = duv_val.op<op::length>();
+            if (radii_val > 0){{
+                duv_length_acc += duv_length;
+                cnt_acc += 1;
+                if ({pccm.boolean(need_refine_scale2d)}){{
+                    max_radii_val = math_op_t::max(max_radii_val, radii_val / float($max_width_height));
+                    // max_radii[i] = max_radii_val;
+                }}
+            }}
+        }}
+        $duv_ndc_length[i] += duv_length_acc;
+        $count[i] += cnt_acc;
+        if ({pccm.boolean(need_refine_scale2d)}){{
+            $max_radii[i] = max_radii_val;
+        }}
+        """)
+
     @torch.no_grad()
     def update_v2(self, state: GaussianTrainState, out: GaussianSplatOutput, duv: torch.Tensor, batch_size: int = 1):
         width, height = out.image_shape_wh

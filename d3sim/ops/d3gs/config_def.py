@@ -68,7 +68,7 @@ class GaussianSplatConfig:
     depth_32bit_prec: float = 0.001
 
     enable_32bit_sort: bool = False
-    render_depth: bool = True
+    render_depth: bool = False
     bg_color: np.ndarray = dataclasses.field(
         default_factory=lambda: np.zeros((3), np.float32))
     scale_global: float = 1.0
@@ -86,7 +86,7 @@ class GaussianSplatConfig:
 
     use_int64_tile_touched: bool = False
 
-    _bg_color_device: torch.Tensor | None = None
+    # _bg_color_device: torch.Tensor | None = None
 
     @property 
     def num_channels(self):
@@ -96,10 +96,10 @@ class GaussianSplatConfig:
     def block_size(self):
         return self.tile_size[0] * self.tile_size[1]
 
-    def get_bg_color_device(self, device: torch.device):
-        if self._bg_color_device is None:
-            self._bg_color_device = torch.from_numpy(self.bg_color).to(device)
-        return self._bg_color_device
+    # def get_bg_color_device(self, device: torch.device):
+    #     if self._bg_color_device is None:
+    #         self._bg_color_device = torch.from_numpy(self.bg_color).to(device)
+    #     return self._bg_color_device
 
 
 @dataclasses.dataclass

@@ -45,18 +45,22 @@ def sync():
         torch.cuda.synchronize()
 
 def _load_model_and_cam():
-    data_path = "/Users/yanyan/Downloads/360_v2/garden"
-    data_path = "/root/autodl-tmp/garden_scene/garden"
-    path = "/Users/yanyan/Downloads/models/garden/point_cloud/iteration_30000/point_cloud.ply"
-    path = "/root/autodl-tmp/garden_model/garden/point_cloud/iteration_30000/point_cloud.ply"
+    if IsAppleSiliconMacOs:
+        data_path = "/Users/yanyan/Downloads/360_v2/garden"
+        path = "/Users/yanyan/Downloads/models/garden/point_cloud/iteration_30000/point_cloud.ply"
+    else:
+        path = "/root/autodl-tmp/garden_model/garden/point_cloud/iteration_30000/point_cloud.ply"
+        data_path = "/root/autodl-tmp/garden_scene/garden"
 
     return load_model_and_cam(data_path, path)
 
 def _load_model_and_2cam():
-    data_path = "/Users/yanyan/Downloads/360_v2/garden"
-    data_path = "/root/autodl-tmp/garden_scene/garden"
-    path = "/Users/yanyan/Downloads/models/garden/point_cloud/iteration_30000/point_cloud.ply"
-    path = "/root/autodl-tmp/garden_model/garden/point_cloud/iteration_30000/point_cloud.ply"
+    if IsAppleSiliconMacOs:
+        data_path = "/Users/yanyan/Downloads/360_v2/garden"
+        path = "/Users/yanyan/Downloads/models/garden/point_cloud/iteration_30000/point_cloud.ply"
+    else:
+        path = "/root/autodl-tmp/garden_model/garden/point_cloud/iteration_30000/point_cloud.ply"
+        data_path = "/root/autodl-tmp/garden_scene/garden"
 
     return load_model_and_2_cam(data_path, path)
 
@@ -82,9 +86,12 @@ def _main_bwd():
     cfg = GaussianSplatConfig()
     fwd = GaussianSplatOp(cfg)
     mod.set_requires_grad(True)
-    grad_path = "/root/Projects/3dgs/gaussian-splatting/grads.pt"
-    # grad_path = "/Users/yanyan/grads.pt"
-    check_grad: bool = False
+    if IsAppleSiliconMacOs:
+        grad_path = "/Users/yanyan/grads.pt"
+    else:
+        grad_path = "/root/Projects/3dgs/gaussian-splatting/grads.pt"
+    # 
+    check_grad: bool = True
     if check_grad:
         grads = torch.load(grad_path, map_location=D3SIM_DEFAULT_DEVICE)
 
@@ -119,7 +126,8 @@ def _main_bwd():
             dout = torch.rand(out_color.shape, device=out_color.device)
 
         t = time.time()
-
+        if not op.is_nchw:
+            dout = dout.permute(1, 2, 0)
         out_color.backward(dout)
         sync()
         print("BWD", time.time() - t)
@@ -164,6 +172,7 @@ def _main():
         res = rasterize_gaussians(mod, cam_bundle, op=op)
         assert res is not None 
         out_color = res.color # [N, C, H, W]
+        assert res.depth is None
         if j == 0:
             if not op.is_nchw:
                 # to nchw

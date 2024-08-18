@@ -113,11 +113,9 @@ class BasicFrame(BaseFrame):
 
     def get_point_in_which_3d_box(self, lidar_id_or_pc: str | np.ndarray | torch.Tensor):
         if isinstance(lidar_id_or_pc, str):
-            # lidar = self.get_lidar_by_id(lidar_id_or_pc)
             lidar_xyz_th = self.get_lidar_xyz_raw(lidar_id_or_pc, CoordSystem.VEHICLE)
         else:
             lidar_xyz_th = np_to_torch_dev(lidar_id_or_pc)
-        # objects = self.get_objects_by_source()
         box3d = torch.from_numpy(self.get_box3d_np()).to(D3SIM_DEFAULT_DEVICE)
         res = points_in_which_3d_box(lidar_xyz_th, box3d)
         return res

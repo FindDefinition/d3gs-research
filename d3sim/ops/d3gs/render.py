@@ -79,16 +79,16 @@ class GaussianSplatOutput(DataClassWithArrayCheck):
 
     @property
     def image_shape_wh(self) -> tuple[int, int]:
-        return (self.T.shape[1], self.T.shape[0])
+        return (self.T.shape[2], self.T.shape[1])
 
     def select_batch(self, batch_idx: int):
         return GaussianSplatOutput(
-            custom_features=None if self.custom_features is None else self.custom_features[batch_idx],
-            T=self.T[batch_idx],
-            color=self.color[batch_idx],
-            depth=None if self.depth is None else self.depth[batch_idx],
-            n_contrib=None if self.n_contrib is None else self.n_contrib[batch_idx],
-            radii=None if self.radii is None else self.radii[batch_idx],
+            custom_features=None if self.custom_features is None else self.custom_features[batch_idx:batch_idx + 1],
+            T=self.T[batch_idx:batch_idx + 1],
+            color=self.color[batch_idx:batch_idx + 1],
+            depth=None if self.depth is None else self.depth[batch_idx:batch_idx + 1],
+            n_contrib=None if self.n_contrib is None else self.n_contrib[batch_idx:batch_idx + 1],
+            radii=None if self.radii is None else self.radii[batch_idx:batch_idx + 1],
         )
 
 
@@ -729,6 +729,7 @@ class GaussianSplatOp:
         custom_feat_use_smem = num_custom_feat <= 16
         if grad is not None:
             drgb = grad.drgb
+            assert drgb.is_contiguous(), "drgb must be contiguous"
             dT = grad.dT
             ddepth_th = grad.ddepth
             # assert drgb.numel() == width * height * 3
@@ -1769,7 +1770,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         else:
             cam_bundle = camera_params
             focal_xy_ppoint = None 
-        with tv.measure_and_print("FWD-all-torch-1", enable=enable_verbose):
+        with measure_and_print_torch("FWD-all-torch-1", enable=enable_verbose):
 
             model = model_cls(
                 xyz=xyz,
@@ -1782,9 +1783,9 @@ class _RasterizeGaussians(torch.autograd.Function):
                 instance_id=instance_id,
                 act_applied=True,
             )
-        with tv.measure_and_print("FWD-all-torch", enable=enable_verbose):
+        with measure_and_print_torch("FWD-all-torch", enable=enable_verbose):
             out, fwd_ctx = op.forward(model, cam_bundle, training, instance2world_T, custom_features)
-        with tv.measure_and_print("FWD-all-torch-2", enable=enable_verbose):
+        with measure_and_print_torch("FWD-all-torch-2", enable=enable_verbose):
 
             if fwd_ctx is not None:
                 ctx.save_for_backward(
@@ -1840,8 +1841,12 @@ class _RasterizeGaussians(torch.autograd.Function):
         if len(ctx.saved_tensors) == 0:
             return (None, ) * 17
         op: GaussianSplatOp = ctx.op
+        if not drgb.is_contiguous():
+            drgb = drgb.contiguous()
+        if dcustom_features is not None and not dcustom_features.is_contiguous():
+            dcustom_features = dcustom_features.contiguous()
 
-        with tv.measure_and_print("BWD-all-torch", enable=False):
+        with tv.measure_and_print("BWD-torch-prep", enable=False):
             out = GaussianSplatOutput(
                 n_contrib=ctx.saved_tensors[-5],
                 color=ctx.saved_tensors[-4],

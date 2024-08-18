@@ -43,7 +43,7 @@ def downsample_indices(points: torch.Tensor, voxel_size: float, hash_scale: floa
         // we can use 21bit for x and y, so we shift 20bit here.
         xc = (math_op_t::floor(($points[i * stride + 0]) / (vsize))) + (1u << 20);
         yc = (math_op_t::floor(($points[i * stride + 1]) / (vsize))) + (1u << 20);
-        // we can only use 20bit in apple metal, so we shift 19bit here,
+        // we can only use 20bit for z in apple metal, so we shift 19bit here,
         zc = (math_op_t::floor(($points[i * stride + 2]) / (vsize))) + (1u << 19);
         table.insert({{xc, yc, zc}}, int(i));
         """)
