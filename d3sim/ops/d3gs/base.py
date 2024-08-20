@@ -1,6 +1,6 @@
 import enum
 import math
-from typing import Annotated
+from typing import Annotated, Type
 
 from d3sim.core import dataclass_dispatch as dataclasses
 from d3sim.core.pytorch.hmt import HomogeneousTensor
@@ -17,6 +17,180 @@ class GaussianCoreFields(enum.Enum):
     SCALE = "scale"
     RGB = "rgb"
 
+def get_qualname_of_type(klass: Type) -> str:
+    module = klass.__module__
+    if module == 'builtins':
+        return klass.__qualname__  # avoid outputs like 'builtins.str'
+    return module + '.' + klass.__qualname__
+
+class GaussianModelProxyBase(abc.ABC):
+    def __init__(self, model: "GaussianModelBase", code: pccm.FunctionCode, gaussian_idx: str, batch_size: int, is_bwd: bool = False):
+        self._model = model 
+        self._code = code 
+        self._gaussian_idx = gaussian_idx
+        self._batch_size = batch_size
+        self._is_bwd = is_bwd
+        self._unique_id = get_qualname_of_type(type(self))
+
+    def get_unique_id(self):
+        return self._unique_id
+
+    @abc.abstractmethod
+    def read_field(self, field: GaussianCoreFields, 
+            out: str, normed_dir: str = ""): ...
+
+    @abc.abstractmethod
+    def prepare_field_proxy(self): ...
+
+    @abc.abstractmethod
+    def accumulate_field_grad(self, field: GaussianCoreFields, 
+            out: str, grad: str, normed_dir: str = "", normed_dir_grad: str = ""): ...
+    
+    @abc.abstractmethod
+    def save_accumulated_grad(self): ...
+
+class GaussianModelProxyOrigin(GaussianModelProxyBase):
+    def read_field(self, field: GaussianCoreFields, 
+            out: str, normed_dir: str = ""):
+        """Write code segment to get field from model ptr.
+        """
+        has_color_base = self._model.color_sh_base is not None
+        cur_degree = self._model.cur_sh_degree
+        max_degree = self._model.color_sh_degree
+        if field == GaussianCoreFields.XYZ:
+            self._code.raw(f"""
+            auto {out} = op::reinterpret_cast_array_nd<3>(xyz_ptr)[{self._gaussian_idx}];
+            """)
+        elif field == GaussianCoreFields.QUATERNION_XYZW:
+            self._code.raw(f"""
+            auto {out}_raw = op::reinterpret_cast_array_nd<4>(quaternion_xyzw_ptr)[{self._gaussian_idx}];
+            auto {out} = {out}_raw.op<op::{self._model.fused_quaternion_xyzw_act_op[0]}>();
+            """)
+        elif field == GaussianCoreFields.SCALE:
+            self._code.raw(f"""
+            auto {out}_raw = op::reinterpret_cast_array_nd<3>(scale_ptr)[{self._gaussian_idx}];
+            auto {out} = {out}_raw.op<op::{self._model.fused_scale_act_op[0]}>();
+            """)
+        elif field == GaussianCoreFields.OPACITY:
+            self._code.raw(f"""
+            auto {out}_raw = op::reinterpret_cast_array_nd<1>(opacity_ptr)[{self._gaussian_idx}];
+            auto {out} = {out}_raw.op<op::{self._model.fused_opacity_act_op[0]}>()[0];
+            """)
+
+        elif field == GaussianCoreFields.RGB:
+            if not self._is_bwd:
+                assert normed_dir != ""
+                self._code.raw(f"""
+                auto sh_ptr = op::reinterpret_cast_array_nd<3>(color_sh_ptr) + {self._gaussian_idx} * {(max_degree + 1) * (max_degree + 1) - has_color_base};
+                """)
+                if has_color_base:
+                    self._code.raw(f"""
+                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>(color_sh_base_ptr) + {self._gaussian_idx};
+                    auto {out} = Gaussian3D::sh_dir_to_rgb<{cur_degree}>({normed_dir}, sh_ptr, sh_base_ptr);
+                    """)
+                else:
+                    self._code.raw(f"""
+                    auto {out} = Gaussian3D::sh_dir_to_rgb<{cur_degree}>({normed_dir}, sh_ptr);
+                    """)
+        else:
+            raise NotImplementedError(f"field {field} not implemented yet.")
+    
+    def prepare_field_proxy(self):
+        if self._batch_size == 1:
+            return 
+        else:
+            if self._is_bwd:
+                self._code.raw(f"""
+                float dopacity_val_acc = 0.0f;
+                tv::array<float, 3> dxyz_acc{{}};
+                tv::array<float, 4> dquat_acc{{}};
+                tv::array<float, 3> dscale_acc{{}};
+                """) 
+
+    def accumulate_field_grad(self, field: GaussianCoreFields, 
+            out: str, grad: str, normed_dir: str = "", normed_dir_grad: str = ""):
+        """Write code segment to get field from model ptr.
+        """
+        has_color_base = self._model.color_sh_base is not None
+        cur_degree = self._model.cur_sh_degree
+        max_degree = self._model.color_sh_degree
+        if field == GaussianCoreFields.XYZ:
+            if self._batch_size == 1:
+                self._code.raw(f"""
+                op::reinterpret_cast_array_nd<3>(xyz_grad_ptr)[{self._gaussian_idx}] = {grad};
+                """)
+            else:
+                self._code.raw(f"""
+                dxyz_acc += {grad};
+                """)
+        elif field == GaussianCoreFields.QUATERNION_XYZW:
+            self._code.raw(f"""
+            {grad} = {grad}.op<op::{self._model.fused_quaternion_xyzw_act_op[1]}>({out}, {out}_raw);
+            """)
+            if self._batch_size == 1:
+                self._code.raw(f"""
+                op::reinterpret_cast_array_nd<4>(quaternion_xyzw_grad_ptr)[{self._gaussian_idx}] = {grad};
+                """)
+            else:
+                self._code.raw(f"""
+                dquat_acc += {grad};
+                """)
+        elif field == GaussianCoreFields.SCALE:
+            self._code.raw(f"""
+            {grad} = {grad}.op<op::{self._model.fused_scale_act_op[1]}>({out}, {out}_raw);
+            """)
+            if self._batch_size == 1:
+                self._code.raw(f"""
+                op::reinterpret_cast_array_nd<3>(scale_grad_ptr)[{self._gaussian_idx}] = {grad};
+                """)
+            else:
+                self._code.raw(f"""
+                dscale_acc += {grad};
+                """)
+        elif field == GaussianCoreFields.OPACITY:
+            self._code.raw(f"""
+            {grad} = tv::array<float, 1>{{{grad}}}.op<op::{self._model.fused_opacity_act_op[1]}>(tv::array<float, 1>{{{out}}}, {out}_raw)[0];
+            """)
+            if self._batch_size == 1:
+                self._code.raw(f"""
+                opacity_grad_ptr[{self._gaussian_idx}] = {grad};
+                """)
+            else:
+                self._code.raw(f"""
+                dopacity_val_acc += {grad};
+                """)
+
+        elif field == GaussianCoreFields.RGB:
+            assert normed_dir != "" and normed_dir_grad != ""
+            self._code.raw(f"""
+            auto sh_ptr = op::reinterpret_cast_array_nd<3>(color_sh_ptr) + {self._gaussian_idx} * {(max_degree + 1) * (max_degree + 1) - has_color_base};
+            auto dsh_ptr = op::reinterpret_cast_array_nd<3>(color_sh_grad_ptr) + i * {(max_degree + 1) * (max_degree + 1) - has_color_base};
+            """)
+            sh_grad_fn = "sh_dir_to_rgb_grad" if self._batch_size == 1 else "sh_dir_to_rgb_grad_batch"
+            if has_color_base:
+                self._code.raw(f"""
+                auto dsh_base_ptr = op::reinterpret_cast_array_nd<3>(color_sh_base_grad_ptr) + {self._gaussian_idx};
+                auto {normed_dir_grad} = Gaussian3D::{sh_grad_fn}<{cur_degree}>(color_grad, dsh_ptr,
+                    {normed_dir}, sh_ptr, dsh_base_ptr);
+                """)
+            else:
+                self._code.raw(f"""
+                auto {normed_dir_grad} = Gaussian3D::{sh_grad_fn}<{cur_degree}>(color_grad, dsh_ptr,
+                    {normed_dir}, sh_ptr);
+                """)
+        else:
+            raise NotImplementedError(f"field {field} not implemented yet.")
+
+    def save_accumulated_grad(self):
+        if self._batch_size == 1:
+            return 
+        else:
+            self._code.raw(f"""
+            op::reinterpret_cast_array_nd<3>(xyz_grad_ptr)[{self._gaussian_idx}] = dxyz_acc;
+            op::reinterpret_cast_array_nd<4>(quaternion_xyzw_grad_ptr)[{self._gaussian_idx}] = dquat_acc;
+            op::reinterpret_cast_array_nd<3>(scale_grad_ptr)[{self._gaussian_idx}] = dscale_acc;
+            opacity_grad_ptr[{self._gaussian_idx}] = dopacity_val_acc;
+            """) 
 
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
@@ -59,20 +233,20 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
         raise NotImplementedError
 
     @property
-    def fused_quaternion_xyzw_act_op(self) -> tuple[str, str] | None:
+    def fused_quaternion_xyzw_act_op(self) -> tuple[str, str]:
         """there are three component support fused act to save gpu memory.
         when you implement fused op, you should return identity
         in component_act property.
         """
-        return None
+        return ("identity", "identity")
 
     @property
-    def fused_scale_act_op(self) -> tuple[str, str] | None:
-        return None
+    def fused_scale_act_op(self) -> tuple[str, str]:
+        return ("identity", "identity")
 
     @property
-    def fused_opacity_act_op(self) -> tuple[str, str] | None:
-        return None
+    def fused_opacity_act_op(self) -> tuple[str, str]:
+        return ("identity", "identity")
 
     @property
     def color_sh_act(self) -> torch.Tensor:
@@ -91,6 +265,22 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
         assert (res + 1) * (res + 1) == dim
         return res
 
+    def get_unique_kernel_key(self):
+        return (f"{self.color_sh_degree}_{self.cur_sh_degree}_{self.fused_quaternion_xyzw_act_op[0]}"
+                f"_{self.fused_scale_act_op[0]}_{self.fused_opacity_act_op[0]}_{self.color_sh_base is None}")
+
+    def get_user_field_dict(self):
+        res = {
+            "xyz": self.xyz,
+            "quaternion_xyzw": self.quaternion_xyzw,
+            "scale": self.scale,
+            "opacity": self.opacity,
+            "color_sh": self.color_sh,
+        }
+        if self.color_sh_base is not None:
+            res["color_sh_base"] = self.color_sh_base
+        return res
+
     def set_requires_grad(self, requires_grad: bool):
         self.xyz.requires_grad_(requires_grad)
         self.quaternion_xyzw.requires_grad_(requires_grad)
@@ -104,6 +294,9 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
         self.scale.grad = None
         self.opacity.grad = None
         self.color_sh.grad = None
+
+    def create_proxy(self, code: pccm.FunctionCode, gaussian_idx: str, batch_size: int, is_bwd: bool = False) -> GaussianModelProxyBase:
+        raise NotImplementedError
 
     def create_model_with_act(self):
         if self.act_applied:
@@ -186,12 +379,13 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
               max_num_degree: int,
               split: bool = False,
               dtype: torch.dtype = torch.float32,
-              device: torch.device = torch.device("cpu")):
+              device: torch.device = torch.device("cpu"),
+              opacity: torch.Tensor | None = None):
         return cls(
             xyz=torch.zeros(N, 3, dtype=dtype, device=device),
             quaternion_xyzw=torch.zeros(N, 4, dtype=dtype, device=device),
             scale=torch.zeros(N, 3, dtype=dtype, device=device),
-            opacity=torch.zeros(N, dtype=dtype, device=device),
+            opacity=opacity if opacity is not None else torch.zeros(N, dtype=dtype, device=device),
             color_sh_base=torch.zeros(N, 3, dtype=dtype, device=device)
             if split else None,
             color_sh=torch.zeros(N, (max_num_degree + 1) *
@@ -202,6 +396,22 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
             cur_sh_degree=0,
         )
 
+    @classmethod
+    def zeros_like(cls,
+              model: "GaussianModelBase",
+              opacity: torch.Tensor | None = None):
+        """
+        Args:
+            model: model to copy the shape from
+            opacity: when batch size is 1, we can reuse storage of opacity grad
+                from rasterize to save some memory.
+        """
+        N = model.xyz.shape[0]
+        dtype = model.xyz.dtype
+        device = model.xyz.device
+        split = model.color_sh_base is not None
+        max_num_degree = model.color_sh_degree
+        return cls.zeros(N, max_num_degree, split, dtype, device, opacity)
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianModelOrigin(GaussianModelBase):
@@ -245,13 +455,16 @@ class GaussianModelOriginFused(GaussianModelBase):
         return self.opacity
 
     @property
-    def fused_quaternion_xyzw_act_op(self) -> tuple[str, str] | None:
+    def fused_quaternion_xyzw_act_op(self) -> tuple[str, str]:
         return ("normalize", "normalize_grad_out")
 
     @property
-    def fused_scale_act_op(self) -> tuple[str, str] | None:
+    def fused_scale_act_op(self) -> tuple[str, str]:
         return ("exponential", "exponential_grad_out")
 
     @property
-    def fused_opacity_act_op(self) -> tuple[str, str] | None:
+    def fused_opacity_act_op(self) -> tuple[str, str]:
         return ("sigmoid", "sigmoid_grad_out")
+
+    def create_proxy(self, code: pccm.FunctionCode, gaussian_idx: str, batch_size: int, is_bwd: bool = False) -> GaussianModelProxyBase:
+        return GaussianModelProxyOrigin(self, code, gaussian_idx, batch_size, is_bwd)

@@ -200,13 +200,6 @@ class GaussianSplatOp:
             tile_num_xy_np = np.array([tile_num_x, tile_num_y], np.int32)
             xyz = model.xyz
             # quat should be normed in user-defined quaternion_xyzw_act.
-            quat_xyzw = model.quaternion_xyzw
-            scales = model.scale
-            opacity = model.opacity
-            color_sh = model.color_sh
-            color_sh_base = model.color_sh_base
-            degree = model.color_sh_degree
-            cur_degree = model.cur_sh_degree
             instance_ids = model.instance_id
 
             depths = torch.empty(batch_size * num, dtype=torch.float32, device=xyz.device)
@@ -247,15 +240,12 @@ class GaussianSplatOp:
             assert custom_feat.shape[0] == batch_size * num
             assert not self.is_nchw, "custom feat don't support nchw, set use_nchw=False in config."
         t1 = time.time()
-        fused_scale_act = model.fused_scale_act_op
-        fused_q_act = model.fused_quaternion_xyzw_act_op
-        fused_opacity_act = model.fused_opacity_act_op
-        has_color_base = color_sh_base is not None
+        enable_v2 = self._cfg.enable_v2
         with measure_and_print_torch("1", enable=enable_verbose):
             prep_kernel_name = (
-                f"gs3d_preprocess_{self._cfg.tile_size}_{degree}_{training}_"
-                f"{fused_scale_act}_{fused_q_act}_{fused_opacity_act}_"
-                f"{cur_degree}_{has_color_base}_{is_cam_bundle}")
+                f"gs3d_preprocess_{self._cfg.tile_size}_{training}_"
+                f"{model.get_unique_kernel_key()}_"
+                f"{is_cam_bundle}")
             code_prep = pccm.code()
             lowpass_filter = self._cfg.gaussian_lowpass_filter
             eps = self._cfg.eps
@@ -311,106 +301,200 @@ class GaussianSplatOp:
                 """)
             code_prep.raw(f"""
             auto tan_fov = 0.5f * resolution_wh.cast<float>() / focal_xy;
-            auto point = op::reinterpret_cast_array_nd<3>($xyz)[gaussian_idx];
-            auto point_cam = cam2world_R_T.op<op::mv_rowmajor>(point - cam2world_center);
-
-            auto uvz = CameraOps::pos_cam_to_uv_no_distort<2, 0, 1>(point_cam, principal_point, focal_xy);
-            auto uv = std::get<0>(uvz) - 0.5f;
-            auto z_in_cam = std::get<1>(uvz);
-            auto scale = op::reinterpret_cast_array_nd<3>($scales)[gaussian_idx];
-            auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[gaussian_idx];
             """)
-            if fused_q_act is not None:
-                code_prep.raw(f"""
-                quat = quat.op<op::{fused_q_act[0]}>();
-                """)
-            if fused_scale_act is not None:
-                code_prep.raw(f"""
-                scale = scale.op<op::{fused_scale_act[0]}>();
-                """)
-            if training:
-                code_prep.raw(f"""
-                auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale, quat);
-                """)
-            else:
-                # scale modifier should only be used during inference.
-                code_prep.raw(f"""
-                auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale * $scale_global, quat);
-                """)
-            code_prep.raw(f"""
-            auto cov2d_vec = Gaussian3D::project_gaussian_to_2d<float, 3>(point_cam, focal_xy, tan_fov, cam2world_R_T, cov3d_vec, $projected_clamp_factor);
-            
-            cov2d_vec[0] += $lowpass_filter;
-            cov2d_vec[2] += $lowpass_filter;
 
-            auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det(cov2d_vec, $eps);
-            auto cov2d_inv = std::get<0>(cov2d_inv_and_det);
-            auto det = std::get<1>(cov2d_inv_and_det);
-            auto radii_fp = math_op_t::ceil(Gaussian3D::get_gaussian_2d_ellipse(cov2d_vec, det, 
-                $cov2d_radii_eigen_eps, $gaussian_std_sigma));
-            constexpr auto tile_size_xy = tv::array<int, 2>{{{self._cfg.tile_size[0]}, {self._cfg.tile_size[1]}}};
-            auto tile_num_xy = tv::div_up(resolution_wh, tile_size_xy);
-            auto tile_size_xy_float = tile_size_xy.cast<float>();
-            auto gaussian_rect_min = ((uv - radii_fp) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
-            auto gaussian_rect_max = ((uv + radii_fp + tile_size_xy_float - 1) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
-            int rect_area = (gaussian_rect_max[0] - gaussian_rect_min[0]) * (gaussian_rect_max[1] - gaussian_rect_min[1]);
-            bool is_empty = (det == 0 || z_in_cam < 0.2f) || rect_area == 0;
-
-            $tiles_touched[i] = is_empty ? 0 : rect_area;
-            $radii[i] = is_empty ? 0 : int(radii_fp);
-            if (is_empty){{
-                // calc color sh requires much IO, so we early exit here.
-                // this will cause warp divergence, but save io.
-                return;
-            }}
-            $depths[i] = z_in_cam;
-
-            op::reinterpret_cast_array_nd<2>($uvs)[i] = uv;
-            auto opacity_val = $opacity[gaussian_idx];
-            """)
-            if fused_opacity_act is not None:
+            if not enable_v2:
+                quat_xyzw = model.quaternion_xyzw
+                scales = model.scale
+                opacity = model.opacity
+                color_sh = model.color_sh
+                color_sh_base = model.color_sh_base
+                degree = model.color_sh_degree
+                cur_degree = model.cur_sh_degree
+                has_color_base = color_sh_base is not None
+                fused_scale_act = model.fused_scale_act_op
+                fused_q_act = model.fused_quaternion_xyzw_act_op
+                fused_opacity_act = model.fused_opacity_act_op
                 code_prep.raw(f"""
-                opacity_val = tv::array<float, 1>{{opacity_val}}.op<op::{fused_opacity_act[0]}>()[0];
+                auto point = op::reinterpret_cast_array_nd<3>($xyz)[gaussian_idx];
+                auto point_cam = cam2world_R_T.op<op::mv_rowmajor>(point - cam2world_center);
+
+                auto uvz = CameraOps::pos_cam_to_uv_no_distort<2, 0, 1>(point_cam, principal_point, focal_xy);
+                auto uv = std::get<0>(uvz) - 0.5f;
+                auto z_in_cam = std::get<1>(uvz);
+                auto scale = op::reinterpret_cast_array_nd<3>($scales)[gaussian_idx];
+                auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[gaussian_idx];
                 """)
-            code_prep.raw(f"""
-            tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], opacity_val}};
-            op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
-            auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + gaussian_idx * {(degree + 1) * (degree + 1) - has_color_base};
-            
-            """)
-            if (training):
-                if has_color_base:
+                if fused_q_act is not None:
                     code_prep.raw(f"""
-                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + gaussian_idx;
-                    auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr, sh_base_ptr);
+                    quat = quat.op<op::{fused_q_act[0]}>();
+                    """)
+                if fused_scale_act is not None:
+                    code_prep.raw(f"""
+                    scale = scale.op<op::{fused_scale_act[0]}>();
+                    """)
+                if training:
+                    code_prep.raw(f"""
+                    auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale, quat);
                     """)
                 else:
+                    # scale modifier should only be used during inference.
                     code_prep.raw(f"""
-                    auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr);
+                    auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale * $scale_global, quat);
                     """)
                 code_prep.raw(f"""
-                uint8_t ne_0_packed = (uint8_t(rgb[0] < 0) << 2) | (uint8_t(rgb[1] < 0) << 1) | uint8_t(rgb[2] < 0);
-                op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = rgb.op<op::maximum>(0.0f);
-                $sh_to_rgb_ne_0[i] = ne_0_packed;
+                auto cov2d_vec = Gaussian3D::project_gaussian_to_2d<float, 3>(point_cam, focal_xy, tan_fov, cam2world_R_T, cov3d_vec, $projected_clamp_factor);
+                
+                cov2d_vec[0] += $lowpass_filter;
+                cov2d_vec[2] += $lowpass_filter;
 
-                op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i] = cov2d_vec;
+                auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det(cov2d_vec, $eps);
+                auto cov2d_inv = std::get<0>(cov2d_inv_and_det);
+                auto det = std::get<1>(cov2d_inv_and_det);
+                auto radii_fp = math_op_t::ceil(Gaussian3D::get_gaussian_2d_ellipse(cov2d_vec, det, 
+                    $cov2d_radii_eigen_eps, $gaussian_std_sigma));
+                constexpr auto tile_size_xy = tv::array<int, 2>{{{self._cfg.tile_size[0]}, {self._cfg.tile_size[1]}}};
+                auto tile_num_xy = tv::div_up(resolution_wh, tile_size_xy);
+                auto tile_size_xy_float = tile_size_xy.cast<float>();
+                auto gaussian_rect_min = ((uv - radii_fp) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
+                auto gaussian_rect_max = ((uv + radii_fp + tile_size_xy_float - 1) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
+                int rect_area = (gaussian_rect_max[0] - gaussian_rect_min[0]) * (gaussian_rect_max[1] - gaussian_rect_min[1]);
+                bool is_empty = (det == 0 || z_in_cam < 0.2f) || rect_area == 0;
+
+                $tiles_touched[i] = is_empty ? 0 : rect_area;
+                $radii[i] = is_empty ? 0 : int(radii_fp);
+                if (is_empty){{
+                    // calc color sh requires much IO, so we early exit here.
+                    // this will cause warp divergence, but save io.
+                    return;
+                }}
+                $depths[i] = z_in_cam;
+
+                op::reinterpret_cast_array_nd<2>($uvs)[i] = uv;
+                auto opacity_val = $opacity[gaussian_idx];
                 """)
-                if not self._cfg.recalc_cov3d_in_bwd:
+                if fused_opacity_act is not None:
                     code_prep.raw(f"""
-                    op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i] = cov3d_vec;
+                    opacity_val = tv::array<float, 1>{{opacity_val}}.op<op::{fused_opacity_act[0]}>()[0];
                     """)
-            else:
-                if has_color_base:
+                code_prep.raw(f"""
+                tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], opacity_val}};
+                op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
+                auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + gaussian_idx * {(degree + 1) * (degree + 1) - has_color_base};
+                
+                """)
+                if (training):
+                    if has_color_base:
+                        code_prep.raw(f"""
+                        auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + gaussian_idx;
+                        auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr, sh_base_ptr);
+                        """)
+                    else:
+                        code_prep.raw(f"""
+                        auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr);
+                        """)
                     code_prep.raw(f"""
-                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + gaussian_idx;
-                    op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr, sh_base_ptr).op<op::maximum>(0.0f);
+                    uint8_t ne_0_packed = (uint8_t(rgb[0] < 0) << 2) | (uint8_t(rgb[1] < 0) << 1) | uint8_t(rgb[2] < 0);
+                    op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = rgb.op<op::maximum>(0.0f);
+                    $sh_to_rgb_ne_0[i] = ne_0_packed;
+
+                    op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i] = cov2d_vec;
+                    """)
+                    if not self._cfg.recalc_cov3d_in_bwd:
+                        code_prep.raw(f"""
+                        op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i] = cov3d_vec;
+                        """)
+                else:
+                    if has_color_base:
+                        code_prep.raw(f"""
+                        auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + gaussian_idx;
+                        op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr, sh_base_ptr).op<op::maximum>(0.0f);
+                        """)
+                    else:
+                        code_prep.raw(f"""
+                        op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr).op<op::maximum>(0.0f);
+                        """)
+                self._inliner.kernel_1d(prep_kernel_name, batch_size * num, 0, code_prep)
+
+            else:
+                proxy = model.create_proxy(code_prep, "gaussian_idx", batch_size)
+                prep_kernel_name += f"_{proxy.get_unique_id()}"
+                proxy.prepare_field_proxy()
+                proxy.read_field(GaussianCoreFields.XYZ, "point")
+                code_prep.raw(f"""
+                auto point_cam = cam2world_R_T.op<op::mv_rowmajor>(point - cam2world_center);
+                auto uvz = CameraOps::pos_cam_to_uv_no_distort<2, 0, 1>(point_cam, principal_point, focal_xy);
+                auto uv = std::get<0>(uvz) - 0.5f;
+                auto z_in_cam = std::get<1>(uvz);
+                """)
+                proxy.read_field(GaussianCoreFields.QUATERNION_XYZW, "quat")
+                proxy.read_field(GaussianCoreFields.SCALE, "scale")
+                if training:
+                    code_prep.raw(f"""
+                    auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale, quat);
                     """)
                 else:
+                    # scale modifier should only be used during inference.
                     code_prep.raw(f"""
-                    op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr).op<op::maximum>(0.0f);
+                    auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale * $scale_global, quat);
                     """)
+                code_prep.raw(f"""
+                auto cov2d_vec = Gaussian3D::project_gaussian_to_2d<float, 3>(point_cam, focal_xy, tan_fov, cam2world_R_T, cov3d_vec, $projected_clamp_factor);
+                
+                cov2d_vec[0] += $lowpass_filter;
+                cov2d_vec[2] += $lowpass_filter;
+
+                auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det(cov2d_vec, $eps);
+                auto cov2d_inv = std::get<0>(cov2d_inv_and_det);
+                auto det = std::get<1>(cov2d_inv_and_det);
+                auto radii_fp = math_op_t::ceil(Gaussian3D::get_gaussian_2d_ellipse(cov2d_vec, det, 
+                    $cov2d_radii_eigen_eps, $gaussian_std_sigma));
+                constexpr auto tile_size_xy = tv::array<int, 2>{{{self._cfg.tile_size[0]}, {self._cfg.tile_size[1]}}};
+                auto tile_num_xy = tv::div_up(resolution_wh, tile_size_xy);
+                auto tile_size_xy_float = tile_size_xy.cast<float>();
+                auto gaussian_rect_min = ((uv - radii_fp) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
+                auto gaussian_rect_max = ((uv + radii_fp + tile_size_xy_float - 1) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
+                int rect_area = (gaussian_rect_max[0] - gaussian_rect_min[0]) * (gaussian_rect_max[1] - gaussian_rect_min[1]);
+                bool is_empty = (det == 0 || z_in_cam < 0.2f) || rect_area == 0;
+
+                $tiles_touched[i] = is_empty ? 0 : rect_area;
+                $radii[i] = is_empty ? 0 : int(radii_fp);
+                if (is_empty){{
+                    // calc color sh requires much IO, so we early exit here.
+                    // this will cause warp divergence, but save io.
+                    return;
+                }}
+                $depths[i] = z_in_cam;
+
+                op::reinterpret_cast_array_nd<2>($uvs)[i] = uv;
+                """)
+                proxy.read_field(GaussianCoreFields.OPACITY, "opacity_val")
+                code_prep.raw(f"""
+                tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], opacity_val}};
+                op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
+                auto normed_dir = (point - cam2world_center).op<op::normalize>();
+                """)
+                proxy.read_field(GaussianCoreFields.RGB, "rgb", "normed_dir")
+                if (training):
+                    code_prep.raw(f"""
+                    uint8_t ne_0_packed = (uint8_t(rgb[0] < 0) << 2) | (uint8_t(rgb[1] < 0) << 1) | uint8_t(rgb[2] < 0);
+                    op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = rgb.op<op::maximum>(0.0f);
+                    $sh_to_rgb_ne_0[i] = ne_0_packed;
+
+                    op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i] = cov2d_vec;
+                    """)
+                    if not self._cfg.recalc_cov3d_in_bwd:
+                        code_prep.raw(f"""
+                        op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i] = cov3d_vec;
+                        """)
+                else:
+                    code_prep.raw(f"""
+                    op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = rgb.op<op::maximum>(0.0f);
+                    """)
+                self._inliner.kernel_1d(prep_kernel_name, batch_size * num, 0, code_prep, 
+                    additional_vars={f"{k}_ptr": v for k, v in model.get_user_field_dict().items()})
+
             # with measure_and_print_torch("1", enable=True):
-            self._inliner.kernel_1d(prep_kernel_name, batch_size * num, 0, code_prep)
             # if batch_size == 2:
             #     print(torch.linalg.norm(rgb_gaussian.float().reshape(-1, num,3)[0] - rgb_gaussian.float().reshape(-1, num, 3)[1]))
             # print(INLINER.get_nvrtc_module(prep_kernel_name).params.debug_code)
@@ -1490,40 +1574,18 @@ class GaussianSplatOp:
             assert cov3d_vecs is not None
         assert cov2d_vecs is not None
         assert sh_to_rgb_ne_0 is not None
-        dxyz_res = torch.zeros_like(model.xyz)
-        dscale_res = torch.zeros_like(model.scale)
-        dquat_res = torch.zeros_like(model.quaternion_xyzw)
-        dcolor_sh_res = torch.zeros_like(model.color_sh)
-        dcolor_base_sh_res = None
-        has_color_base = model.color_sh_base is not None
-        if model.color_sh_base is not None:
-            dcolor_base_sh_res = torch.zeros_like(model.color_sh_base)
-        # dopacity = torch.zeros_like(model.opacity)
-        if batch_size == 1:
-            dopacity_res = dopacity
-        else:
-            dopacity_res = torch.zeros_like(model.opacity)
-        grad_model = GaussianModelOrigin(xyz=dxyz_res,
-                                         color_sh=dcolor_sh_res,
-                                         scale=dscale_res,
-                                         quaternion_xyzw=dquat_res,
-                                         opacity=dopacity_res,
-                                         color_sh_base=dcolor_base_sh_res)
-        xyz = model.xyz
-        scales = model.scale
-        quat_xyzw = model.quaternion_xyzw
-        color_sh = model.color_sh
-        opacity = model.opacity
+        # grad_model = GaussianModelOrigin(xyz=dxyz_res,
+        #                                  color_sh=dcolor_sh_res,
+        #                                  scale=dscale_res,
+        #                                  quaternion_xyzw=dquat_res,
+        #                                  opacity=dopacity_res,
+        #                                  color_sh_base=dcolor_base_sh_res)
+        grad_model = model.zeros_like(model, dopacity if batch_size == 1 else None)
+        
         instance_ids = model.instance_id
-        degree = model.color_sh_degree
-        cur_degree = model.cur_sh_degree
-        fused_scale_act = model.fused_scale_act_op
-        fused_q_act = model.fused_quaternion_xyzw_act_op
-        fused_opacity_act = model.fused_opacity_act_op
         prep_kernel_name = (
-            f"gs3d_preprocess_bwd_{self._cfg.tile_size}_{degree}_"
-            f"{fused_scale_act}_{fused_q_act}_{fused_opacity_act}_"
-            f"{cur_degree}_{has_color_base}_{dz is None}_{batch_size == 1}_"
+            f"gs3d_preprocess_bwd_{self._cfg.tile_size}_{model.get_unique_kernel_key()}_"
+            f"_{dz is None}_{batch_size == 1}_"
             f"{is_cam_bundle}")
         for_ctx = nullcontext()
         with tv.measure_and_print("BWD-prep", enable=self._cfg.verbose):
@@ -1533,374 +1595,357 @@ class GaussianSplatOp:
             using math_op_t = tv::arrayops::MathScalarOp<float>;
             auto resolution_wh = $resolution_wh_np;
             """)
-            if batch_size > 1:
-                code_prep.raw(f"""
-                float dopacity_val_acc = 0.0f;
-                tv::array<float, 3> dxyz_acc{{}};
-                tv::array<float, 4> dquat_acc{{}};
-                tv::array<float, 3> dscale_acc{{}};
-                """)
-                for_ctx = code_prep.for_("int batch_idx = 0; batch_idx < $batch_size; ++batch_idx")
-            with for_ctx:
+            if not self._cfg.enable_v2:
+                xyz = model.xyz
+                scales = model.scale
+                quat_xyzw = model.quaternion_xyzw
+                color_sh = model.color_sh
+                opacity = model.opacity
+
+                degree = model.color_sh_degree
+                cur_degree = model.cur_sh_degree
+                fused_scale_act = model.fused_scale_act_op
+                fused_q_act = model.fused_quaternion_xyzw_act_op
+                fused_opacity_act = model.fused_opacity_act_op
+
+                dxyz_res = grad_model.xyz
+                dscale_res = grad_model.scale
+                dquat_res = grad_model.quaternion_xyzw
+                dcolor_sh_res = grad_model.color_sh
+                dcolor_base_sh_res = None
+                has_color_base = model.color_sh_base is not None
+                if model.color_sh_base is not None:
+                    dcolor_base_sh_res = grad_model.color_sh_base
+                dopacity_res = grad_model.opacity
+
                 if batch_size > 1:
                     code_prep.raw(f"""
-                    auto i_with_batch = i + batch_idx * $num;
+                    float dopacity_val_acc = 0.0f;
+                    tv::array<float, 3> dxyz_acc{{}};
+                    tv::array<float, 4> dquat_acc{{}};
+                    tv::array<float, 3> dscale_acc{{}};
                     """)
-                else:
-                    code_prep.raw(f"""
-                    auto i_with_batch = i;
-                    """)
-                code_prep.raw(f"""
-                if ($radii[i_with_batch] == 0){{
-                    {"return" if batch_size == 1 else "continue"};
-                }}
-                auto uv_grad = op::reinterpret_cast_array_nd<2>($duv)[i_with_batch];
-                auto conic_grad = op::reinterpret_cast_array_nd<3>($dconic)[i_with_batch];
-                // auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i_with_batch];
-                """)
-                if is_cam_bundle:
-                    # cam2world, focal and ppoint are tensor, load from gpu mem
-                    code_prep.raw(f"""
-                    auto cam2world_T = op::reinterpret_cast_array_nd<4, 3>($cam2world_T_ten)[batch_idx];
-                    auto focal_xy_ppoint = op::reinterpret_cast_array_nd<4>($focal_xy_ppoint_ten)[batch_idx];
-                    auto focal_xy = op::slice<0, 2>(focal_xy_ppoint);
-                    auto principal_point = op::slice<2, 4>(focal_xy_ppoint);
-                    auto cam2world_R_T = op::slice<0, 3>(cam2world_T);
-                    auto cam2world_center = cam2world_T[3];
-
-                    """)
-                    if enable_instance_render:
-                        code_prep.raw(f"""
-                        auto frame_id = $frame_ids[batch_idx];
-                        """)
-                else:
-                    # cam2world, focal and ppoint are registers
-                    code_prep.raw(f"""
-                    auto cam2world_R_T = $cam2world_R_np;
-                    auto cam2world_center = $cam2world_center_np;
-                    auto focal_xy = $focal_xy_np;
-                    auto principal_point = $principal_point_np;
-                    """)
-                    if enable_instance_render:
-                        code_prep.raw(f"""
-                        auto frame_id = $frame_local_id;
-                        """)
-                if enable_instance_render:
-                    code_prep.raw(f"""
-                    auto instance_id = $instance_ids[i];
-                    if (instance_id >= 0){{
-                        auto instance2world_T_val = op::reinterpret_cast_array_nd<4, 3>($instance2world_T)[frame_id * $num_instance + instance_id];
-                        // get cam2instance_T, cam2instance = world2instance @ cam2world
-                        auto cam2instance_T = instance2world_T_val.op<op::transform_matrix_colmajor_inverse>().op<op::transform_matrix_mm_nnn>(cam2world_T);
-                        cam2world_R_T = op::slice<0, 3>(cam2instance_T);
-                        cam2world_center = cam2instance_T[3];
-                    }}
-                    """)
-                code_prep.raw(f"""
-
-                auto tan_fov = 0.5f * resolution_wh.cast<float>() / focal_xy;
-                auto point = op::reinterpret_cast_array_nd<3>($xyz)[i];
-                point = point - cam2world_center;
-
-                auto point_cam = cam2world_R_T.op<op::mv_rowmajor>(point);
-                auto cov2d_arr = op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i_with_batch];
-                auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, {"$dz[i_with_batch]" if dz is not None else "0.0f"}, point_cam, principal_point, focal_xy);
-                auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad(conic_grad, cov2d_arr);
-                auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
-                auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[i];
-                """)
-                if fused_scale_act:
-                    code_prep.raw(f"""
-                    auto scale_act = scale.op<op::{fused_scale_act[0]}>();
-                    """)
-                else:
-                    code_prep.raw(f"""
-                    auto scale_act = scale;
-                    """)
-                if fused_q_act:
-                    code_prep.raw(f"""
-                    auto quat_act = quat.op<op::{fused_q_act[0]}>();
-                    """)
-                else:
-                    code_prep.raw(f"""
-                    auto quat_act = quat;
-                    """)
-                if self._cfg.recalc_cov3d_in_bwd:
-                    code_prep.raw(f"""
-                    auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale_act, quat_act);
-                    """)
-                else:
-                    code_prep.raw(f"""
-                    auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i_with_batch];
-                    """)
-                code_prep.raw(f"""
-                auto proj_grad_res = Gaussian3D::project_gaussian_to_2d_grad<float, 3>(dcov2d, point_cam, focal_xy, tan_fov, cam2world_R_T, cov3d_vec);
-                dpoint_cam += std::get<0>(proj_grad_res);
-
-                auto dxyz = cam2world_R_T.op<op::mv_colmajor>(dpoint_cam);
-                auto cov3d_grad_res = Gaussian3D::scale_quat_to_cov3d_grad(std::get<1>(proj_grad_res), scale_act, quat_act);
-                auto dscale = std::get<0>(cov3d_grad_res);
-                auto dquat = std::get<1>(cov3d_grad_res);
-                """)
-                if fused_scale_act:
-                    code_prep.raw(f"""
-                    dscale = dscale.op<op::{fused_scale_act[1]}>(scale_act, scale);
-                    """)
-                if fused_q_act:
-                    code_prep.raw(f"""
-                    dquat = dquat.op<op::{fused_q_act[1]}>(quat_act, quat);
-                    """)
-                if fused_opacity_act:
-                    code_prep.raw(f"""
-                    tv::array<float, 1> opacity_val{{$opacity[i]}};
-                    tv::array<float, 1> dopacity_val{{$dopacity[i_with_batch]}};
-                    dopacity_val = dopacity_val.op<op::{fused_opacity_act[1]}>(opacity_val.op<op::{fused_opacity_act[0]}>(), opacity_val);
-                    """)
+                    for_ctx = code_prep.for_("int batch_idx = 0; batch_idx < $batch_size; ++batch_idx")
+                with for_ctx:
                     if batch_size > 1:
                         code_prep.raw(f"""
-                        dopacity_val_acc += dopacity_val[0];
+                        auto i_with_batch = i + batch_idx * $num;
                         """)
                     else:
                         code_prep.raw(f"""
-                        $dopacity[i] = dopacity_val[0];
+                        auto i_with_batch = i;
+                        """)
+                    code_prep.raw(f"""
+                    if ($radii[i_with_batch] == 0){{
+                        {"return" if batch_size == 1 else "continue"};
+                    }}
+                    auto uv_grad = op::reinterpret_cast_array_nd<2>($duv)[i_with_batch];
+                    auto conic_grad = op::reinterpret_cast_array_nd<3>($dconic)[i_with_batch];
+                    // auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i_with_batch];
+                    """)
+                    if is_cam_bundle:
+                        # cam2world, focal and ppoint are tensor, load from gpu mem
+                        code_prep.raw(f"""
+                        auto cam2world_T = op::reinterpret_cast_array_nd<4, 3>($cam2world_T_ten)[batch_idx];
+                        auto focal_xy_ppoint = op::reinterpret_cast_array_nd<4>($focal_xy_ppoint_ten)[batch_idx];
+                        auto focal_xy = op::slice<0, 2>(focal_xy_ppoint);
+                        auto principal_point = op::slice<2, 4>(focal_xy_ppoint);
+                        auto cam2world_R_T = op::slice<0, 3>(cam2world_T);
+                        auto cam2world_center = cam2world_T[3];
+
+                        """)
+                        if enable_instance_render:
+                            code_prep.raw(f"""
+                            auto frame_id = $frame_ids[batch_idx];
+                            """)
+                    else:
+                        # cam2world, focal and ppoint are registers
+                        code_prep.raw(f"""
+                        auto cam2world_R_T = $cam2world_R_np;
+                        auto cam2world_center = $cam2world_center_np;
+                        auto focal_xy = $focal_xy_np;
+                        auto principal_point = $principal_point_np;
+                        """)
+                        if enable_instance_render:
+                            code_prep.raw(f"""
+                            auto frame_id = $frame_local_id;
+                            """)
+                    if enable_instance_render:
+                        code_prep.raw(f"""
+                        auto instance_id = $instance_ids[i];
+                        if (instance_id >= 0){{
+                            auto instance2world_T_val = op::reinterpret_cast_array_nd<4, 3>($instance2world_T)[frame_id * $num_instance + instance_id];
+                            // get cam2instance_T, cam2instance = world2instance @ cam2world
+                            auto cam2instance_T = instance2world_T_val.op<op::transform_matrix_colmajor_inverse>().op<op::transform_matrix_mm_nnn>(cam2world_T);
+                            cam2world_R_T = op::slice<0, 3>(cam2instance_T);
+                            cam2world_center = cam2instance_T[3];
+                        }}
+                        """)
+                    code_prep.raw(f"""
+
+                    auto tan_fov = 0.5f * resolution_wh.cast<float>() / focal_xy;
+                    auto point = op::reinterpret_cast_array_nd<3>($xyz)[i];
+                    point = point - cam2world_center;
+
+                    auto point_cam = cam2world_R_T.op<op::mv_rowmajor>(point);
+                    auto cov2d_arr = op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i_with_batch];
+                    auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, {"$dz[i_with_batch]" if dz is not None else "0.0f"}, point_cam, principal_point, focal_xy);
+                    auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad(conic_grad, cov2d_arr);
+                    auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
+                    auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[i];
+                    """)
+                    if fused_scale_act:
+                        code_prep.raw(f"""
+                        auto scale_act = scale.op<op::{fused_scale_act[0]}>();
+                        """)
+                    else:
+                        code_prep.raw(f"""
+                        auto scale_act = scale;
+                        """)
+                    if fused_q_act:
+                        code_prep.raw(f"""
+                        auto quat_act = quat.op<op::{fused_q_act[0]}>();
+                        """)
+                    else:
+                        code_prep.raw(f"""
+                        auto quat_act = quat;
+                        """)
+                    if self._cfg.recalc_cov3d_in_bwd:
+                        code_prep.raw(f"""
+                        auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale_act, quat_act);
+                        """)
+                    else:
+                        code_prep.raw(f"""
+                        auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i_with_batch];
+                        """)
+                    code_prep.raw(f"""
+                    auto proj_grad_res = Gaussian3D::project_gaussian_to_2d_grad<float, 3>(dcov2d, point_cam, focal_xy, tan_fov, cam2world_R_T, cov3d_vec);
+                    dpoint_cam += std::get<0>(proj_grad_res);
+
+                    auto dxyz = cam2world_R_T.op<op::mv_colmajor>(dpoint_cam);
+                    auto cov3d_grad_res = Gaussian3D::scale_quat_to_cov3d_grad(std::get<1>(proj_grad_res), scale_act, quat_act);
+                    auto dscale = std::get<0>(cov3d_grad_res);
+                    auto dquat = std::get<1>(cov3d_grad_res);
+                    """)
+                    if fused_scale_act:
+                        code_prep.raw(f"""
+                        dscale = dscale.op<op::{fused_scale_act[1]}>(scale_act, scale);
+                        """)
+                    if fused_q_act:
+                        code_prep.raw(f"""
+                        dquat = dquat.op<op::{fused_q_act[1]}>(quat_act, quat);
+                        """)
+                    if fused_opacity_act:
+                        code_prep.raw(f"""
+                        tv::array<float, 1> opacity_val{{$opacity[i]}};
+                        tv::array<float, 1> dopacity_val{{$dopacity[i_with_batch]}};
+                        dopacity_val = dopacity_val.op<op::{fused_opacity_act[1]}>(opacity_val.op<op::{fused_opacity_act[0]}>(), opacity_val);
+                        """)
+                        if batch_size > 1:
+                            code_prep.raw(f"""
+                            dopacity_val_acc += dopacity_val[0];
+                            """)
+                        else:
+                            code_prep.raw(f"""
+                            $dopacity[i] = dopacity_val[0];
+                            """)
+                    if batch_size > 1:
+                        if not fused_opacity_act:
+                            code_prep.raw(f"""
+                            dopacity_val_acc += $dopacity[i_with_batch];
+                            """)
+                        code_prep.raw(f"""
+                        dscale_acc += dscale;
+                        dquat_acc += dquat;
+                        """)
+                    else:
+                        code_prep.raw(f"""
+                        op::reinterpret_cast_array_nd<3>($dscale_res)[i] = dscale;
+                        op::reinterpret_cast_array_nd<4>($dquat_res)[i] = dquat;
+                        """)
+                    code_prep.raw(f"""
+
+                    auto normed_dir = (point).op<op::normalize>();
+                    auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1) - has_color_base};
+                    auto dsh_ptr = op::reinterpret_cast_array_nd<3>($dcolor_sh_res) + i * {(degree + 1) * (degree + 1) - has_color_base};
+                    auto color_grad = op::reinterpret_cast_array_nd<3>($dcolor)[i_with_batch];
+
+                    uint8_t nn_packed = $sh_to_rgb_ne_0[i_with_batch];
+                    bool rgb0_ne_0 = nn_packed & 0x1;
+                    bool rgb1_ne_0 = nn_packed & 0x2;
+                    bool rgb2_ne_0 = nn_packed & 0x4;
+                    color_grad[0] *= rgb0_ne_0 ? 0.0f : 1.0f;
+                    color_grad[1] *= rgb1_ne_0 ? 0.0f : 1.0f;
+                    color_grad[2] *= rgb2_ne_0 ? 0.0f : 1.0f;
+                    """)
+                    sh_grad_fn = "sh_dir_to_rgb_grad" if batch_size == 1 else "sh_dir_to_rgb_grad_batch"
+                    if has_color_base:
+                        code_prep.raw(f"""
+                        auto dsh_base_ptr = op::reinterpret_cast_array_nd<3>($dcolor_base_sh_res) + i;
+                        auto dnormed_dir = Gaussian3D::{sh_grad_fn}<{cur_degree}>(color_grad, dsh_ptr,
+                            normed_dir, sh_ptr, dsh_base_ptr);
+                        """)
+                    else:
+                        code_prep.raw(f"""
+                        auto dnormed_dir = Gaussian3D::{sh_grad_fn}<{cur_degree}>(color_grad, dsh_ptr,
+                            normed_dir, sh_ptr);
+                        """)
+                    code_prep.raw(f"""
+                    dxyz += dnormed_dir.op<op::normalize_grad>(point);
+                    """)
+                    if batch_size == 1:
+                        code_prep.raw(f"""
+                        op::reinterpret_cast_array_nd<3>($dxyz_res)[i] = dxyz;
+                        """)
+                    else:
+                        code_prep.raw(f"""
+                        dxyz_acc += dxyz;
                         """)
                 if batch_size > 1:
-                    if not fused_opacity_act:
+                    code_prep.raw(f"""
+                    op::reinterpret_cast_array_nd<3>($dxyz_res)[i] = dxyz_acc;
+                    op::reinterpret_cast_array_nd<4>($dquat_res)[i] = dquat_acc;
+                    op::reinterpret_cast_array_nd<3>($dscale_res)[i] = dscale_acc;
+                    $dopacity_res[i] = dopacity_val_acc;
+                    """)
+                self._inliner.kernel_1d(prep_kernel_name, num, 0, code_prep)
+            else:
+                proxy = model.create_proxy(code_prep, "i", batch_size, is_bwd=True)
+
+                proxy.prepare_field_proxy()
+                if batch_size > 1:
+                    # code_prep.raw(f"""
+                    # float dopacity_val_acc = 0.0f;
+                    # tv::array<float, 3> dxyz_acc{{}};
+                    # tv::array<float, 4> dquat_acc{{}};
+                    # tv::array<float, 3> dscale_acc{{}};
+                    # """)
+                    for_ctx = code_prep.for_("int batch_idx = 0; batch_idx < $batch_size; ++batch_idx")
+                with for_ctx:
+                    if batch_size > 1:
                         code_prep.raw(f"""
-                        dopacity_val_acc += $dopacity[i_with_batch];
+                        auto i_with_batch = i + batch_idx * $num;
+                        """)
+                    else:
+                        code_prep.raw(f"""
+                        auto i_with_batch = i;
                         """)
                     code_prep.raw(f"""
-                    dscale_acc += dscale;
-                    dquat_acc += dquat;
+                    if ($radii[i_with_batch] == 0){{
+                        {"return" if batch_size == 1 else "continue"};
+                    }}
+                    auto uv_grad = op::reinterpret_cast_array_nd<2>($duv)[i_with_batch];
+                    auto conic_grad = op::reinterpret_cast_array_nd<3>($dconic)[i_with_batch];
+                    // auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i_with_batch];
                     """)
-                else:
-                    code_prep.raw(f"""
-                    op::reinterpret_cast_array_nd<3>($dscale_res)[i] = dscale;
-                    op::reinterpret_cast_array_nd<4>($dquat_res)[i] = dquat;
-                    """)
-                code_prep.raw(f"""
+                    if is_cam_bundle:
+                        # cam2world, focal and ppoint are tensor, load from gpu mem
+                        code_prep.raw(f"""
+                        auto cam2world_T = op::reinterpret_cast_array_nd<4, 3>($cam2world_T_ten)[batch_idx];
+                        auto focal_xy_ppoint = op::reinterpret_cast_array_nd<4>($focal_xy_ppoint_ten)[batch_idx];
+                        auto focal_xy = op::slice<0, 2>(focal_xy_ppoint);
+                        auto principal_point = op::slice<2, 4>(focal_xy_ppoint);
+                        auto cam2world_R_T = op::slice<0, 3>(cam2world_T);
+                        auto cam2world_center = cam2world_T[3];
 
-                auto normed_dir = (point).op<op::normalize>();
-                auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + i * {(degree + 1) * (degree + 1) - has_color_base};
-                auto dsh_ptr = op::reinterpret_cast_array_nd<3>($dcolor_sh_res) + i * {(degree + 1) * (degree + 1) - has_color_base};
-                auto color_grad = op::reinterpret_cast_array_nd<3>($dcolor)[i_with_batch];
+                        """)
+                        if enable_instance_render:
+                            code_prep.raw(f"""
+                            auto frame_id = $frame_ids[batch_idx];
+                            """)
+                    else:
+                        # cam2world, focal and ppoint are registers
+                        code_prep.raw(f"""
+                        auto cam2world_R_T = $cam2world_R_np;
+                        auto cam2world_center = $cam2world_center_np;
+                        auto focal_xy = $focal_xy_np;
+                        auto principal_point = $principal_point_np;
+                        """)
+                        if enable_instance_render:
+                            code_prep.raw(f"""
+                            auto frame_id = $frame_local_id;
+                            """)
+                    if enable_instance_render:
+                        code_prep.raw(f"""
+                        auto instance_id = $instance_ids[i];
+                        if (instance_id >= 0){{
+                            auto instance2world_T_val = op::reinterpret_cast_array_nd<4, 3>($instance2world_T)[frame_id * $num_instance + instance_id];
+                            // get cam2instance_T, cam2instance = world2instance @ cam2world
+                            auto cam2instance_T = instance2world_T_val.op<op::transform_matrix_colmajor_inverse>().op<op::transform_matrix_mm_nnn>(cam2world_T);
+                            cam2world_R_T = op::slice<0, 3>(cam2instance_T);
+                            cam2world_center = cam2instance_T[3];
+                        }}
+                        """)
+                    code_prep.raw(f"""
 
-                uint8_t nn_packed = $sh_to_rgb_ne_0[i_with_batch];
-                bool rgb0_ne_0 = nn_packed & 0x1;
-                bool rgb1_ne_0 = nn_packed & 0x2;
-                bool rgb2_ne_0 = nn_packed & 0x4;
-                color_grad[0] *= rgb0_ne_0 ? 0.0f : 1.0f;
-                color_grad[1] *= rgb1_ne_0 ? 0.0f : 1.0f;
-                color_grad[2] *= rgb2_ne_0 ? 0.0f : 1.0f;
-                """)
-                sh_grad_fn = "sh_dir_to_rgb_grad" if batch_size == 1 else "sh_dir_to_rgb_grad_batch"
-                if has_color_base:
-                    code_prep.raw(f"""
-                    auto dsh_base_ptr = op::reinterpret_cast_array_nd<3>($dcolor_base_sh_res) + i;
-                    auto dnormed_dir = Gaussian3D::{sh_grad_fn}<{cur_degree}>(color_grad, dsh_ptr,
-                        normed_dir, sh_ptr, dsh_base_ptr);
+                    auto tan_fov = 0.5f * resolution_wh.cast<float>() / focal_xy;
                     """)
-                else:
+                    proxy.read_field(GaussianCoreFields.XYZ, "point")
                     code_prep.raw(f"""
-                    auto dnormed_dir = Gaussian3D::{sh_grad_fn}<{cur_degree}>(color_grad, dsh_ptr,
-                        normed_dir, sh_ptr);
+                    point = point - cam2world_center;
+
+                    auto point_cam = cam2world_R_T.op<op::mv_rowmajor>(point);
+                    auto cov2d_arr = op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i_with_batch];
+                    auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, {"$dz[i_with_batch]" if dz is not None else "0.0f"}, point_cam, principal_point, focal_xy);
+                    auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad(conic_grad, cov2d_arr);
                     """)
-                code_prep.raw(f"""
-                dxyz += dnormed_dir.op<op::normalize_grad>(point);
-                """)
-                if batch_size == 1:
+                    proxy.read_field(GaussianCoreFields.SCALE, "scale")
+                    proxy.read_field(GaussianCoreFields.QUATERNION_XYZW, "quat")
+
+                    if self._cfg.recalc_cov3d_in_bwd:
+                        code_prep.raw(f"""
+                        auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale, quat);
+                        """)
+                    else:
+                        code_prep.raw(f"""
+                        auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i_with_batch];
+                        """)
                     code_prep.raw(f"""
-                    op::reinterpret_cast_array_nd<3>($dxyz_res)[i] = dxyz;
+                    auto proj_grad_res = Gaussian3D::project_gaussian_to_2d_grad<float, 3>(dcov2d, point_cam, focal_xy, tan_fov, cam2world_R_T, cov3d_vec);
+                    dpoint_cam += std::get<0>(proj_grad_res);
+
+                    auto dxyz = cam2world_R_T.op<op::mv_colmajor>(dpoint_cam);
+                    auto cov3d_grad_res = Gaussian3D::scale_quat_to_cov3d_grad(std::get<1>(proj_grad_res), scale, quat);
+                    auto dscale = std::get<0>(cov3d_grad_res);
+                    auto dquat = std::get<1>(cov3d_grad_res);
+                    tv::array<float, 1> dopacity_val{{$dopacity[i_with_batch]}};
+
                     """)
-                else:
+                    proxy.accumulate_field_grad(GaussianCoreFields.SCALE, "scale", "dscale")
+                    proxy.accumulate_field_grad(GaussianCoreFields.QUATERNION_XYZW, "quat", "dquat")
+                    
+                    proxy.read_field(GaussianCoreFields.OPACITY, "opacity")
+                    proxy.accumulate_field_grad(GaussianCoreFields.OPACITY, "opacity", "dopacity_val[0]")
+
                     code_prep.raw(f"""
-                    dxyz_acc += dxyz;
+                    auto normed_dir = (point).op<op::normalize>();
+                    auto color_grad = op::reinterpret_cast_array_nd<3>($dcolor)[i_with_batch];
+
+                    uint8_t nn_packed = $sh_to_rgb_ne_0[i_with_batch];
+                    bool rgb0_ne_0 = nn_packed & 0x1;
+                    bool rgb1_ne_0 = nn_packed & 0x2;
+                    bool rgb2_ne_0 = nn_packed & 0x4;
+                    color_grad[0] *= rgb0_ne_0 ? 0.0f : 1.0f;
+                    color_grad[1] *= rgb1_ne_0 ? 0.0f : 1.0f;
+                    color_grad[2] *= rgb2_ne_0 ? 0.0f : 1.0f;
                     """)
-            if batch_size > 1:
-                code_prep.raw(f"""
-                op::reinterpret_cast_array_nd<3>($dxyz_res)[i] = dxyz_acc;
-                op::reinterpret_cast_array_nd<4>($dquat_res)[i] = dquat_acc;
-                op::reinterpret_cast_array_nd<3>($dscale_res)[i] = dscale_acc;
-                $dopacity_res[i] = dopacity_val_acc;
-                """)
-            self._inliner.kernel_1d(prep_kernel_name, num, 0, code_prep)
+                    proxy.accumulate_field_grad(GaussianCoreFields.RGB, "", "color_grad", "normed_dir", "dnormed_dir")
+                    code_prep.raw(f"""
+                    dxyz += dnormed_dir.op<op::normalize_grad>(point);
+                    """)
+                    proxy.accumulate_field_grad(GaussianCoreFields.XYZ, "point", "dxyz")
+
+                if batch_size > 1:
+                    proxy.save_accumulated_grad()
+                add_vars = {f"{k}_ptr": v for k, v in model.get_user_field_dict().items()}
+                add_vars.update({f"{k}_grad_ptr": v for k, v in grad_model.get_user_field_dict().items()})
+                self._inliner.kernel_1d(prep_kernel_name, num, 0, code_prep,
+                    additional_vars=add_vars)
+
+                # raise NotImplementedError
         if return_uv_grad:
             return grad_model, duv.view(batch_size, -1, 2), grad_out.dcustom_features
         return grad_model, None, grad_out.dcustom_features
-
-    
-
-    def prepare_field_proxy(self, batch_size: int, is_bwd: bool, model: GaussianModelBase, code: pccm.FunctionCode, gaussian_idx: str):
-        return 
-
-    def read_field(self, is_bwd: bool, model: GaussianModelBase, code: pccm.FunctionCode, field: GaussianCoreFields, 
-            out: str, gaussian_idx: str, normed_dir: str):
-        """Write code segment to get field from model ptr.
-        """
-        has_color_base = model.color_sh_base is not None
-        cur_degree = model.cur_sh_degree
-        max_degree = model.color_sh_degree
-        if field == GaussianCoreFields.XYZ:
-            code.raw(f"""
-            auto {out} = op::reinterpret_cast_array_nd<3>(xyz)[{gaussian_idx}];
-            """)
-        elif field == GaussianCoreFields.QUATERNION_XYZW:
-            if is_bwd:
-                # keep inputs for grad
-                code.raw(f"""
-                auto {out}_raw = op::reinterpret_cast_array_nd<3>(quaternion_xyzw)[{gaussian_idx}];
-                """)
-                if model.fused_quaternion_xyzw_act_op is not None:
-                    code.raw(f"""
-                    auto {out} = {out}.op<op::{model.fused_quaternion_xyzw_act_op[0]}>();
-                    """)
-            else:
-                code.raw(f"""
-                auto {out} = op::reinterpret_cast_array_nd<3>(quaternion_xyzw)[{gaussian_idx}];
-                """)
-                if model.fused_quaternion_xyzw_act_op is not None:
-                    code.raw(f"""
-                    {out} = {out}.op<op::{model.fused_quaternion_xyzw_act_op[0]}>();
-                    """)
-
-        elif field == GaussianCoreFields.SCALE:
-            if is_bwd:
-                # keep inputs for grad
-                code.raw(f"""
-                auto {out}_raw = op::reinterpret_cast_array_nd<3>(scale)[{gaussian_idx}];
-                """)
-                if model.fused_scale_act_op is not None:
-                    code.raw(f"""
-                    auto {out} = {out}.op<op::{model.fused_scale_act_op[0]}>();
-                    """)
-            else:
-                code.raw(f"""
-                auto {out} = op::reinterpret_cast_array_nd<3>(scale)[{gaussian_idx}];
-                """)
-                if model.fused_scale_act_op is not None:
-                    code.raw(f"""
-                    {out} = {out}.op<op::{model.fused_scale_act_op[0]}>();
-                    """)
-
-        elif field == GaussianCoreFields.OPACITY:
-            if is_bwd:
-                code.raw(f"""
-                auto {out}_raw = opacity[{gaussian_idx}];
-                """)
-                if model.fused_opacity_act_op is not None:
-                    code.raw(f"""
-                    auto {out} = tv::array<float, 1>{{{out}}}.op<op::{model.fused_opacity_act_op[0]}>()[0];
-                    """)
-            else:
-                code.raw(f"""
-                auto {out} = opacity[{gaussian_idx}];
-                """)
-                if model.fused_opacity_act_op is not None:
-                    code.raw(f"""
-                    {out} = tv::array<float, 1>{{{out}}}.op<op::{model.fused_opacity_act_op[0]}>()[0];
-                    """)
-
-        elif field == GaussianCoreFields.RGB:
-            if not is_bwd:
-                code.raw(f"""
-                auto sh_ptr = op::reinterpret_cast_array_nd<3>(color_sh) + {gaussian_idx} * {(max_degree + 1) * (max_degree + 1) - has_color_base};
-                """)
-                if has_color_base:
-                    code.raw(f"""
-                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>(color_sh_base) + {gaussian_idx};
-                    auto {out} = Gaussian3D::sh_dir_to_rgb<{cur_degree}>({normed_dir}, sh_ptr, sh_base_ptr);
-                    """)
-                else:
-                    code.raw(f"""
-                    auto {out} = Gaussian3D::sh_dir_to_rgb<{cur_degree}>({normed_dir}, sh_ptr);
-                    """)
-        else:
-            raise NotImplementedError(f"field {field} not implemented yet.")
-
-    def read_field(self, is_bwd: bool, model: GaussianModelBase, code: pccm.FunctionCode, field: GaussianCoreFields, 
-            out: str, gaussian_idx: str, normed_dir: str):
-        """Write code segment to get field from model ptr.
-        """
-        has_color_base = model.color_sh_base is not None
-        cur_degree = model.cur_sh_degree
-        max_degree = model.color_sh_degree
-        if field == GaussianCoreFields.XYZ:
-            code.raw(f"""
-            auto {out} = op::reinterpret_cast_array_nd<3>(xyz)[{gaussian_idx}];
-            """)
-        elif field == GaussianCoreFields.QUATERNION_XYZW:
-            if is_bwd:
-                # keep inputs for grad
-                code.raw(f"""
-                auto {out}_raw = op::reinterpret_cast_array_nd<3>(quaternion_xyzw)[{gaussian_idx}];
-                """)
-                if model.fused_quaternion_xyzw_act_op is not None:
-                    code.raw(f"""
-                    auto {out} = {out}.op<op::{model.fused_quaternion_xyzw_act_op[0]}>();
-                    """)
-            else:
-                code.raw(f"""
-                auto {out} = op::reinterpret_cast_array_nd<3>(quaternion_xyzw)[{gaussian_idx}];
-                """)
-                if model.fused_quaternion_xyzw_act_op is not None:
-                    code.raw(f"""
-                    {out} = {out}.op<op::{model.fused_quaternion_xyzw_act_op[0]}>();
-                    """)
-
-        elif field == GaussianCoreFields.SCALE:
-            if is_bwd:
-                # keep inputs for grad
-                code.raw(f"""
-                auto {out}_raw = op::reinterpret_cast_array_nd<3>(scale)[{gaussian_idx}];
-                """)
-                if model.fused_scale_act_op is not None:
-                    code.raw(f"""
-                    auto {out} = {out}.op<op::{model.fused_scale_act_op[0]}>();
-                    """)
-            else:
-                code.raw(f"""
-                auto {out} = op::reinterpret_cast_array_nd<3>(scale)[{gaussian_idx}];
-                """)
-                if model.fused_scale_act_op is not None:
-                    code.raw(f"""
-                    {out} = {out}.op<op::{model.fused_scale_act_op[0]}>();
-                    """)
-
-        elif field == GaussianCoreFields.OPACITY:
-            if is_bwd:
-                code.raw(f"""
-                auto {out}_raw = opacity[{gaussian_idx}];
-                """)
-                if model.fused_opacity_act_op is not None:
-                    code.raw(f"""
-                    auto {out} = tv::array<float, 1>{{{out}}}.op<op::{model.fused_opacity_act_op[0]}>()[0];
-                    """)
-            else:
-                code.raw(f"""
-                auto {out} = opacity[{gaussian_idx}];
-                """)
-                if model.fused_opacity_act_op is not None:
-                    code.raw(f"""
-                    {out} = tv::array<float, 1>{{{out}}}.op<op::{model.fused_opacity_act_op[0]}>()[0];
-                    """)
-
-        elif field == GaussianCoreFields.RGB:
-            if not is_bwd:
-                code.raw(f"""
-                auto sh_ptr = op::reinterpret_cast_array_nd<3>(color_sh) + {gaussian_idx} * {(max_degree + 1) * (max_degree + 1) - has_color_base};
-                """)
-                if has_color_base:
-                    code.raw(f"""
-                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>(color_sh_base) + {gaussian_idx};
-                    auto {out} = Gaussian3D::sh_dir_to_rgb<{cur_degree}>({normed_dir}, sh_ptr, sh_base_ptr);
-                    """)
-                else:
-                    code.raw(f"""
-                    auto {out} = Gaussian3D::sh_dir_to_rgb<{cur_degree}>({normed_dir}, sh_ptr);
-                    """)
-        else:
-            raise NotImplementedError(f"field {field} not implemented yet.")
-
 
 class _RasterizeGaussians(torch.autograd.Function):
 

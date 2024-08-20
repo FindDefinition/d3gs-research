@@ -49,9 +49,11 @@ def cams_to_cam_bundle(cams: list[BasicPinholeCamera]):
     ppoints = np.stack([cam.principal_point for cam in cams], axis=0).reshape(-1, 2)
     focal_xy_ppoints = np.concatenate([focal_xys, ppoints], axis=1)
     focal_xy_ppoints_th = torch.from_numpy(np.ascontiguousarray(focal_xy_ppoints)).to(D3SIM_DEFAULT_DEVICE)
-    for cam in cams:
-        assert cam.frame_local_id is not None
-    frame_local_ids = torch.tensor([cam.frame_local_id for cam in cams], dtype=torch.int32, device=D3SIM_DEFAULT_DEVICE)
+    frame_local_ids = None 
+    if cams[0].frame_local_id is not None:
+        for cam in cams:
+            assert cam.frame_local_id is not None
+        frame_local_ids = torch.tensor([cam.frame_local_id for cam in cams], dtype=torch.int32, device=D3SIM_DEFAULT_DEVICE)
     cam_bundle = CameraBundle(focal_xy_ppoints_th, cams[0].image_shape_wh, frame_local_ids, cam2world_Ts_th)
     return cam_bundle
 

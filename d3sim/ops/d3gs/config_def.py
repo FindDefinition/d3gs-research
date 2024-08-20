@@ -86,6 +86,8 @@ class GaussianSplatConfig:
 
     use_int64_tile_touched: bool = False
 
+    enable_v2 = True
+
     # _bg_color_device: torch.Tensor | None = None
 
     @property 
