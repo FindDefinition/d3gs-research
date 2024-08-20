@@ -1,3 +1,4 @@
+import enum
 import math
 from typing import Annotated
 
@@ -6,6 +7,16 @@ from d3sim.core.pytorch.hmt import HomogeneousTensor
 import torch
 from d3sim.core import arrcheck
 import abc
+import pccm 
+from cumm.common import TensorViewArrayLinalg, TensorViewNVRTC
+
+class GaussianCoreFields(enum.Enum):
+    XYZ = "xyz"
+    QUATERNION_XYZW = "quaternion_xyzw"
+    OPACITY = "opacity"
+    SCALE = "scale"
+    RGB = "rgb"
+
 
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
@@ -68,6 +79,10 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
         return self.color_sh
 
     @property
+    def color_sh_base_act(self) -> torch.Tensor | None:
+        return self.color_sh_base
+
+    @property
     def color_sh_degree(self) -> int:
         dim = self.color_sh.shape[1]
         if self.color_sh_base is not None:
@@ -93,15 +108,15 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
     def create_model_with_act(self):
         if self.act_applied:
             return self
-        return self.__class__(xyz=self.xyz_act,
-                              quaternion_xyzw=self.quaternion_xyzw_act,
-                              scale=self.scale_act,
-                              opacity=self.opacity_act,
-                              color_sh=self.color_sh_act,
-                              cur_sh_degree=self.cur_sh_degree,
-                              color_sh_base=self.color_sh_base,
-                              instance_id=self.instance_id,
-                              act_applied=True)
+        return dataclasses.replace(
+            self,
+            xyz=self.xyz_act,
+            quaternion_xyzw=self.quaternion_xyzw_act,
+            scale=self.scale_act,
+            opacity=self.opacity_act,
+            color_sh=self.color_sh_act,
+            act_applied=True,
+        )
 
     @classmethod
     def empty(cls,
@@ -154,7 +169,8 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
         )
 
     def to_parameter(self):
-        return self.__class__(
+        return dataclasses.replace(
+            self,
             xyz=torch.nn.Parameter(self.xyz),
             quaternion_xyzw=torch.nn.Parameter(self.quaternion_xyzw),
             scale=torch.nn.Parameter(self.scale),
@@ -162,9 +178,6 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
             color_sh=torch.nn.Parameter(self.color_sh),
             color_sh_base=torch.nn.Parameter(self.color_sh_base)
             if self.color_sh_base is not None else None,
-            cur_sh_degree=self.cur_sh_degree,
-            act_applied=self.act_applied,
-            instance_id=self.instance_id,
         )
 
     @classmethod

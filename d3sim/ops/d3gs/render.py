@@ -9,7 +9,7 @@ from d3sim.core import dataclass_dispatch as dataclasses
 from d3sim.core.arrcheck.dcbase import DataClassWithArrayCheck
 import d3sim.core.arrcheck as ac
 from d3sim.data.scene_def.camera import BasicPinholeCamera
-from d3sim.ops.d3gs.base import GaussianModelBase, GaussianModelOrigin
+from d3sim.ops.d3gs.base import GaussianCoreFields, GaussianModelBase, GaussianModelOrigin
 from d3sim.csrc.inliner import INLINER, create_default_inliner
 import numpy as np
 import math
@@ -160,7 +160,6 @@ class GaussianSplatOp:
             enable_32bit_sort = self._cfg.enable_32bit_sort
             camera = cameras
             image_shape_wh = camera.image_shape_wh
-            # axis_front_u_v = camera.axes_front_u_v
 
             width = image_shape_wh[0]
             height = image_shape_wh[1]
@@ -1430,7 +1429,6 @@ class GaussianSplatOp:
         num = model.xyz.shape[0]
         camera = cameras
         image_shape_wh = camera.image_shape_wh
-        # axis_front_u_v = camera.axes_front_u_v
 
         width = image_shape_wh[0]
         height = image_shape_wh[1]
@@ -1729,6 +1727,179 @@ class GaussianSplatOp:
         if return_uv_grad:
             return grad_model, duv.view(batch_size, -1, 2), grad_out.dcustom_features
         return grad_model, None, grad_out.dcustom_features
+
+    
+
+    def prepare_field_proxy(self, batch_size: int, is_bwd: bool, model: GaussianModelBase, code: pccm.FunctionCode, gaussian_idx: str):
+        return 
+
+    def read_field(self, is_bwd: bool, model: GaussianModelBase, code: pccm.FunctionCode, field: GaussianCoreFields, 
+            out: str, gaussian_idx: str, normed_dir: str):
+        """Write code segment to get field from model ptr.
+        """
+        has_color_base = model.color_sh_base is not None
+        cur_degree = model.cur_sh_degree
+        max_degree = model.color_sh_degree
+        if field == GaussianCoreFields.XYZ:
+            code.raw(f"""
+            auto {out} = op::reinterpret_cast_array_nd<3>(xyz)[{gaussian_idx}];
+            """)
+        elif field == GaussianCoreFields.QUATERNION_XYZW:
+            if is_bwd:
+                # keep inputs for grad
+                code.raw(f"""
+                auto {out}_raw = op::reinterpret_cast_array_nd<3>(quaternion_xyzw)[{gaussian_idx}];
+                """)
+                if model.fused_quaternion_xyzw_act_op is not None:
+                    code.raw(f"""
+                    auto {out} = {out}.op<op::{model.fused_quaternion_xyzw_act_op[0]}>();
+                    """)
+            else:
+                code.raw(f"""
+                auto {out} = op::reinterpret_cast_array_nd<3>(quaternion_xyzw)[{gaussian_idx}];
+                """)
+                if model.fused_quaternion_xyzw_act_op is not None:
+                    code.raw(f"""
+                    {out} = {out}.op<op::{model.fused_quaternion_xyzw_act_op[0]}>();
+                    """)
+
+        elif field == GaussianCoreFields.SCALE:
+            if is_bwd:
+                # keep inputs for grad
+                code.raw(f"""
+                auto {out}_raw = op::reinterpret_cast_array_nd<3>(scale)[{gaussian_idx}];
+                """)
+                if model.fused_scale_act_op is not None:
+                    code.raw(f"""
+                    auto {out} = {out}.op<op::{model.fused_scale_act_op[0]}>();
+                    """)
+            else:
+                code.raw(f"""
+                auto {out} = op::reinterpret_cast_array_nd<3>(scale)[{gaussian_idx}];
+                """)
+                if model.fused_scale_act_op is not None:
+                    code.raw(f"""
+                    {out} = {out}.op<op::{model.fused_scale_act_op[0]}>();
+                    """)
+
+        elif field == GaussianCoreFields.OPACITY:
+            if is_bwd:
+                code.raw(f"""
+                auto {out}_raw = opacity[{gaussian_idx}];
+                """)
+                if model.fused_opacity_act_op is not None:
+                    code.raw(f"""
+                    auto {out} = tv::array<float, 1>{{{out}}}.op<op::{model.fused_opacity_act_op[0]}>()[0];
+                    """)
+            else:
+                code.raw(f"""
+                auto {out} = opacity[{gaussian_idx}];
+                """)
+                if model.fused_opacity_act_op is not None:
+                    code.raw(f"""
+                    {out} = tv::array<float, 1>{{{out}}}.op<op::{model.fused_opacity_act_op[0]}>()[0];
+                    """)
+
+        elif field == GaussianCoreFields.RGB:
+            if not is_bwd:
+                code.raw(f"""
+                auto sh_ptr = op::reinterpret_cast_array_nd<3>(color_sh) + {gaussian_idx} * {(max_degree + 1) * (max_degree + 1) - has_color_base};
+                """)
+                if has_color_base:
+                    code.raw(f"""
+                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>(color_sh_base) + {gaussian_idx};
+                    auto {out} = Gaussian3D::sh_dir_to_rgb<{cur_degree}>({normed_dir}, sh_ptr, sh_base_ptr);
+                    """)
+                else:
+                    code.raw(f"""
+                    auto {out} = Gaussian3D::sh_dir_to_rgb<{cur_degree}>({normed_dir}, sh_ptr);
+                    """)
+        else:
+            raise NotImplementedError(f"field {field} not implemented yet.")
+
+    def read_field(self, is_bwd: bool, model: GaussianModelBase, code: pccm.FunctionCode, field: GaussianCoreFields, 
+            out: str, gaussian_idx: str, normed_dir: str):
+        """Write code segment to get field from model ptr.
+        """
+        has_color_base = model.color_sh_base is not None
+        cur_degree = model.cur_sh_degree
+        max_degree = model.color_sh_degree
+        if field == GaussianCoreFields.XYZ:
+            code.raw(f"""
+            auto {out} = op::reinterpret_cast_array_nd<3>(xyz)[{gaussian_idx}];
+            """)
+        elif field == GaussianCoreFields.QUATERNION_XYZW:
+            if is_bwd:
+                # keep inputs for grad
+                code.raw(f"""
+                auto {out}_raw = op::reinterpret_cast_array_nd<3>(quaternion_xyzw)[{gaussian_idx}];
+                """)
+                if model.fused_quaternion_xyzw_act_op is not None:
+                    code.raw(f"""
+                    auto {out} = {out}.op<op::{model.fused_quaternion_xyzw_act_op[0]}>();
+                    """)
+            else:
+                code.raw(f"""
+                auto {out} = op::reinterpret_cast_array_nd<3>(quaternion_xyzw)[{gaussian_idx}];
+                """)
+                if model.fused_quaternion_xyzw_act_op is not None:
+                    code.raw(f"""
+                    {out} = {out}.op<op::{model.fused_quaternion_xyzw_act_op[0]}>();
+                    """)
+
+        elif field == GaussianCoreFields.SCALE:
+            if is_bwd:
+                # keep inputs for grad
+                code.raw(f"""
+                auto {out}_raw = op::reinterpret_cast_array_nd<3>(scale)[{gaussian_idx}];
+                """)
+                if model.fused_scale_act_op is not None:
+                    code.raw(f"""
+                    auto {out} = {out}.op<op::{model.fused_scale_act_op[0]}>();
+                    """)
+            else:
+                code.raw(f"""
+                auto {out} = op::reinterpret_cast_array_nd<3>(scale)[{gaussian_idx}];
+                """)
+                if model.fused_scale_act_op is not None:
+                    code.raw(f"""
+                    {out} = {out}.op<op::{model.fused_scale_act_op[0]}>();
+                    """)
+
+        elif field == GaussianCoreFields.OPACITY:
+            if is_bwd:
+                code.raw(f"""
+                auto {out}_raw = opacity[{gaussian_idx}];
+                """)
+                if model.fused_opacity_act_op is not None:
+                    code.raw(f"""
+                    auto {out} = tv::array<float, 1>{{{out}}}.op<op::{model.fused_opacity_act_op[0]}>()[0];
+                    """)
+            else:
+                code.raw(f"""
+                auto {out} = opacity[{gaussian_idx}];
+                """)
+                if model.fused_opacity_act_op is not None:
+                    code.raw(f"""
+                    {out} = tv::array<float, 1>{{{out}}}.op<op::{model.fused_opacity_act_op[0]}>()[0];
+                    """)
+
+        elif field == GaussianCoreFields.RGB:
+            if not is_bwd:
+                code.raw(f"""
+                auto sh_ptr = op::reinterpret_cast_array_nd<3>(color_sh) + {gaussian_idx} * {(max_degree + 1) * (max_degree + 1) - has_color_base};
+                """)
+                if has_color_base:
+                    code.raw(f"""
+                    auto sh_base_ptr = op::reinterpret_cast_array_nd<3>(color_sh_base) + {gaussian_idx};
+                    auto {out} = Gaussian3D::sh_dir_to_rgb<{cur_degree}>({normed_dir}, sh_ptr, sh_base_ptr);
+                    """)
+                else:
+                    code.raw(f"""
+                    auto {out} = Gaussian3D::sh_dir_to_rgb<{cur_degree}>({normed_dir}, sh_ptr);
+                    """)
+        else:
+            raise NotImplementedError(f"field {field} not implemented yet.")
 
 
 class _RasterizeGaussians(torch.autograd.Function):

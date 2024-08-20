@@ -9,7 +9,7 @@ from d3sim.constants import D3SIM_DEFAULT_DEVICE
 import d3sim.core.dataclass_dispatch as dataclasses
 
 from d3sim.core.geodef import EulerIntrinsicOrder
-from d3sim.data.scene_def.base import CameraFieldTypes, CoordSystem, LidarFieldTypes, Object2d, Object3d, Pose, Scene, Sensor, Resource, BaseFrame, ALL_RESOURCE_LOADERS, ResourceLoader
+from d3sim.data.scene_def.base import CameraFieldTypes, CoordSystem, DistortType, LidarFieldTypes, Object2d, Object3d, Pose, Scene, Sensor, Resource, BaseFrame, ALL_RESOURCE_LOADERS, ResourceLoader
 from d3sim.data.scene_def.camera import BasicCamera, BasicPinholeCamera
 import dask.dataframe as dd
 import numpy as np
@@ -564,8 +564,7 @@ def load_scene(scene_id: str, folder: str, cache_whole_in_memory: bool = True):
                 distortion=distortion,
                 image_rc=image_rc,
                 seg_label_rc=seg_rc,
-                # waymo camera x is front, z is up, use opencv cam (2, 0, 1) as reference.
-                axes_front_u_v=(0, -1, -2),
+                distortion_type=DistortType.kOpencvPinholeWaymo
             ))
     for idx, row in lidar_metadata.iterrows():
         frame_id = row['key.frame_timestamp_micros']

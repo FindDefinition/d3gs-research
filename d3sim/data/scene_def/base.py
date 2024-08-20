@@ -174,6 +174,8 @@ class Object3d(ObjectBase):
         self.pose.apply_world_transform_inplace(world2new)
         return self
 
+
+
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class Object2d(ObjectBase):
     bbox_xywh: np.ndarray # f32
@@ -296,7 +298,7 @@ class BaseFrame:
     pose: Pose
     sensors: list[Sensor] = dataclasses.field(default_factory=list)
     objects: list[Object3d] = dataclasses.field(default_factory=list)
-
+    local_id: int = -1
     def get_objects_by_source(self, source: str = "") -> list[Object3d]:
         res: list[Object3d] = []
         for obj in self.objects:
@@ -396,6 +398,9 @@ class BaseFrame:
                 break
         return dataclasses.replace(self, sensors=new_sensors)
 
+    def replace_objects(self, objects: list[Object3d]):
+        return dataclasses.replace(self, objects=objects)
+
 T_frame = TypeVar("T_frame", bound=BaseFrame)
 
 @dataclasses.dataclass
@@ -450,6 +455,7 @@ class Scene(Generic[T_frame]):
 
     def assign_frame_local_id_inplace(self):
         for i, frame in enumerate(self.frames):
+            frame.local_id = i
             for sensor in frame.sensors:
                 sensor.frame_local_id = i
 
@@ -470,7 +476,21 @@ class Scene(Generic[T_frame]):
                     if obj.track_id_3d is not None and obj.track_id_3d in track_id_str_to_local_id:
                         obj.track_local_id_3d = track_id_str_to_local_id[obj.track_id_3d]
 
+    def get_track_local_id_to_frame_local_ids(self):
+        track_local_id_to_frame_ids: dict[int, list[int]] = {}
+        for i, frame in enumerate(self.frames):
+            for obj in frame.objects:
+                if obj.track_local_id not in track_local_id_to_frame_ids:
+                    track_local_id_to_frame_ids[obj.track_local_id] = []
+                track_local_id_to_frame_ids[obj.track_local_id].append(i)
+        return track_local_id_to_frame_ids
+
+    def get_frames_by_frame_local_ids(self, frame_local_ids: list[int]):
+        return [self.frames[i] for i in frame_local_ids]
+
 class DistortType(enum.IntEnum):
-    kOpencvPinhole = 0
+    kNone = 0
+    kOpencvPinhole = 1
+    kOpencvPinholeWaymo = 2
 
 

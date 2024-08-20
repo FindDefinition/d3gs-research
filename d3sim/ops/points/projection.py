@@ -15,20 +15,22 @@ def project_points_to_camera(
         intrinsic: np.ndarray,
         image_size_wh: tuple[int, int],
         distort: np.ndarray,
-        distort_type: DistortType = DistortType.kOpencvPinhole,
-        axes_front_u_v: tuple[int, int, int] = (2, 0, 1)) -> tuple[torch.Tensor, torch.Tensor]:
+        distort_type: DistortType = DistortType.kOpencvPinhole) -> tuple[torch.Tensor, torch.Tensor]:
     focal_length = np.array([intrinsic[0, 0], intrinsic[1, 1]],
                             dtype=np.float32)
     resolution = np.array([image_size_wh[0], image_size_wh[1]],
                           dtype=np.float32)
-    center = np.array([intrinsic[0, 2], intrinsic[1, 2]],
+    center_unified = np.array([intrinsic[0, 2], intrinsic[1, 2]],
                       dtype=np.float32) / resolution
     
-    if distort_type == DistortType.kOpencvPinhole:
+    if distort_type == DistortType.kOpencvPinhole or distort_type == DistortType.kOpencvPinholeWaymo:
         assert distort.shape[0] >= 4
+        distort = distort.astype(np.float32)
+    elif distort_type == DistortType.kNone:
         distort = distort.astype(np.float32)
     else:
         raise NotImplementedError
+    # distort[:] = 0
     cam_to_point_T = np.ascontiguousarray(cam_to_point[:3].T)
     if cam_to_point_T.dtype != np.float32:
         cam_to_point_T = cam_to_point_T.astype(np.float32)
@@ -37,21 +39,20 @@ def project_points_to_camera(
     res = torch.empty([points.shape[0], 3], dtype=points.dtype, device=points.device)
     res_mask = torch.empty([points.shape[0]], dtype=torch.uint8, device=points.device)
     INLINER.kernel_1d(
-        f"project_points_to_cam_{distort.shape[0]}_{axes_front_u_v}", num, 0, f"""
+        f"project_points_to_cam_{distort.shape[0]}", num, 0, f"""
     namespace op = tv::arrayops;
     auto point = op::reinterpret_cast_array_nd<3>($points + i * $point_stride)[0];
-    auto center_val = $center;
+    auto center_unified_val = $center_unified;
     auto focal_length_val = $focal_length;
     auto distort_val = $distort;
     auto c2w_T = $cam_to_point_T;
     auto uvd_res = CameraOps::pos_to_uv(
-        point, $resolution, center_val, 
+        point, $resolution, center_unified_val, 
         focal_length_val, distort_val.data(), 
         static_cast<CameraDefs::DistortType>($distort_type), c2w_T, {{}});
     auto uv = std::get<0>(uvd_res);
     auto z = std::get<1>(uvd_res);
     auto valid = std::get<2>(uvd_res);
-    valid = true;
     valid &= (uv[0] > 0 && uv[1] > 0 && uv[0] < 1.0f && uv[1] < 1.0f);
     auto dir = (point - c2w_T[3]).op<op::normalize>();
     // assume front axis in camera space is pointing forward
@@ -107,7 +108,8 @@ def projected_point_uvd_to_jet_rgb(
         image_size_wh: tuple[int, int],
         val_range: tuple[float, float] = (0.5, 60.0),
         image_res: torch.Tensor | None = None,
-        size: int = 2):
+        size: int = 2,
+        z_min: float = 0.0):
     if image_res is None:
         image_res = torch.zeros([image_size_wh[1], image_size_wh[0], 3], dtype=torch.uint8, device=points_uvd.device)
     else:
@@ -115,8 +117,9 @@ def projected_point_uvd_to_jet_rgb(
     assert points_uvd.shape[1] == 3
     width = image_size_wh[0]
     height = image_size_wh[1]
-    range_upper = val_range[1]
-    range_lower = val_range[0]
+    range_upper = float(val_range[1])
+    range_lower = float(val_range[0])
+    z_min = float(z_min)
     INLINER.kernel_1d(
         "projected_point_uvd_to_rgb", points_uvd.shape[0], 0, f"""
     namespace op = tv::arrayops;
@@ -135,7 +138,7 @@ def projected_point_uvd_to_jet_rgb(
         for (int k = 0; k < $size * 2 - 1; ++k){{
             int u = u_int - $size + j;
             int v = v_int - $size + k;
-            if (u >= 0 && u < $width && v >= 0 && v < $height){{
+            if (u >= 0 && u < $width && v >= 0 && v < $height && depth > $z_min){{
                 $image_res[v * $width * 3 + u * 3 + 0] = rgb[0];
                 $image_res[v * $width * 3 + u * 3 + 1] = rgb[1];
                 $image_res[v * $width * 3 + u * 3 + 2] = rgb[2];

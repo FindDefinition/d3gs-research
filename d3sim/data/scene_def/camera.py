@@ -7,7 +7,7 @@ from d3sim.core import arrcheck
 from d3sim.core.arrcheck.tensor import ArrayCheck
 from d3sim.core.thtools import np_to_torch_dev
 from d3sim.data.scene_def.base import CameraFieldTypes
-from .base import BaseCamera, Object2d, Sensor, Resource, ALL_RESOURCE_LOADERS, ResourceLoader
+from .base import BaseCamera, DistortType, Object2d, Sensor, Resource, ALL_RESOURCE_LOADERS, ResourceLoader
 import d3sim.core.dataclass_dispatch as dataclasses 
 import numpy as np 
 import abc 
@@ -39,14 +39,23 @@ class ResizeParam:
     scale_wh: tuple[float, float]
     target_size_wh: tuple[int, int]
 
+@dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
+class UndistortParam:
+    target_size_wh: tuple[int, int]
+    distort: np.ndarray
+    cam_matrix: np.ndarray
+    new_cam_matrix: np.ndarray
+    roi: list[int]
+    distort_type: DistortType
+
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class BasicCamera(BaseCamera, abc.ABC):
     image_shape_wh: tuple[int, int]
     image_rc: Resource[np.ndarray]
     intrinsic: Annotated[np.ndarray, ArrayCheck([4, 4], arrcheck.Float32 | arrcheck.Float64)] = dataclasses.field(default_factory=lambda: np.eye(4))
     distortion: np.ndarray
-    axes_front_u_v: tuple[int, int, int] = (2, 0, 1)
-    _lazy_image_transform: list[CropParam | ResizeParam] = dataclasses.field(default_factory=list)
+    distortion_type: DistortType = DistortType.kOpencvPinhole
+    _lazy_image_transform: list[CropParam | ResizeParam | UndistortParam] = dataclasses.field(default_factory=list)
 
     def get_field_np(self, field: CameraFieldTypes | str) -> np.ndarray | None:
         if field == CameraFieldTypes.IMAGE:
@@ -63,10 +72,7 @@ class BasicCamera(BaseCamera, abc.ABC):
                 res.append(obj)
         return res
 
-    def crop(self, crop_xy: tuple[int, int], crop_wh: tuple[int, int]) -> Self:
-        x, y = crop_xy
-        w, h = crop_wh
-        assert x >= 0 and y >= 0 and x + w <= self.image_shape_wh[0] and y + h <= self.image_shape_wh[1]
+    def _crop_objects(self, objects: list[Object2d], crop_xy: tuple[int, int], crop_wh: tuple[int, int]) -> list[Object2d]:
         objects = self.get_objects_by_source()
         all_bbox_xywh = self.get_bbox_xywh()
         new_bbox_xy = np.maximum(all_bbox_xywh[:, :2], np.array(crop_xy))
@@ -79,6 +85,17 @@ class BasicCamera(BaseCamera, abc.ABC):
             valid = mask[i]
             if valid:
                 new_objs.append(dataclasses.replace(obj, bbox_xywh=new_bbox_xywh[i]))
+        return new_objs
+    
+    def crop(self, crop_xy: tuple[int, int], crop_wh: tuple[int, int]) -> Self:
+        x, y = crop_xy
+        w_valid = min(crop_wh[0], self.image_shape_wh[0] - x)
+        h_valid = min(crop_wh[1], self.image_shape_wh[1] - y)
+        crop_wh = (w_valid, h_valid)
+        w, h = crop_wh
+        assert x >= 0 and y >= 0 and x + w <= self.image_shape_wh[0] and y + h <= self.image_shape_wh[1]
+        objects = self.get_objects_by_source()
+        new_objs: list[Object2d] = self._crop_objects(objects, crop_xy, crop_wh)
         return dataclasses.replace(self, image_shape_wh=(w, h),
             intrinsic=self.get_cropped_intrinsic(crop_xy),
             objects=new_objs,
@@ -96,6 +113,24 @@ class BasicCamera(BaseCamera, abc.ABC):
             intrinsic=self.get_resized_intrinsic(scale),
              objects=new_objs,
              _lazy_image_transform=self._lazy_image_transform + [ResizeParam(real_scale_wh, target_size_wh)])
+
+    def undistort(self, alpha: float = 1.0) -> Self:
+        new_cam_matrix, roi = cv2.getOptimalNewCameraMatrix(self.intrinsic[:3, :3], self.distortion, self.image_shape_wh, alpha)
+        crop_xy = (roi[0], roi[1])
+        crop_wh = (roi[2], roi[3])
+        objects = self.get_objects_by_source()
+        new_objs: list[Object2d] = self._crop_objects(objects, crop_xy, crop_wh)
+
+        new_intrinsic = np.eye(4, dtype=np.float32)
+        new_intrinsic[:3, :3] = new_cam_matrix
+        new_intrinsic[0, 2] -= crop_xy[0]
+        new_intrinsic[1, 2] -= crop_xy[1]
+
+        undistort_param = UndistortParam(crop_wh, self.distortion, self.intrinsic[:3, :3], new_cam_matrix, list(roi), self.distortion_type)
+        distort = self.distortion.copy()
+        distort[:] = 0
+        # print(roi, new_cam_matrix)
+        return dataclasses.replace(self, objects=new_objs, distortion=distort, distortion_type=DistortType.kNone, image_shape_wh=crop_wh, intrinsic=new_intrinsic,  _lazy_image_transform=self._lazy_image_transform + [undistort_param])
 
     def get_cropped_intrinsic(self, crop_xy: tuple[int, int]) -> np.ndarray:
         x, y = crop_xy
@@ -138,6 +173,12 @@ class BasicCamera(BaseCamera, abc.ABC):
                 elif isinstance(transform, ResizeParam):
                     mode = cv2.INTER_NEAREST if img_is_seg else cv2.INTER_LINEAR
                     img = cv2.resize(img, transform.target_size_wh, interpolation=mode)
+                elif isinstance(transform, UndistortParam):
+                    assert transform.distort_type == DistortType.kOpencvPinhole or transform.distort_type == DistortType.kOpencvPinholeWaymo
+                    img = cv2.undistort(img, transform.cam_matrix, transform.distort, newCameraMatrix=transform.new_cam_matrix)
+                    img = img[transform.roi[1]:transform.roi[1] + transform.roi[3], transform.roi[0]:transform.roi[0] + transform.roi[2]]
+                    assert img.shape[1] == transform.target_size_wh[0]
+                    assert img.shape[0] == transform.target_size_wh[1]
             return img
         return img
 
@@ -161,6 +202,8 @@ class BasicCamera(BaseCamera, abc.ABC):
                         mode = Fv.InterpolationMode.BILINEAR
                     target_size_wh = transform.target_size_wh
                     img_th_chw = Fv.resize(img_th_chw, [target_size_wh[1], target_size_wh[0]], interpolation=mode)
+                else:
+                    raise NotImplementedError
             if output_is_chw:
                 return img_th_chw
             else:
