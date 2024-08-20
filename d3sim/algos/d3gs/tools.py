@@ -2,12 +2,12 @@ import math
 from plyfile import PlyData
 import torch 
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT, IsAppleSiliconMacOs
-from d3sim.ops.d3gs.base import GaussianModelBase, GaussianModelOrigin, GaussianModelOriginFused
+from d3sim.algos.d3gs.base import GaussianModelBase, GaussianModelOrigin, GaussianModelOriginFused
 import numpy as np
 from d3sim.csrc.inliner import INLINER
 from d3sim.csrc.gs3d import SHConstants
-from d3sim.ops.d3gs import config_def
-from d3sim.ops.d3gs.ops import simple_knn
+from d3sim.algos.d3gs import config_def
+from d3sim.algos.d3gs.ops import simple_knn
 from d3sim.core.pytorch.optim import NgpAdam
 
 def rgb_to_sh(rgb):

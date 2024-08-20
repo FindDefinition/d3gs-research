@@ -13,15 +13,15 @@ import os
 import sys
 from PIL import Image
 from typing import NamedTuple
-from d3sim.ops.d3gs.data.scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
+from d3sim.algos.d3gs.data.scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
-from d3sim.ops.d3gs.data.utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
+from d3sim.algos.d3gs.data.utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
 import numpy as np
 import json
 from pathlib import Path
 from plyfile import PlyData, PlyElement
-from d3sim.ops.d3gs.data.utils.sh_utils import SH2RGB
-from d3sim.ops.d3gs.data.scene.gaussian_model import BasicPointCloud
+from d3sim.algos.d3gs.data.utils.sh_utils import SH2RGB
+from d3sim.algos.d3gs.data.scene.gaussian_model import BasicPointCloud
 
 class CameraInfo(NamedTuple):
     uid: int

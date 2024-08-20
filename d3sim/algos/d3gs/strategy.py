@@ -3,13 +3,13 @@ from d3sim.core import dataclass_dispatch as dataclasses
 from d3sim.core.arrcheck.dcbase import DataClassWithArrayCheck
 from typing import Annotated, Callable, Literal, Mapping
 from d3sim.core.pytorch.hmt import HomogeneousTensor
-from d3sim.ops.d3gs.base import GaussianModelBase, GaussianModelOrigin
+from d3sim.algos.d3gs.base import GaussianModelBase, GaussianModelOrigin
 import d3sim.core.arrcheck as ac
 import torch
 from d3sim.csrc.inliner import INLINER
 import pccm 
-from d3sim.ops.d3gs.render import GaussianSplatOutput 
-from d3sim.ops.d3gs import config_def
+from d3sim.algos.d3gs.render import GaussianSplatOutput 
+from d3sim.algos.d3gs import config_def
 from d3sim.core.debugtools import get_from_store
 
 @torch.no_grad()

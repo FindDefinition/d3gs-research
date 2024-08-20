@@ -5,22 +5,22 @@ from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT, IsAppleSiliconMa
 from d3sim.core.train import BasicTrainEngine, StepEvent, TrainEvent, TrainEventType
 from d3sim.csrc.inliner import INLINER
 from d3sim.data.scene_def.camera import BasicPinholeCamera
-from d3sim.ops.d3gs.base import GaussianModelBase, GaussianModelOrigin, GaussianModelOriginFused
-from d3sim.ops.d3gs import config_def
+from d3sim.algos.d3gs.base import GaussianModelBase, GaussianModelOrigin, GaussianModelOriginFused
+from d3sim.algos.d3gs import config_def
 from d3sim.core import dataclass_dispatch as dataclasses
 
-from d3sim.ops.d3gs.data.load import load_scene_info_and_first_cam, Scene, original_cam_to_d3sim_cam
-from d3sim.ops.d3gs.render import CameraBundle, GaussianSplatOp, GaussianSplatOutput, rasterize_gaussians
-from d3sim.ops.d3gs.strategy import GaussianTrainState, GaussianStrategyBase, reset_param_in_optim
-from d3sim.ops.d3gs.losses import SSimLoss, SSimLossV2, SSimLossV3, l1_loss, ssim
+from d3sim.algos.d3gs.data.load import load_scene_info_and_first_cam, Scene, original_cam_to_d3sim_cam
+from d3sim.algos.d3gs.render import CameraBundle, GaussianSplatOp, GaussianSplatOutput, rasterize_gaussians, rasterize_gaussians_dynamic
+from d3sim.algos.d3gs.strategy import GaussianTrainState, GaussianStrategyBase, reset_param_in_optim
+from d3sim.algos.d3gs.losses import SSimLoss, SSimLossV2, SSimLossV3, l1_loss, ssim
 from cumm import tensorview as tv
-from d3sim.ops.d3gs.tools import create_origin_3dgs_optimizers, init_original_3dgs_model
+from d3sim.algos.d3gs.tools import create_origin_3dgs_optimizers, init_original_3dgs_model
 import contextlib 
 import pccm 
 
 import torch 
 from rich.progress import Progress, TextColumn, TaskProgressColumn, TimeRemainingColumn, BarColumn, MofNCompleteColumn
-from d3sim.ops.d3gs.gsplat import DefaultStrategy as StrategyRef
+from d3sim.algos.d3gs.gsplat import DefaultStrategy as StrategyRef
 from d3sim.core.debugtools import create_enter_debug_store
 import numpy as np 
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -172,7 +172,7 @@ class Trainer:
                         uv_grad_holder.requires_grad_(True)
                 with measure_and_print_torch(f"fwd-{self.model.xyz.shape[0]}", enable=verbose):
                     # with tv.measure_and_print("rasterize"):
-                    out = rasterize_gaussians(self.model, cam_bundle, op=self.gauss_op, training=True, uv_grad_holder=uv_grad_holder)
+                    out = rasterize_gaussians_dynamic(self.model, cam_bundle, op=self.gauss_op, training=True, uv_grad_holder=uv_grad_holder)
                 with measure_and_print_torch(f"fwd-loss-{self.model.xyz.shape[0]}", enable=verbose):
 
                     assert ev.step_ctx_value is not None 

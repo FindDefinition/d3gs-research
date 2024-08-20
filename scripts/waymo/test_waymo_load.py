@@ -43,20 +43,27 @@ def _dev_lidar():
         # uvd = frame.get_projected_pc_in_cam("lidar_1", "camera_1")
         cam = frame.get_camera_by_id("camera_1")
         if cam.segmentation is not None:
-            point_uvd = frame.get_projected_pc_in_cam("lidar_1", "camera_1")
+            # cam = cam.crop((0, 300), (1280, 720))
+            cam = cam.undistort(1)
+            frame = frame.replace_sensor(cam)
+            point_uvd, point_uvd_mask = frame.get_projected_pc_in_cam("lidar_1", "camera_1")
+            point_uvd = point_uvd[point_uvd_mask]
             depth_map = get_depth_map_from_uvd(point_uvd, cam.image_shape_wh)
             depth_map_rgb = depth_map_to_jet_rgb(depth_map).cpu().numpy()
-            res = frame.get_projected_image_in_cam_np("lidar_1", "camera_1")
-            cam = frame.get_camera_by_id("camera_1")
+            res = frame.get_projected_image_in_cam_np("lidar_1", "camera_1", size=3)
+            print(res.shape, cam.image_shape_wh)
+            # res = cam.image
+            # cam = frame.get_camera_by_id("camera_1")
             cam_seg_label = cam.segmentation
-            bbox_mask_np = cam.get_bbox_mask_np()
-            res.reshape(-1, 3)[cam_seg_label.reshape(-1) == CameraSegType.TYPE_SKY] = (70, 130, 25)
+            # bbox_mask_np = cam.get_bbox_mask_np()
+            bbox_mask_np = frame.get_image_3d_object_mask_np("camera_1")
+            # res.reshape(-1, 3)[cam_seg_label.reshape(-1) == CameraSegType.TYPE_SKY] = (70, 130, 25)
             res.reshape(-1, 3)[bbox_mask_np.reshape(-1)] = 0
-
+            print(res.shape)
             for obj in cam.objects:
-                cv2.rectangle(depth_map_rgb, (int(obj.bbox_xywh[0]), int(obj.bbox_xywh[1])),
+                cv2.rectangle(res, (int(obj.bbox_xywh[0]), int(obj.bbox_xywh[1])),
                     (int(obj.bbox_xywh[0] + obj.bbox_xywh[2]), int(obj.bbox_xywh[1] + obj.bbox_xywh[3])), (0, 255, 0), 2)
-            cv2.imwrite("test.jpg", depth_map_rgb)
+            cv2.imwrite("test.jpg", res)
             breakpoint()
         all_pc.append(frame.get_lidar_xyz("lidar_1", CoordSystem.WORLD))
     all_pc = np.concatenate(all_pc)

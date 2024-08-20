@@ -24,12 +24,13 @@ def get_qualname_of_type(klass: Type) -> str:
     return module + '.' + klass.__qualname__
 
 class GaussianModelProxyBase(abc.ABC):
-    def __init__(self, model: "GaussianModelBase", code: pccm.FunctionCode, gaussian_idx: str, batch_size: int, is_bwd: bool = False):
+    def __init__(self, model: "GaussianModelBase", code: pccm.FunctionCode, gaussian_idx: str, batch_idx: str, batch_size: int, is_bwd: bool = False):
         self._model = model 
         self._code = code 
         self._gaussian_idx = gaussian_idx
         self._batch_size = batch_size
         self._is_bwd = is_bwd
+        self._batch_idx = batch_idx
         self._unique_id = get_qualname_of_type(type(self))
 
     def get_unique_id(self):
@@ -281,6 +282,8 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
             res["color_sh_base"] = self.color_sh_base
         return res
 
+        
+
     def set_requires_grad(self, requires_grad: bool):
         self.xyz.requires_grad_(requires_grad)
         self.quaternion_xyzw.requires_grad_(requires_grad)
@@ -295,7 +298,7 @@ class GaussianModelBase(HomogeneousTensor, abc.ABC):
         self.opacity.grad = None
         self.color_sh.grad = None
 
-    def create_proxy(self, code: pccm.FunctionCode, gaussian_idx: str, batch_size: int, is_bwd: bool = False) -> GaussianModelProxyBase:
+    def create_proxy(self, code: pccm.FunctionCode, gaussian_idx: str, batch_idx: str, batch_size: int, is_bwd: bool = False) -> GaussianModelProxyBase:
         raise NotImplementedError
 
     def create_model_with_act(self):
@@ -466,5 +469,5 @@ class GaussianModelOriginFused(GaussianModelBase):
     def fused_opacity_act_op(self) -> tuple[str, str]:
         return ("sigmoid", "sigmoid_grad_out")
 
-    def create_proxy(self, code: pccm.FunctionCode, gaussian_idx: str, batch_size: int, is_bwd: bool = False) -> GaussianModelProxyBase:
-        return GaussianModelProxyOrigin(self, code, gaussian_idx, batch_size, is_bwd)
+    def create_proxy(self, code: pccm.FunctionCode, gaussian_idx: str, batch_idx: str, batch_size: int, is_bwd: bool = False) -> GaussianModelProxyBase:
+        return GaussianModelProxyOrigin(self, code, gaussian_idx, batch_idx, batch_size, is_bwd)

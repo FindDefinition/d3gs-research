@@ -1,13 +1,36 @@
-from typing import Any, Generic, Literal
+from typing import Any, ClassVar, Generic, Literal, get_args, get_origin
 import torch 
 import d3sim.core.dataclass_dispatch as dataclasses
 from typing import Self
 from torch.nn import ParameterDict
 
-from d3sim.core.arrcheck.dcbase import DataClassWithArrayCheck
+from d3sim.core.arrcheck.dcbase import DataClassWithArrayCheck, is_annotated, is_optional
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class HomogeneousTensor(DataClassWithArrayCheck):
+    __tensor_field_type_metas__: ClassVar[dict[str, Any] | None] = None
+    # TODO should we implement this in __init_subclass__?
+    def __post_init__(self):
+        # analysis annotations, check is Tensor.
+        # currently we support torch.Tensor, torch.nn.Parameter and 
+        # optional version of them.
+        type_self = type(self)
+        if type_self.__tensor_field_type_metas__ is None:
+            type_self.__tensor_field_type_metas__ = {}
+            for field in dataclasses.fields(self):
+                field_type = field.type
+                if is_annotated(field_type):
+                    field_type = get_args(field_type)[0]
+                    assert field_type is not None 
+                if is_optional(field_type):
+                    args = get_args(field_type) # is union, only None or Tensor allowed
+                    if torch.Tensor in args or torch.nn.Parameter in args:
+                        assert len(args) == 2, "only None or Tensor allowed"
+                        type_self.__tensor_field_type_metas__[field.name] = 1
+                else:
+                    if field_type == torch.Tensor or field_type == torch.nn.Parameter:
+                        type_self.__tensor_field_type_metas__[field.name] = 1
+
     def _get_all_fields(self) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
         res: dict[str, torch.Tensor] = {}
         res_non_tensor: dict[str, Any] = {}
@@ -100,3 +123,32 @@ class HomogeneousTensor(DataClassWithArrayCheck):
                 res = torch.nn.Parameter(res)
             setattr(self, key, res)
         return self
+
+    def to_autograd_tuple_repr(self):
+        """should only be used in pytorch autograd function
+        """
+        res = []
+        res_tensor_field_names = []
+        res_non_tensor = {}
+        tensor_field_metas = type(self).__tensor_field_type_metas__
+        assert tensor_field_metas is not None
+        for field in dataclasses.fields(self):
+            field_value = getattr(self, field.name)
+            if field.name in tensor_field_metas:
+                res_tensor_field_names.append(field.name)
+                res.append(field_value)
+            else:
+                res_non_tensor[field.name] = field_value
+        return tuple(res), res_tensor_field_names, res_non_tensor
+
+    def to_autograd_tuple_repr_tensor_only(self):
+        """should only be used in pytorch autograd function
+        """
+        tensor_field_metas = type(self).__tensor_field_type_metas__
+        assert tensor_field_metas is not None
+        return tuple(getattr(self, k) for k in tensor_field_metas)
+
+    @classmethod
+    def from_autograd_tuple_repr(cls, tensor_tuple, tensor_names, non_tensor_dict):
+        tensor_dict = dict(zip(tensor_names, tensor_tuple))
+        return cls(**tensor_dict, **non_tensor_dict)

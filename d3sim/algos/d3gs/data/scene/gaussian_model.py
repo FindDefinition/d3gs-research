@@ -11,15 +11,15 @@
 
 import torch
 import numpy as np
-from d3sim.ops.d3gs.data.utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from d3sim.algos.d3gs.data.utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
-from d3sim.ops.d3gs.data.utils.system_utils import mkdir_p
+from d3sim.algos.d3gs.data.utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
-from d3sim.ops.d3gs.data.utils.sh_utils import RGB2SH
+from d3sim.algos.d3gs.data.utils.sh_utils import RGB2SH
 # from simple_knn._C import distCUDA2
-from d3sim.ops.d3gs.data.utils.graphics_utils import BasicPointCloud
-from d3sim.ops.d3gs.data.utils.general_utils import strip_symmetric, build_scaling_rotation
+from d3sim.algos.d3gs.data.utils.graphics_utils import BasicPointCloud
+from d3sim.algos.d3gs.data.utils.general_utils import strip_symmetric, build_scaling_rotation
 
 class GaussianModel:
 

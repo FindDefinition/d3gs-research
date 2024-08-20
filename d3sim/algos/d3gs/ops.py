@@ -3,7 +3,7 @@ from d3sim.constants import D3SIM_DEFAULT_DEVICE, IsAppleSiliconMacOs
 from d3sim.csrc.inliner import INLINER 
 import torch 
 import numpy as np 
-from d3sim.ops.d3gs.data import scene
+from d3sim.algos.d3gs.data import scene
 import pccm 
 from tensorpc.flow import observe_function
 from cumm.inliner import torch_tensor_to_tv
@@ -183,7 +183,7 @@ def simple_knn(points: torch.Tensor, k: int, use_64bit: bool = False):
     return res_knn
 
 def __main():
-    from d3sim.ops.d3gs.data.load import load_scene_info_and_first_cam
+    from d3sim.algos.d3gs.data.load import load_scene_info_and_first_cam
     path =  "/Users/yanyan/Downloads/360_v2/garden"
     scene_info, cam = load_scene_info_and_first_cam(path)
     points = scene_info.point_cloud

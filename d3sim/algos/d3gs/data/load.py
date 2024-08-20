@@ -1,14 +1,14 @@
-from d3sim.ops.d3gs.tools import load_3dgs_origin_model
+from d3sim.algos.d3gs.tools import load_3dgs_origin_model
 import pickle
 import time
 import torch 
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT, IsAppleSiliconMacOs
 from d3sim.data.scene_def.base import Pose, Resource
 from d3sim.data.scene_def.camera import BasicPinholeCamera
-from d3sim.ops.d3gs.render import GaussianSplatConfig, GaussianSplatOp, rasterize_gaussians
-from d3sim.ops.d3gs.data.scene.dataset_readers import readColmapSceneInfo, SceneInfo
+from d3sim.algos.d3gs.render import GaussianSplatConfig, GaussianSplatOp, rasterize_gaussians
+from d3sim.algos.d3gs.data.scene.dataset_readers import readColmapSceneInfo, SceneInfo
 import numpy as np
-from d3sim.ops.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, cameraList_from_camInfos, camera_to_JSON, Camera
+from d3sim.algos.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, cameraList_from_camInfos, camera_to_JSON, Camera
 import random
 class _Args:
     def __init__(self):
@@ -72,7 +72,7 @@ def original_cam_to_d3sim_cam(cam: Camera):
     return d3sim_cam
 
 def load_model_and_cam(data_path: str, model_path: str):
-    from d3sim.ops.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, camera_to_JSON
+    from d3sim.algos.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, camera_to_JSON
     path = model_path
     test_data_path = PACKAGE_ROOT.parent / "scripts/d3gs_cam.pkl"
     if test_data_path.exists():
@@ -101,7 +101,7 @@ def load_model_and_cam(data_path: str, model_path: str):
     return mod, cam
 
 def load_model_and_2_cam(data_path: str, model_path: str):
-    from d3sim.ops.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, camera_to_JSON
+    from d3sim.algos.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, camera_to_JSON
     path = model_path
     scene_info = readColmapSceneInfo(data_path, "images_4", True)
     train_camera_infos = scene_info.train_cameras

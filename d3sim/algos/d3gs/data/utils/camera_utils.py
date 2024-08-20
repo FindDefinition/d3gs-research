@@ -9,10 +9,10 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from d3sim.ops.d3gs.data.scene.cameras import Camera
+from d3sim.algos.d3gs.data.scene.cameras import Camera
 import numpy as np
-from d3sim.ops.d3gs.data.utils.general_utils import PILtoTorch
-from d3sim.ops.d3gs.data.utils.graphics_utils import fov2focal
+from d3sim.algos.d3gs.data.utils.general_utils import PILtoTorch
+from d3sim.algos.d3gs.data.utils.graphics_utils import fov2focal
 import tqdm 
 WARNED = False
 

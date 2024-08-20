@@ -1,37 +1,16 @@
-from d3sim.ops.d3gs.tools import load_3dgs_origin_model
+from d3sim.algos.d3gs.tools import load_3dgs_origin_model
 import pickle
 import time
 import torch 
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT, IsAppleSiliconMacOs
 from d3sim.data.scene_def.base import Pose, Resource
 from d3sim.data.scene_def.camera import BasicPinholeCamera
-from d3sim.ops.d3gs.render import CameraBundle, GaussianSplatConfig, GaussianSplatOp, rasterize_gaussians
-from d3sim.ops.d3gs.data.scene.dataset_readers import readColmapSceneInfo
+from d3sim.algos.d3gs.render import CameraBundle, GaussianSplatConfig, GaussianSplatOp, rasterize_gaussians
+from d3sim.algos.d3gs.data.scene.dataset_readers import readColmapSceneInfo
 import numpy as np
 from d3sim.ops.points.projection import depth_map_to_jet_rgb 
-from d3sim.ops.d3gs.data.load import load_model_and_2_cam, load_model_and_cam
+from d3sim.algos.d3gs.data.load import load_model_and_2_cam, load_model_and_cam
 from torch.profiler import profile, record_function, ProfilerActivity
-# def _validate_color_sh(color_sh: torch.Tensor, xyz: torch.Tensor,
-#                        rgb_gaussian: torch.Tensor, cam2world_T_np: np.ndarray):
-#     from d3sim.ops.d3gs.data.utils.sh_utils import eval_sh
-#     shs_view = color_sh.transpose(1, 2).view(-1, 3, (3 + 1)**2)
-#     dir_pp = (xyz - torch.from_numpy(cam2world_T_np[3]).cuda().repeat(
-#         color_sh.shape[0], 1))
-#     dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
-#     sh2rgb = eval_sh(3, shs_view, dir_pp_normalized)
-#     colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
-#     print(torch.linalg.norm(colors_precomp - rgb_gaussian))
-
-#     # print(INLINER.get_nvrtc_module(prep_kernel_name).params.debug_code)
-#     # breakpoint()
-
-
-# def build_covariance_from_scaling_rotation(scaling, scaling_modifier,
-#                                            rotation):
-#     L = build_scaling_rotation(scaling_modifier * scaling, rotation)
-#     actual_covariance = L @ L.transpose(1, 2)
-#     symm = strip_symmetric(actual_covariance)
-#     return symm
 
 class _Args:
     def __init__(self):
