@@ -158,6 +158,7 @@ class GaussianSplatOp:
         training: bool = False,
         instance2world_T: torch.Tensor | None = None,
         custom_features: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
         prep_user_inputs: dict[str, Any] | None = None,
     ):
         enable_verbose = self._cfg.verbose
@@ -259,7 +260,7 @@ class GaussianSplatOp:
             prep_kernel_name = (
                 f"gs3d_preprocess_{self._cfg.tile_size}_{training}_"
                 f"{model.get_unique_kernel_key()}_"
-                f"{is_cam_bundle}")
+                f"{is_cam_bundle}_{mask is None}")
             code_prep = pccm.code()
             lowpass_filter = self._cfg.gaussian_lowpass_filter
             eps = self._cfg.eps
@@ -271,6 +272,14 @@ class GaussianSplatOp:
             using math_op_t = tv::arrayops::MathScalarOp<float>;
             auto resolution_wh = $resolution_wh_np;
             """)
+            if mask is not None:
+                code_prep.raw(f"""
+                bool invalid = $mask[i];
+                """)
+            else:
+                code_prep.raw(f"""
+                bool invalid = false;
+                """)
             if is_cam_bundle:
                 # cam2world, focal and ppoint are tensor, load from gpu mem
                 code_prep.raw(f"""
@@ -373,7 +382,7 @@ class GaussianSplatOp:
                 auto gaussian_rect_min = ((uv - radii_fp) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
                 auto gaussian_rect_max = ((uv + radii_fp + tile_size_xy_float - 1) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
                 int rect_area = (gaussian_rect_max[0] - gaussian_rect_min[0]) * (gaussian_rect_max[1] - gaussian_rect_min[1]);
-                bool is_empty = (det == 0 || z_in_cam < 0.2f) || rect_area == 0;
+                bool is_empty = (det == 0 || z_in_cam < 0.2f) || rect_area == 0 || invalid;
 
                 $tiles_touched[i] = is_empty ? 0 : rect_area;
                 $radii[i] = is_empty ? 0 : int(radii_fp);
@@ -469,7 +478,7 @@ class GaussianSplatOp:
                 auto gaussian_rect_min = ((uv - radii_fp) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
                 auto gaussian_rect_max = ((uv + radii_fp + tile_size_xy_float - 1) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
                 int rect_area = (gaussian_rect_max[0] - gaussian_rect_min[0]) * (gaussian_rect_max[1] - gaussian_rect_min[1]);
-                bool is_empty = (det == 0 || z_in_cam < 0.2f) || rect_area == 0;
+                bool is_empty = (det == 0 || z_in_cam < 0.2f) || rect_area == 0 || invalid;
 
                 $tiles_touched[i] = is_empty ? 0 : rect_area;
                 $radii[i] = is_empty ? 0 : int(radii_fp);
@@ -1984,6 +1993,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         cur_sh_degree,
         instance_id,
         custom_features,
+        mask,
         model_cls: type[GaussianModelOriginBase],
         # cameras
         camera_params: CameraParamBundle | BasicPinholeCamera,
@@ -2022,7 +2032,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 act_applied=True,
             )
         with measure_and_print_torch("FWD-all-torch", enable=enable_verbose):
-            out, fwd_ctx = op.forward(model, cam_bundle, training, instance2world_T, custom_features)
+            out, fwd_ctx = op.forward(model, cam_bundle, training, instance2world_T, custom_features, mask)
         with measure_and_print_torch("FWD-all-torch-2", enable=enable_verbose):
 
             if fwd_ctx is not None:
@@ -2077,7 +2087,7 @@ class _RasterizeGaussians(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, drgb, ddepth, dcustom_features, dT, dn_contrib, dradii):
         if len(ctx.saved_tensors) == 0:
-            return (None, ) * 17
+            return (None, ) * 18
         op: GaussianSplatOp = ctx.op
         if not drgb.is_contiguous():
             drgb = drgb.contiguous()
@@ -2150,7 +2160,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         grad_out, duv, dcf = op.backward(model, cam_bundle, fwd_ctx, out, gradient,
                                     ctx.return_uv_grad, instance2world_T, 
                                     custom_features)
-        return grad_out.xyz, grad_out.color_sh, grad_out.color_sh_base, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, dcf, None, None, None, None, None, None, None, duv
+        return grad_out.xyz, grad_out.color_sh, grad_out.color_sh_base, grad_out.scale, grad_out.quaternion_xyzw, grad_out.opacity, None, None, dcf, None, None, None, None, None, None, None, None, duv
 
 class _RasterizeGaussiansWithDynamicInput(torch.autograd.Function):
 
@@ -2173,6 +2183,7 @@ class _RasterizeGaussiansWithDynamicInput(torch.autograd.Function):
         user_inputs: dict[str, Any] | None,
         uv_grad_holder,
         custom_features,
+        mask,
         # model dynamic fields
         *model_fields,
     ):
@@ -2198,7 +2209,7 @@ class _RasterizeGaussiansWithDynamicInput(torch.autograd.Function):
             model = model_cls.from_autograd_tuple_repr(model_fields, model_tensor_names, model_nontensor_dict)
         with measure_and_print_torch("FWD-all-torch", enable=enable_verbose):
             out, fwd_ctx = op.forward(model, cam_bundle, training, instance2world_T, custom_features,
-                {**user_input_tensors, **user_inputs})
+                mask, {**user_input_tensors, **user_inputs})
         with measure_and_print_torch("FWD-all-torch-2", enable=enable_verbose):
 
             if fwd_ctx is not None:
@@ -2256,7 +2267,7 @@ class _RasterizeGaussiansWithDynamicInput(torch.autograd.Function):
         model_tensor_names = ctx.model_tensor_names
 
         if len(ctx.saved_tensors) == 0:
-            return (None, ) * (13 + len(model_tensor_names))
+            return (None, ) * (14 + len(model_tensor_names))
         op: GaussianSplatOp = ctx.op
         if not drgb.is_contiguous():
             drgb = drgb.contiguous()
@@ -2311,7 +2322,7 @@ class _RasterizeGaussiansWithDynamicInput(torch.autograd.Function):
         grad_out, duv, dcf = op.backward(model, cam_bundle, fwd_ctx, out, gradient,
                                     ctx.return_uv_grad, instance2world_T, 
                                     custom_features, {**user_input_tensors, **ctx.user_inputs})
-        return (None, ) * 11 + (duv, dcf) + grad_out.to_autograd_tuple_repr_tensor_only()
+        return (None, ) * 11 + (duv, dcf, None) + grad_out.to_autograd_tuple_repr_tensor_only()
         
 
 def rasterize_gaussians(
@@ -2323,6 +2334,7 @@ def rasterize_gaussians(
     uv_grad_holder: torch.Tensor | None = None,
     instance2world_T: torch.Tensor | None = None,
     custom_features: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
 ):
     # if not training:
     #     assert background_tensor is None, "background_tensor is only used in training mode"
@@ -2344,6 +2356,7 @@ def rasterize_gaussians(
         model.cur_sh_degree,
         model.instance_id,
         custom_features,
+        mask,
         type(model),
         cameras,
         c2w_T,
@@ -2379,6 +2392,7 @@ def rasterize_gaussians_dynamic(
     custom_features: torch.Tensor | None = None,
     prep_input_tensors: dict[str, torch.Tensor] | None = None,
     prep_inputs: dict[str, Any] | None = None,
+    mask: torch.Tensor | None = None,
 ):
     assert op._cfg.enable_v2, "only v2 (proxy) is supported"
     model = model.create_model_with_act()  # apply activation
@@ -2407,6 +2421,7 @@ def rasterize_gaussians_dynamic(
         # special tensors
         uv_grad_holder,
         custom_features,
+        mask,
         # model dynamic fields
         *mten,
     )

@@ -1,22 +1,43 @@
-from d3sim.algos.d3gs.base import GaussianModelProxyBase, GaussianModelOriginFused, GaussianCoreFields
+from d3sim.algos.d3gs.base import GaussianModelProxyBase, GaussianCoreFields
 from d3sim.core import dataclass_dispatch as dataclasses
 import pccm
+from d3sim.algos.d3gs.origin.model import GaussianModelOriginFused
 from typing import Annotated, Any, Type
 from d3sim.core import arrcheck
 import torch 
 
-class PVGProxy(GaussianModelProxyBase):
+@dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
+class PVGModelConfig:
+    cycle: float = 0.2
+    velocity_decay: float = 1.0
+
+class PVGProxy(GaussianModelProxyBase["PVGGaussianModel"]):
+    def __init__(self, cfg: PVGModelConfig, model: "PVGGaussianModel", code: pccm.FunctionCode, gaussian_idx: str, batch_idx: str, batch_size: int, is_bwd: bool = False):
+        super().__init__(model, code, gaussian_idx, batch_idx, batch_size, is_bwd)
+        self.cfg = cfg
+
     def validate_prep_inputs(self, inputs: dict[str, Any]): 
         assert "batch_ts" in inputs
+        assert "time_shift" in inputs
 
     def prepare_field_proxy(self):
         self._code.raw(f"""
         float t_gaussian = t_ptr[{self._gaussian_idx}];
         tv::array<float, 3> velocity = op::reinterpret_cast_array_nd<3>(velocity_ptr)[{self._gaussian_idx}];
-        float scale_t = scaling_t_ptr[{self._gaussian_idx}];
-        float batch_t = batch_ts[{self._batch_idx}];
+        float scale_t = math_op_t::exp(scaling_t_ptr[{self._gaussian_idx}]);
+        float batch_t = batch_ts[{self._batch_idx}] - time_shift;
         tv::array<float, 3> _proxy_xyz = op::reinterpret_cast_array_nd<3>(xyz_ptr)[{self._gaussian_idx}];
-        auto xyz_shm = _proxy_xyz + velocity * math_op_t::sin(batch_t - t_gaussian);
+        float a = 1.0f / {self.cfg.cycle} * M_PI * 2.0f;
+        auto xyz_shm = _proxy_xyz + velocity * math_op_t::sin((batch_t - t_gaussian) * a) / a;
+        
+        auto inst_velocity = velocity * math_op_t::exp(-scale_t / {self.cfg.cycle} / 2.0f * {self.cfg.velocity_decay});
+        xyz_shm += inst_velocity * time_shift;
+
+        auto marginal_t = math_op_t::exp(-0.5f * (t_gaussian - batch_t) * (t_gaussian - batch_t) / scale_t / scale_t);
+        auto _proxy_opacity_val = op::reinterpret_cast_array_nd<1>(opacity_ptr)[{self._gaussian_idx}];
+        auto opacity_t = _proxy_opacity_val.op<op::sigmoid>()[0] * marginal_t;
+
+        invalid = marginal_t <= 0.05f;
         """) 
 
         if self._batch_size == 1:
@@ -40,7 +61,7 @@ class PVGProxy(GaussianModelProxyBase):
         max_degree = self._model.color_sh_degree
         if field == GaussianCoreFields.XYZ:
             self._code.raw(f"""
-            auto {out} = op::reinterpret_cast_array_nd<3>(xyz_ptr)[{self._gaussian_idx}];
+            auto {out} = xyz_shm;
             """)
         elif field == GaussianCoreFields.QUATERNION_XYZW:
             self._code.raw(f"""
@@ -54,8 +75,7 @@ class PVGProxy(GaussianModelProxyBase):
             """)
         elif field == GaussianCoreFields.OPACITY:
             self._code.raw(f"""
-            auto {out}_raw = op::reinterpret_cast_array_nd<1>(opacity_ptr)[{self._gaussian_idx}];
-            auto {out} = {out}_raw.op<op::{self._model.fused_opacity_act_op[0]}>()[0];
+            auto {out} = opacity_t;
             """)
 
         elif field == GaussianCoreFields.RGB:
@@ -168,6 +188,13 @@ class PVGGaussianModel(GaussianModelOriginFused):
     velocity: Annotated[torch.Tensor, arrcheck.ArrayCheck(["N", 3], arrcheck.F32)]
     scaling_t: Annotated[torch.Tensor, arrcheck.ArrayCheck(["N", 1], arrcheck.F32)]
     t: Annotated[torch.Tensor, arrcheck.ArrayCheck(["N", 1], arrcheck.F32)]
-
+    cycle: float = 0.2
     def create_proxy(self, code: pccm.FunctionCode, gaussian_idx: str, batch_idx: str, batch_size: int, is_bwd: bool = False) -> GaussianModelProxyBase:
-        return PVGProxy(self, code, gaussian_idx, batch_idx, batch_size, is_bwd)
+        cfg = PVGModelConfig(cycle=self.cycle)
+        return PVGProxy(cfg, self, code, gaussian_idx, batch_idx, batch_size, is_bwd)
+    def get_proxy_field_dict(self):
+        res = super().get_proxy_field_dict()
+        res["velocity"] = self.velocity
+        res["scaling_t"] = self.scaling_t
+        res["t"] = self.t
+        return res
