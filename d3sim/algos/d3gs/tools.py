@@ -170,3 +170,11 @@ def create_origin_3dgs_optimizers(model: GaussianModelOriginBase, optim_cfg: con
                                                     lr_delay_mult=optim_cfg.position_lr_delay_mult,
                                                     max_steps=optim_cfg.position_lr_max_steps)
     return optimizers, xyz_schedule_xyz
+
+def create_origin_xyz_scheduler(optim_cfg: config_def.Optimizer, batch_size: int, spatial_lr_scale: float):
+    bs_scale = math.sqrt(batch_size)
+    xyz_schedule_xyz = get_expon_lr_func(lr_init=optim_cfg.position_lr_init*spatial_lr_scale * bs_scale,
+                                                    lr_final=optim_cfg.position_lr_final*spatial_lr_scale * bs_scale,
+                                                    lr_delay_mult=optim_cfg.position_lr_delay_mult,
+                                                    max_steps=optim_cfg.position_lr_max_steps)
+    return xyz_schedule_xyz

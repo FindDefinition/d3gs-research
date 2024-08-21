@@ -192,7 +192,7 @@ class GaussianStrategyOrigin(GaussianStrategyBase):
 
         auto cnt_val = $cnt[i];
         auto duv_ndc_length_val = $duv_ndc_length[i];
-        bool is_grad_high = (duv_ndc_length_val / math_op_t::max(cnt_val, 1.0f)) >= $(self.cfg.grow_grad2d);
+        bool is_grad_high = (duv_ndc_length_val / math_op_t::max(cnt_val, 1.0f)) >= $(self.grow_grad2d);
         auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
         auto opacity_val = $opacity[i];
         """)
@@ -205,21 +205,21 @@ class GaussianStrategyOrigin(GaussianStrategyBase):
             code.raw(f"""
             opacity_val = tv::array<float, 1>{{opacity_val}}.op<op::{model.fused_opacity_act_op[0]}>()[0];
             """)
-        # print("self.cfg.grow_scale3d", self.cfg.grow_grad2d, self.cfg.grow_scale3d, scene_scale, model.fused_opacity_act_op)
+        # print("self.grow_scale3d", self.grow_grad2d, self.grow_scale3d, scene_scale, model.fused_opacity_act_op)
         code.raw(f"""
         auto scale_max = scale.op<op::reduce_max>();
-        bool is_small = scale_max <= $(self.cfg.grow_scale3d) * $scene_scale;
+        bool is_small = scale_max <= $(self.grow_scale3d) * $scene_scale;
         bool is_dupli = is_grad_high && is_small;
         $should_dupti_u8[i] = is_dupli;
         bool is_large = !is_small;
         float max_radii_val = $max_radii[i];
-        bool prune_mask_origin = opacity_val < $(self.cfg.prune_opacity_thresh);
+        bool prune_mask_origin = opacity_val < $(self.prune_opacity_thresh);
         if ($prune_too_big){{
-            prune_mask_origin |= scale_max > $(self.cfg.prune_scale3d) * $scene_scale;
+            prune_mask_origin |= scale_max > $(self.prune_scale3d) * $scene_scale;
         }}
         if ($refine_by_radii){{
-            is_large |= max_radii_val > $(self.cfg.grow_scale2d);
-            prune_mask_origin |= max_radii_val > $(self.cfg.prune_scale2d);
+            is_large |= max_radii_val > $(self.grow_scale2d);
+            prune_mask_origin |= max_radii_val > $(self.prune_scale2d);
         }}
         bool is_split = is_grad_high && is_large;
         $should_split_u8[i] = is_split;
@@ -305,13 +305,13 @@ class GaussianStrategyOrigin(GaussianStrategyBase):
         op::reinterpret_cast_array_nd<3>($(new_model_split.xyz))[i] = new_xyz;
         op::reinterpret_cast_array_nd<3>($(new_model_split.scale))[i] = new_scaling.op<op::log>();
         // calc prune mask
-        bool prune_mask_origin = opacity_val < $(self.cfg.prune_opacity_thresh);
+        bool prune_mask_origin = opacity_val < $(self.prune_opacity_thresh);
         auto new_scaling_max = new_scaling.op<op::reduce_max>();
         if($prune_too_big){{
-            prune_mask_origin |= new_scaling_max > $(self.cfg.prune_scale3d) * $scene_scale;
+            prune_mask_origin |= new_scaling_max > $(self.prune_scale3d) * $scene_scale;
         }}
         if ($refine_by_radii){{
-            prune_mask_origin |= max_radii_val > $(self.cfg.prune_scale2d);
+            prune_mask_origin |= max_radii_val > $(self.prune_scale2d);
         }}
         $split_prune_mask_u8[i] = prune_mask_origin;
         """)

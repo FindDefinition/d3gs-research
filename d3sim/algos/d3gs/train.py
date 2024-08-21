@@ -261,6 +261,7 @@ class Trainer:
             if param_group["name"] == "xyz":
                 lr = self.scheduler(ev.cur_step + 1)
                 param_group['lr'] = lr
+                # print("!!!", ev.cur_step + 1, lr)
                 break
 
     def _on_log(self, ev: TrainEvent):
@@ -339,7 +340,7 @@ def __main():
     else:
         cfg = config_def.Config(
             model=config_def.Model(config_def.GaussianSplatConfig(enable_32bit_sort=False, gaussian_std_sigma=3.0)),
-            train=config_def.Train(iterations=7000, batch_size=8)
+            train=config_def.Train(iterations=30000, batch_size=1)
         )
     model = GaussianModelOriginFused.create_from_dataset(ds, device=torch.device(D3SIM_DEFAULT_DEVICE)) 
     model = model.to_parameter()

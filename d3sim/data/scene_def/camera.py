@@ -212,7 +212,7 @@ class BasicCamera(BaseCamera, abc.ABC):
                 return img_th_chw.permute(1, 2, 0)
         return img_th
 
-    def get_image_torch(self, output_is_chw: bool = False, device: torch.device | None = None) -> torch.Tensor:
+    def get_image_torch(self, output_is_chw: bool = False, device: torch.device | str | None = None) -> torch.Tensor:
         if self.has_field_torch(CameraFieldTypes.IMAGE):
             res = self.get_field_torch(CameraFieldTypes.IMAGE)
             assert res is not None 

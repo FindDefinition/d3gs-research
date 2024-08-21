@@ -10,6 +10,7 @@ from torch.optim.optimizer import Optimizer
 import tqdm
 from d3sim.algos.d3gs.data_base import D3simDataset
 from d3sim.algos.d3gs.origin.strategy import GaussianStrategyOrigin
+from d3sim.algos.d3gs.tools import create_origin_xyz_scheduler
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT, IsAppleSiliconMacOs
 from d3sim.core.train import BasicTrainEngine, StepEvent, TrainEvent, TrainEventType
 from d3sim.csrc.inliner import INLINER
@@ -42,6 +43,7 @@ class OriginXYZLRScheduler(torch.optim.lr_scheduler.LambdaLR):
             lr_final = lr_init
 
         def helper(step: int):
+            step += 1 # match original 3dgs behavior
             if step < 0 or (lr_init == 0.0 and lr_final == 0.0):
                 # Disable this parameter
                 return 0.0
@@ -54,7 +56,11 @@ class OriginXYZLRScheduler(torch.optim.lr_scheduler.LambdaLR):
                 delay_rate = 1.0
             t = np.clip(step / max_steps, 0, 1)
             log_lerp = np.exp(np.log(lr_init) * (1 - t) + np.log(lr_final) * t)
-            return delay_rate * log_lerp
+            res = delay_rate * log_lerp
+            # print("!!!", step, res)
+            # we want to set lr directly instead of multiple the init lr.
+            # so we return the ratio.
+            return res / lr_init
 
         super().__init__(optimizer, helper, -1)
 
@@ -70,6 +76,8 @@ class GaussianOptimizerOrigin(GaussianOptimizerBase[GaussianModelOriginBase]):
     })
     position_lr_final: float = 0.0000016
     position_lr_delay_mult: float = 0.01
+    position_lr_max_steps: int = 30_000
+
     optims: dict[str, OptimizerObject] | None = None
     def init_optimizer(self, model: GaussianModelOriginBase, dataset: D3simDataset, batch_size: int, total_step: int): 
         bs_scale = math.sqrt(batch_size)
@@ -88,7 +96,7 @@ class GaussianOptimizerOrigin(GaussianOptimizerBase[GaussianModelOriginBase]):
             optim = torch.optim.Adam([{"params": [p], "lr": lr, "name": k}], eps=1e-15 / bs_scale, fused=fused, betas=(1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.999)))
             schr = None 
             if k == "xyz":
-                schr = OriginXYZLRScheduler(optim, lr, self.position_lr_final * bs_scale * dataset.extent, max_steps=total_step)
+                schr = OriginXYZLRScheduler(optim, lr, self.position_lr_final * bs_scale * dataset.extent, max_steps=self.position_lr_max_steps)
             optims[k] = OptimizerObject(optimizer=optim, scheduler=schr)
         self.optims = optims
 
@@ -129,7 +137,7 @@ class Trainer:
     def __post_init__(self) -> None:
         self.engine = BasicTrainEngine()
         self.device = torch.device(D3SIM_DEFAULT_DEVICE)
-
+        self.rescale_steps_by_batch_size(self.batch_size)
         self.optim.init_optimizer(self.model, self.dataset, self.batch_size, self.iterations)
         self.train_state = GaussianTrainState.create(self.model.xyz.shape[0], device=self.model.xyz.device)
         # self.train_state_ref = GaussianTrainState.create(model.xyz.shape[0], device=model.xyz.device)
@@ -140,17 +148,30 @@ class Trainer:
 
         # self.strategy = GaussianStrategyOrigin()
         self.strategy_ref = StrategyRef(verbose=True)
+        # cfg = config_def.Config(
+        #     model=config_def.Model(config_def.GaussianSplatConfig(enable_32bit_sort=False, gaussian_std_sigma=3.0)),
+        #     train=config_def.Train(iterations=7000, batch_size=8)
+        # )
+        # cfg.train.rescale_steps_by_batch_size(self.batch_size)
 
         # self.op = GaussianSplatOp(cfg.model.op)
-        
+        # self.scheduler = create_origin_xyz_scheduler(cfg.train.optim, cfg.train.batch_size, self.dataset.extent)
         self.use_strategy_ref = False
         self.engine.register_period_event("log", 1000, self._on_log)
         self.engine.register_period_event("up_sh", 1000 // self.batch_size, self._on_up_sh_degree_log)
-        # self.engine.register_base_event(TrainEventType.BeginIteration, self._on_iter_start)
+        self.engine.register_base_event(TrainEventType.BeginIteration, self._on_iter_start)
         if not self.use_strategy_ref:
             self.engine.register_period_event("update_gs", self.strategy.refine_every, self._on_refine_gs)
             self.engine.register_period_event("reset_opacity", self.strategy.reset_opacity_every, self._on_reset_opacity)
         # self.engine.register_period_event("do_eval", 2000, self._on_reset_opacity)
+    
+    def _on_iter_start(self, ev: TrainEvent):
+        for param_group in self.optim.get_optimizer_dict()["xyz"].param_groups:
+            if param_group["name"] == "xyz":
+                # lr = self.scheduler(ev.cur_step + 1)
+                # param_group['lr'] = lr
+                # print("!!! REF", ev.cur_step + 1, param_group['lr'])
+                break
 
     def rescale_steps_by_batch_size(self, batch_size: int):
         self.iterations = self.iterations // batch_size
@@ -422,7 +443,7 @@ def __main():
     op = GaussianSplatOp(cfg.model.op)
     optim = GaussianOptimizerOrigin()
     strategy = GaussianStrategyOrigin()
-    trainer = Trainer(model, ds, op, optim, strategy)
+    trainer = Trainer(model, ds, op, optim, strategy, iterations=7000, batch_size=8)
     with create_enter_debug_store():
 
         trainer.train(ds)

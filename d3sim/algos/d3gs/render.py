@@ -731,8 +731,7 @@ class GaussianSplatOp:
 
             final_T = torch.empty(
                 [batch_size, height, width],
-                dtype=torch.float64
-                if self._cfg.transmittance_is_double else torch.float32,
+                dtype=torch.float32,
                 device=xyz.device)
             n_contrib = torch.empty([batch_size, height, width],
                                     dtype=torch.int32,
@@ -1177,7 +1176,7 @@ class GaussianSplatOp:
                         if (alpha < 1.0f / 255.0f || power > 0.0f){{
                             continue;
                         }}
-                        float next_T = T * (1.0f - alpha);
+                        {t_dtype} next_T = T * {t_dtype}(1.0f - alpha);
                         """)
 
                     else:
@@ -1186,7 +1185,7 @@ class GaussianSplatOp:
                         if (alpha < 1.0f / 255.0f){{
                             continue;
                         }}
-                        float next_T = T * (1.0f - alpha);
+                        {t_dtype} next_T = T * {t_dtype}(1.0f - alpha);
                         """)
                 if not is_bwd:
                     code_rasterize.raw(f"""
@@ -2131,8 +2130,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 )
             else:
                 cam_bundle = ctx.cams
-            if op._cfg.transmittance_is_double:
-                dT = dT.float()
+            # if op._cfg.transmittance_is_double:
+            #     dT = dT.float()
             gradient = GaussianSplatGradients(
                 drgb=drgb,
                 ddepth=ddepth,
