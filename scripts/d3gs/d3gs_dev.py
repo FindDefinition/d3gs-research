@@ -6,10 +6,10 @@ from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT, IsAppleSiliconMa
 from d3sim.data.scene_def.base import Pose, Resource
 from d3sim.data.scene_def.camera import BasicPinholeCamera
 from d3sim.algos.d3gs.render import CameraBundle, GaussianSplatConfig, GaussianSplatOp, rasterize_gaussians
-from d3sim.algos.d3gs.data.scene.dataset_readers import readColmapSceneInfo
+from d3sim.algos.d3gs.origin.data.scene.dataset_readers import readColmapSceneInfo
 import numpy as np
 from d3sim.ops.points.projection import depth_map_to_jet_rgb 
-from d3sim.algos.d3gs.data.load import load_model_and_2_cam, load_model_and_cam
+from d3sim.algos.d3gs.origin.data.load import load_model_and_2_cam, load_model_and_cam
 from torch.profiler import profile, record_function, ProfilerActivity
 
 class _Args:

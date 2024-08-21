@@ -4,7 +4,7 @@ import d3sim.core.dataclass_dispatch as dataclasses
 from typing import Self
 from torch.nn import ParameterDict
 
-from d3sim.core.arrcheck.dcbase import DataClassWithArrayCheck, is_annotated, is_optional
+from d3sim.core.arrcheck.dcbase import DataClassWithArrayCheck, extract_annotated_type_and_meta, is_annotated, is_optional
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class HomogeneousTensor(DataClassWithArrayCheck):
@@ -19,17 +19,20 @@ class HomogeneousTensor(DataClassWithArrayCheck):
             type_self.__tensor_field_type_metas__ = {}
             for field in dataclasses.fields(self):
                 field_type = field.type
+                annometa = None
                 if is_annotated(field_type):
                     field_type = get_args(field_type)[0]
                     assert field_type is not None 
+                    _, annometa = extract_annotated_type_and_meta(field_type)
+
                 if is_optional(field_type):
                     args = get_args(field_type) # is union, only None or Tensor allowed
                     if torch.Tensor in args or torch.nn.Parameter in args:
                         assert len(args) == 2, "only None or Tensor allowed"
-                        type_self.__tensor_field_type_metas__[field.name] = 1
+                        type_self.__tensor_field_type_metas__[field.name] = annometa
                 else:
                     if field_type == torch.Tensor or field_type == torch.nn.Parameter:
-                        type_self.__tensor_field_type_metas__[field.name] = 1
+                        type_self.__tensor_field_type_metas__[field.name] = annometa
 
     def _get_all_fields(self) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
         res: dict[str, torch.Tensor] = {}
@@ -41,7 +44,6 @@ class HomogeneousTensor(DataClassWithArrayCheck):
             else:
                 res_non_tensor[field.name] = field_value
         return res, res_non_tensor
-
 
     def get_all_tensor_fields(self) -> dict[str, torch.Tensor]:
         return self._get_all_fields()[0]
@@ -152,3 +154,46 @@ class HomogeneousTensor(DataClassWithArrayCheck):
     def from_autograd_tuple_repr(cls, tensor_tuple, tensor_names, non_tensor_dict):
         tensor_dict = dict(zip(tensor_names, tensor_tuple))
         return cls(**tensor_dict, **non_tensor_dict)
+
+    @classmethod 
+    def empty_like(cls, hmt: Self, num: int | None = None, not_param: bool = False, external_tensors: dict[str, torch.Tensor] | None = None):
+        tensor_fields, non_tensor_fields = hmt._get_all_fields()
+        for key, value in tensor_fields.items():
+            is_parameter = isinstance(value, torch.nn.Parameter)
+            if external_tensors is not None and key in external_tensors:
+                tensor_fields[key] = external_tensors[key]
+            else:
+                if num is not None:
+                    tensor_fields[key] = torch.empty(num, *value.shape[1:], dtype=value.dtype, device=value.device)
+                else:
+                    tensor_fields[key] = torch.empty_like(value)
+            if is_parameter and not not_param:
+                tensor_fields[key] = torch.nn.Parameter(tensor_fields[key])
+        return cls(**tensor_fields, **non_tensor_fields)
+
+    @classmethod
+    def zeros_like(cls, hmt: Self, num: int | None = None, not_param: bool = False, external_tensors: dict[str, torch.Tensor] | None = None):
+        tensor_fields, non_tensor_fields = hmt._get_all_fields()
+        for key, value in tensor_fields.items():
+            is_parameter = isinstance(value, torch.nn.Parameter)
+            if external_tensors is not None and key in external_tensors:
+                tensor_fields[key] = external_tensors[key]
+            else:
+                if num is not None:
+                    tensor_fields[key] = torch.zeros(num, *value.shape[1:], dtype=value.dtype, device=value.device)
+                else:
+                    tensor_fields[key] = torch.zeros_like(value)
+            if is_parameter and not not_param:
+                tensor_fields[key] = torch.nn.Parameter(tensor_fields[key])
+        return cls(**tensor_fields, **non_tensor_fields)
+
+    def to_parameter(self) -> Self:
+        all_tensors = self.get_all_tensor_fields()
+        res_tensors: dict[str, torch.nn.Parameter] = {}
+        for key, value in all_tensors.items():
+            if value.dtype == torch.float32 or value.dtype == torch.float16 or value.dtype == torch.bfloat16:
+                res_tensors[key] = torch.nn.Parameter(value)
+        return dataclasses.replace(
+            self,
+            **res_tensors
+        )

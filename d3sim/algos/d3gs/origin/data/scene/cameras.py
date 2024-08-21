@@ -12,8 +12,16 @@
 import torch
 from torch import nn
 import numpy as np
-from d3sim.algos.d3gs.data.utils.graphics_utils import getWorld2View2, getProjectionMatrix
-from d3sim.algos.d3gs.render import fov2focal
+from d3sim.algos.d3gs.origin.data.utils.graphics_utils import getWorld2View2, getProjectionMatrix
+import math 
+
+
+def fov2focal(fov: float, length: int):
+    return float(length) / (2 * math.tan(fov / 2))
+
+
+def focal2fov(focal: float, length: int):
+    return 2 * math.atan(float(length) / (2 * focal))
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,

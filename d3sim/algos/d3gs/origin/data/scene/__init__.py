@@ -12,11 +12,11 @@
 import os
 import random
 import json
-from d3sim.algos.d3gs.data.utils.system_utils import searchForMaxIteration
-from d3sim.algos.d3gs.data.scene.dataset_readers import sceneLoadTypeCallbacks
-from d3sim.algos.d3gs.data.scene.gaussian_model import GaussianModel
-from d3sim.algos.d3gs.data.arguments import ModelParams
-from d3sim.algos.d3gs.data.utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from d3sim.algos.d3gs.origin.data.utils.system_utils import searchForMaxIteration
+from d3sim.algos.d3gs.origin.data.scene.dataset_readers import sceneLoadTypeCallbacks
+from d3sim.algos.d3gs.origin.data.scene.gaussian_model import GaussianModel
+from d3sim.algos.d3gs.origin.data.arguments import ModelParams
+from d3sim.algos.d3gs.origin.data.utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
 class Scene:
 

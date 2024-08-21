@@ -1,15 +1,19 @@
+from typing import Literal
 from d3sim.algos.d3gs.tools import load_3dgs_origin_model
 import pickle
 import time
 import torch 
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT, IsAppleSiliconMacOs
-from d3sim.data.scene_def.base import Pose, Resource
+from d3sim.data.scene_def.base import CameraFieldTypes, Pose, Resource
 from d3sim.data.scene_def.camera import BasicPinholeCamera
 from d3sim.algos.d3gs.render import GaussianSplatConfig, GaussianSplatOp, rasterize_gaussians
-from d3sim.algos.d3gs.data.scene.dataset_readers import readColmapSceneInfo, SceneInfo
+from d3sim.algos.d3gs.origin.data.scene.dataset_readers import readColmapSceneInfo, SceneInfo
 import numpy as np
-from d3sim.algos.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, cameraList_from_camInfos, camera_to_JSON, Camera
+from d3sim.algos.d3gs.origin.data.utils.camera_utils import cameraList_from_camInfos_gen, cameraList_from_camInfos, camera_to_JSON, Camera
 import random
+from d3sim.algos.d3gs.data_base import D3simDataset, DatasetPointCloud
+from d3sim.core import dataclass_dispatch as dataclasses
+
 class _Args:
     def __init__(self):
         self.resolution = 1
@@ -68,11 +72,11 @@ def original_cam_to_d3sim_cam(cam: Camera):
     d3sim_cam = BasicPinholeCamera(id="", timestamp=0, pose=Pose(np.eye(4), np.linalg.inv(world2cam)), 
         image_rc=Resource(base_uri="", loader_type=""), intrinsic=intrinsic_4x4, distortion=np.zeros(4, np.float32),
         image_shape_wh=image_shape_wh, objects=[])
-
+    d3sim_cam.set_field_torch(CameraFieldTypes.IMAGE, cam.original_image)
     return d3sim_cam
 
 def load_model_and_cam(data_path: str, model_path: str):
-    from d3sim.algos.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, camera_to_JSON
+    from d3sim.algos.d3gs.origin.data.utils.camera_utils import cameraList_from_camInfos_gen, camera_to_JSON
     path = model_path
     test_data_path = PACKAGE_ROOT.parent / "scripts/d3gs_cam.pkl"
     if test_data_path.exists():
@@ -101,7 +105,7 @@ def load_model_and_cam(data_path: str, model_path: str):
     return mod, cam
 
 def load_model_and_2_cam(data_path: str, model_path: str):
-    from d3sim.algos.d3gs.data.utils.camera_utils import cameraList_from_camInfos_gen, camera_to_JSON
+    from d3sim.algos.d3gs.origin.data.utils.camera_utils import cameraList_from_camInfos_gen, camera_to_JSON
     path = model_path
     scene_info = readColmapSceneInfo(data_path, "images_4", True)
     train_camera_infos = scene_info.train_cameras
@@ -114,3 +118,47 @@ def load_model_and_2_cam(data_path: str, model_path: str):
 
     return mod, [cam_first, cam_second]
 
+
+@dataclasses.dataclass
+class OriginDataset(D3simDataset):
+    root: str
+    image_folder: str = "images_4"
+    shuffle: bool = True
+    resolution_scales: list[float] | None = None
+    def __post_init__(self):
+        scene_info, cam = load_scene_info_and_first_cam(self.root, self.image_folder)
+        resolution_scales = self.resolution_scales
+        if resolution_scales is None:
+            resolution_scales = [1.0]
+        self._cameras_split = {
+            "train": {},
+            "test": {}
+        }
+
+        self.scene_info = scene_info
+        if self.shuffle:
+            random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
+            random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
+        self.cameras_extent = scene_info.nerf_normalization["radius"]
+        for resolution_scale in resolution_scales:
+            print("Loading Training Cameras")
+            cams = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, _Args())
+            cams_d3sim = [original_cam_to_d3sim_cam(cam) for cam in cams]
+            self._cameras_split["train"][resolution_scale] = cams_d3sim
+
+            print("Loading Test Cameras")
+            cams = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, _Args())
+            cams_d3sim = [original_cam_to_d3sim_cam(cam) for cam in cams]
+            self._cameras_split["test"][resolution_scale] = cams_d3sim
+
+    @property
+    def dataset_point_cloud(self) -> DatasetPointCloud:
+        points = self.scene_info.point_cloud
+        return DatasetPointCloud(xyz=points.points, rgb=points.colors)
+
+    @property
+    def extent(self) -> float:
+        return self.scene_info.nerf_normalization["radius"]
+
+    def get_cameras(self, split: Literal["train", "test"]) -> list[BasicPinholeCamera]:
+        return self._cameras_split[split][1.0]

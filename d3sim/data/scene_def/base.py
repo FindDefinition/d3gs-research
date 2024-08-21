@@ -221,6 +221,7 @@ class Sensor(Generic[T_field_type]):
     # if not None, indicate the coordinate system of sensor data (e.g. pointcloud)
     data_coord: CoordSystem | None = None
     frame_local_id: int | None = None
+    scene_local_id: int | None = None
 
     homogeneous_fields: dict[str | T_field_type, np.ndarray] = dataclasses.field(default_factory=dict)
     _homogeneous_torch_fields: dict[str | T_field_type, torch.Tensor] = dataclasses.field(default_factory=dict)
@@ -245,7 +246,12 @@ class Sensor(Generic[T_field_type]):
         return field in self.homogeneous_fields
 
     def set_field_np(self, field: T_field_type | str, data: np.ndarray):
+        assert isinstance(data, np.ndarray)
         self.homogeneous_fields[field] = data
+
+    def set_field_torch(self, field: T_field_type | str, data: torch.Tensor):
+        assert isinstance(data, torch.Tensor)
+        self._homogeneous_torch_fields[field] = data
 
     def get_field_np(self, field: T_field_type | str) -> np.ndarray | None:
         if field not in self.homogeneous_fields:
@@ -258,7 +264,12 @@ class Sensor(Generic[T_field_type]):
             raise ValueError(f"Field {field} not found")
         return res
 
+    def has_field_torch(self, field: T_field_type | str) -> bool:
+        return field in self._homogeneous_torch_fields
+
     def get_field_torch(self, field: T_field_type | str, device: str | torch.device | None = None) -> torch.Tensor | None:
+        if field in self._homogeneous_torch_fields:
+            return self._homogeneous_torch_fields[field]
         npf = self.get_field_np(field)
         if npf is None:
             return None
@@ -400,10 +411,13 @@ class BaseFrame:
 
 T_frame = TypeVar("T_frame", bound=BaseFrame)
 
-@dataclasses.dataclass
+@dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class Scene(Generic[T_frame]):
     id: str 
     frames: list[T_frame]
+    fields: dict[str, np.ndarray] = dataclasses.field(default_factory=dict)
+    scene_local_id: int | None = None
+
     def __post_init__(self):
         # create resource loaders
         self.init_loaders()
@@ -455,6 +469,14 @@ class Scene(Generic[T_frame]):
             frame.local_id = i
             for sensor in frame.sensors:
                 sensor.frame_local_id = i
+                sensor.scene_local_id = self.scene_local_id
+
+    def assign_scene_local_id_inplace(self, scene_local_id: int):
+        self.scene_local_id = scene_local_id
+        for i, frame in enumerate(self.frames):
+            frame.local_id = i
+            for sensor in frame.sensors:
+                sensor.scene_local_id = scene_local_id
 
     def assign_track_local_id_inplace(self):
         track_id_str_to_local_id: dict[str | int, int] = {}

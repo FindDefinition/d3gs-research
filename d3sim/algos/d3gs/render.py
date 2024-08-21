@@ -9,7 +9,9 @@ from d3sim.core import dataclass_dispatch as dataclasses
 from d3sim.core.arrcheck.dcbase import DataClassWithArrayCheck
 import d3sim.core.arrcheck as ac
 from d3sim.data.scene_def.camera import BasicPinholeCamera
-from d3sim.algos.d3gs.base import GaussianCoreFields, GaussianModelBase, GaussianModelOrigin
+from d3sim.algos.d3gs.base import GaussianCoreFields, GaussianModelBase
+from d3sim.algos.d3gs.origin.model import GaussianModelOriginBase
+
 from d3sim.csrc.inliner import INLINER, create_default_inliner
 import numpy as np
 import math
@@ -17,20 +19,13 @@ import torch
 
 import pccm
 from cumm.gemm.codeops import div_up
-from d3sim.constants import IsAppleSiliconMacOs
+from d3sim.constants import D3SIM_DEFAULT_DEVICE, IsAppleSiliconMacOs
 import cumm.tensorview as tv
-from d3sim.algos.d3gs.data.utils.general_utils import strip_symmetric, build_scaling_rotation
+from d3sim.algos.d3gs.origin.data.utils.general_utils import strip_symmetric, build_scaling_rotation
 from cumm.inliner import torch_tensor_to_tv, measure_and_print_torch, get_current_stream
 from torch.autograd.function import once_differentiable
 from d3sim.algos.d3gs.config_def import GaussianSplatConfig
 
-
-def fov2focal(fov: float, length: int):
-    return float(length) / (2 * math.tan(fov / 2))
-
-
-def focal2fov(focal: float, length: int):
-    return 2 * math.atan(float(length) / (2 * focal))
 
 
 _DEFAULT_ENABLE_32BIT_SORT = False if IsAppleSiliconMacOs else False
@@ -122,6 +117,24 @@ class CameraParamBundle:
 class CameraBundle(CameraParamBundle):
     cam2world_T: torch.Tensor
 
+    @classmethod 
+    def from_pinhole_cams(cls, cams: list[BasicPinholeCamera]):
+        cam2worlds = [cam.pose.to_world for cam in cams]
+        cam2world_Ts = [cam2world[:3].T for cam2world in cam2worlds]
+        cam2world_Ts_onearray = np.stack(cam2world_Ts, axis=0).reshape(-1, 4, 3)
+        cam2world_Ts_th = torch.from_numpy(np.ascontiguousarray(cam2world_Ts_onearray)).to(D3SIM_DEFAULT_DEVICE)
+
+        focal_xys = np.stack([cam.focal_length for cam in cams], axis=0).reshape(-1, 2)
+        ppoints = np.stack([cam.principal_point for cam in cams], axis=0).reshape(-1, 2)
+        focal_xy_ppoints = np.concatenate([focal_xys, ppoints], axis=1)
+        focal_xy_ppoints_th = torch.from_numpy(np.ascontiguousarray(focal_xy_ppoints)).to(D3SIM_DEFAULT_DEVICE)
+        frame_local_ids = None 
+        if cams[0].frame_local_id is not None:
+            for cam in cams:
+                assert cam.frame_local_id is not None
+            frame_local_ids = torch.tensor([cam.frame_local_id for cam in cams], dtype=torch.int32, device=D3SIM_DEFAULT_DEVICE)
+        cam_bundle = CameraBundle(focal_xy_ppoints_th, cams[0].image_shape_wh, frame_local_ids, cam2world_Ts_th)
+        return cam_bundle
 
 class GaussianSplatOp:
 
@@ -140,7 +153,7 @@ class GaussianSplatOp:
 
     def forward(
         self,
-        model: GaussianModelBase,
+        model: GaussianModelOriginBase,
         cameras: BasicPinholeCamera | CameraBundle,
         training: bool = False,
         instance2world_T: torch.Tensor | None = None,
@@ -492,9 +505,10 @@ class GaussianSplatOp:
                     code_prep.raw(f"""
                     op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = rgb.op<op::maximum>(0.0f);
                     """)
-                add_vars = {f"{k}_ptr": v for k, v in model.get_user_field_dict().items()}
+                add_vars = {f"{k}_ptr": v for k, v in model.get_proxy_field_dict().items()}
                 if prep_user_inputs is not None:
                     add_vars.update(prep_user_inputs)
+                    proxy.validate_prep_inputs(prep_user_inputs)
                 self._inliner.kernel_1d(prep_kernel_name, batch_size * num, 0, code_prep, 
                     additional_vars=add_vars)
 
@@ -766,7 +780,7 @@ class GaussianSplatOp:
         return output_dc, ctx
 
     def rasterize_forward_backward(self,
-                                   model: GaussianModelBase,
+                                   model: GaussianModelOriginBase,
                                    ctx: GaussianSplatOpContext,
                                    out: GaussianSplatOutput,
                                    grad: GaussianSplatGradients | None = None,
@@ -1504,7 +1518,7 @@ class GaussianSplatOp:
         return grad_out
 
     def backward(self,
-                 model: GaussianModelBase,
+                 model: GaussianModelOriginBase,
                  cameras: BasicPinholeCamera | CameraBundle,
                  ctx: GaussianSplatOpContext,
                  out: GaussianSplatOutput,
@@ -1586,8 +1600,9 @@ class GaussianSplatOp:
         #                                  quaternion_xyzw=dquat_res,
         #                                  opacity=dopacity_res,
         #                                  color_sh_base=dcolor_base_sh_res)
-        grad_model = model.zeros_like(model, dopacity if batch_size == 1 else None)
-        
+        grad_model = model.zeros_like(model, not_param=True, external_tensors={"opacity": dopacity} if batch_size == 1 else None)
+        # grad_model = model.zeros_like_debug(model, dopacity=dopacity if batch_size == 1 else None)
+
         instance_ids = model.instance_id
         prep_kernel_name = (
             f"gs3d_preprocess_bwd_{self._cfg.tile_size}_{model.get_unique_kernel_key()}_"
@@ -1943,8 +1958,8 @@ class GaussianSplatOp:
 
                 if batch_size > 1:
                     proxy.save_accumulated_grad()
-                add_vars = {f"{k}_ptr": v for k, v in model.get_user_field_dict().items()}
-                add_vars.update({f"{k}_grad_ptr": v for k, v in grad_model.get_user_field_dict().items()})
+                add_vars = {f"{k}_ptr": v for k, v in model.get_proxy_field_dict().items()}
+                add_vars.update({f"{k}_grad_ptr": v for k, v in grad_model.get_proxy_field_dict().items()})
                 if prep_user_inputs is not None:
                     add_vars.update(prep_user_inputs)
                 self._inliner.kernel_1d(prep_kernel_name, num, 0, code_prep,
@@ -1970,7 +1985,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         cur_sh_degree,
         instance_id,
         custom_features,
-        model_cls: type[GaussianModelBase],
+        model_cls: type[GaussianModelOriginBase],
         # cameras
         camera_params: CameraParamBundle | BasicPinholeCamera,
         cam2world_T: torch.Tensor | None,
@@ -2144,7 +2159,7 @@ class _RasterizeGaussiansWithDynamicInput(torch.autograd.Function):
     def forward(
         ctx,
         # model cls and autograd repr data
-        model_cls: type[GaussianModelBase],
+        model_cls: type[GaussianModelOriginBase],
         model_tensor_names: list[str],
         model_nontensor_dict: dict[str, Any],
         # cameras
@@ -2301,7 +2316,7 @@ class _RasterizeGaussiansWithDynamicInput(torch.autograd.Function):
         
 
 def rasterize_gaussians(
-    model: GaussianModelBase,
+    model: GaussianModelOriginBase,
     cameras: BasicPinholeCamera | CameraBundle,
     op: GaussianSplatOp,
     training=False,
@@ -2356,7 +2371,7 @@ def rasterize_gaussians(
     return out
 
 def rasterize_gaussians_dynamic(
-    model: GaussianModelBase,
+    model: GaussianModelOriginBase,
     cameras: BasicPinholeCamera | CameraBundle,
     op: GaussianSplatOp,
     training=False,

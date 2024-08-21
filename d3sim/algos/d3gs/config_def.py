@@ -88,8 +88,6 @@ class GaussianSplatConfig:
 
     enable_v2 = True
 
-    # _bg_color_device: torch.Tensor | None = None
-
     @property 
     def num_channels(self):
         return 4 if self.render_rgba else 3
@@ -97,11 +95,6 @@ class GaussianSplatConfig:
     @property
     def block_size(self):
         return self.tile_size[0] * self.tile_size[1]
-
-    # def get_bg_color_device(self, device: torch.device):
-    #     if self._bg_color_device is None:
-    #         self._bg_color_device = torch.from_numpy(self.bg_color).to(device)
-    #     return self._bg_color_device
 
 
 @dataclasses.dataclass

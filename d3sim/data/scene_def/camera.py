@@ -213,6 +213,10 @@ class BasicCamera(BaseCamera, abc.ABC):
         return img_th
 
     def get_image_torch(self, output_is_chw: bool = False, device: torch.device | None = None) -> torch.Tensor:
+        if self.has_field_torch(CameraFieldTypes.IMAGE):
+            res = self.get_field_torch(CameraFieldTypes.IMAGE)
+            assert res is not None 
+            return self._apply_image_transform_torch(res, output_is_chw)
         return self._apply_image_transform_torch(np_to_torch_dev(self.image, device), output_is_chw)
 
     @property 

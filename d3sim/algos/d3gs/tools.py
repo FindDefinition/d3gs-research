@@ -2,7 +2,7 @@ import math
 from plyfile import PlyData
 import torch 
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT, IsAppleSiliconMacOs
-from d3sim.algos.d3gs.base import GaussianModelBase, GaussianModelOrigin, GaussianModelOriginFused
+from d3sim.algos.d3gs.origin.model import GaussianModelOriginBase, GaussianModelOrigin, GaussianModelOriginFused
 import numpy as np
 from d3sim.csrc.inliner import INLINER
 from d3sim.csrc.gs3d import SHConstants
@@ -67,7 +67,7 @@ def points_to_gaussian_init_scale(points: torch.Tensor):
     scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
     return scales
 
-def init_original_3dgs_model(model: GaussianModelBase, points: np.ndarray, points_rgb: np.ndarray):
+def init_original_3dgs_model(model: GaussianModelOriginBase, points: np.ndarray, points_rgb: np.ndarray):
     with torch.no_grad():
         assert model.xyz.shape[0] == points.shape[0]
         points_th = torch.from_numpy(points.astype(np.float32)).to(D3SIM_DEFAULT_DEVICE).contiguous()
@@ -124,7 +124,7 @@ def get_expon_lr_func(
     return helper
 
 
-def create_origin_3dgs_optimizer(model: GaussianModelBase, optim_cfg: config_def.Optimizer, spatial_lr_scale: float):
+def create_origin_3dgs_optimizer(model: GaussianModelOriginBase, optim_cfg: config_def.Optimizer, spatial_lr_scale: float):
 
     pg = [
         {'params': [model.xyz], 'lr': optim_cfg.position_lr_init * spatial_lr_scale, "name": "xyz"},
@@ -142,7 +142,7 @@ def create_origin_3dgs_optimizer(model: GaussianModelBase, optim_cfg: config_def
                                                     max_steps=optim_cfg.position_lr_max_steps)
     return optim, xyz_schedule_xyz
 
-def create_origin_3dgs_optimizers(model: GaussianModelBase, optim_cfg: config_def.Optimizer, batch_size: int, spatial_lr_scale: float, fused: bool = True):
+def create_origin_3dgs_optimizers(model: GaussianModelOriginBase, optim_cfg: config_def.Optimizer, batch_size: int, spatial_lr_scale: float, fused: bool = True):
     bs_scale = math.sqrt(batch_size)
     pgs = [
         {'params': [model.xyz], 'lr': optim_cfg.position_lr_init * spatial_lr_scale * bs_scale, "name": "xyz"},
