@@ -256,7 +256,7 @@ class GaussianSplatOp:
             assert not self.is_nchw, "custom feat don't support nchw, set use_nchw=False in config."
         t1 = time.time()
         enable_v2 = self._cfg.enable_v2
-        with measure_and_print_torch("1", enable=enable_verbose):
+        with measure_and_print_torch("gs3d_preprocess", enable=enable_verbose):
             prep_kernel_name = (
                 f"gs3d_preprocess_{self._cfg.tile_size}_{training}_"
                 f"{model.get_unique_kernel_key()}_"
@@ -324,6 +324,9 @@ class GaussianSplatOp:
                 """)
             code_prep.raw(f"""
             auto tan_fov = 0.5f * resolution_wh.cast<float>() / focal_xy;
+            // tan_fov[0] = -0.5463024898437905;
+            // tan_fov[1] = -0.5463024898437905;
+            // auto focal_xy_debug_for_proj = resolution_wh.cast<float>() / 2.0f / tan_fov;
             """)
 
             if not enable_v2:
@@ -525,7 +528,7 @@ class GaussianSplatOp:
             # if batch_size == 2:
             #     print(torch.linalg.norm(rgb_gaussian.float().reshape(-1, num,3)[0] - rgb_gaussian.float().reshape(-1, num, 3)[1]))
             # print(INLINER.get_nvrtc_module(prep_kernel_name).params.debug_code)
-        with measure_and_print_torch("2", enable=enable_verbose):
+        with measure_and_print_torch("cumsum", enable=enable_verbose):
             tiles_touched.cumsum_(0)
             num_rendered = int(tiles_touched[-1].item())
         out_img_shape = [
@@ -565,7 +568,7 @@ class GaussianSplatOp:
         gaussian_idx = torch.empty(num_rendered,
                                    dtype=torch.int32,
                                    device=xyz.device)
-        with measure_and_print_torch(f"3 {num_rendered}",
+        with measure_and_print_torch(f"prepare sort {num_rendered}",
                                      enable=enable_verbose):
             code = pccm.code()
             code.raw(f"""
@@ -644,7 +647,7 @@ class GaussianSplatOp:
         # TODO use radix sort with trunated bits (faster) for cuda
         # TODO use 32bit sort, for 1920x1080 tile, the max tile idx is 8100, 13 bits
         # so we can use 18bit for depth. (19bit if torch support uint32, true in torch >= 2.3 and cuda)
-        with measure_and_print_torch("4", enable=enable_verbose):
+        with measure_and_print_torch("do sort", enable=enable_verbose):
             if self._cfg.use_cub_sort:
                 from d3sim.d3sim_thtools.device_sort import DeviceSort
                 db = True
@@ -691,7 +694,7 @@ class GaussianSplatOp:
                 sorted_vals, indices = torch.sort(keys_tile_idx_depth)
                 gaussian_idx_sorted = torch.gather(gaussian_idx, 0, indices)
 
-        with measure_and_print_torch("4.2", enable=enable_verbose):
+        with measure_and_print_torch("prepare workrange", enable=enable_verbose):
             workload_ranges = torch.zeros([batch_size * tile_num_x * tile_num_y, 2],
                                           dtype=torch.int32,
                                           device=xyz.device)
@@ -774,7 +777,7 @@ class GaussianSplatOp:
                 cov2d_vecs=cov2d_vecs,
                 sh_to_rgb_ne_0=sh_to_rgb_ne_0,
                 depths=depths)
-        with measure_and_print_torch("5", enable=enable_verbose):
+        with measure_and_print_torch("rasterize", enable=enable_verbose):
             self.rasterize_forward_backward(
                 model,
                 ctx,

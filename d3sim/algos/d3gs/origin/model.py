@@ -266,8 +266,6 @@ class GaussianModelOrigin(GaussianModelOriginBase):
 class GaussianModelProxyOrigin(GaussianModelProxyBase["GaussianModelOriginFused"]):
     def read_field(self, field: GaussianCoreFields, 
             out: str, normed_dir: str = ""):
-        """Write code segment to get field from model ptr.
-        """
         has_color_base = self._model.color_sh_base is not None
         cur_degree = self._model.cur_sh_degree
         max_degree = self._model.color_sh_degree
@@ -323,19 +321,20 @@ class GaussianModelProxyOrigin(GaussianModelProxyBase["GaussianModelOriginFused"
 
     def accumulate_field_grad(self, field: GaussianCoreFields, 
             out: str, grad: str, normed_dir: str = "", normed_dir_grad: str = ""):
-        """Write code segment to get field from model ptr.
-        """
         has_color_base = self._model.color_sh_base is not None
         cur_degree = self._model.cur_sh_degree
         max_degree = self._model.color_sh_degree
-        if field == GaussianCoreFields.XYZ:
+        if field == GaussianCoreFields.SCALE:
+            self._code.raw(f"""
+            {grad} = {grad}.op<op::{self._model.fused_scale_act_op[1]}>({out}, {out}_raw);
+            """)
             if self._batch_size == 1:
                 self._code.raw(f"""
-                op::reinterpret_cast_array_nd<3>(xyz_grad_ptr)[{self._gaussian_idx}] = {grad};
+                op::reinterpret_cast_array_nd<3>(scale_grad_ptr)[{self._gaussian_idx}] = {grad};
                 """)
             else:
                 self._code.raw(f"""
-                dxyz_acc += {grad};
+                dscale_acc += {grad};
                 """)
         elif field == GaussianCoreFields.QUATERNION_XYZW:
             self._code.raw(f"""
@@ -349,18 +348,6 @@ class GaussianModelProxyOrigin(GaussianModelProxyBase["GaussianModelOriginFused"
                 self._code.raw(f"""
                 dquat_acc += {grad};
                 """)
-        elif field == GaussianCoreFields.SCALE:
-            self._code.raw(f"""
-            {grad} = {grad}.op<op::{self._model.fused_scale_act_op[1]}>({out}, {out}_raw);
-            """)
-            if self._batch_size == 1:
-                self._code.raw(f"""
-                op::reinterpret_cast_array_nd<3>(scale_grad_ptr)[{self._gaussian_idx}] = {grad};
-                """)
-            else:
-                self._code.raw(f"""
-                dscale_acc += {grad};
-                """)
         elif field == GaussianCoreFields.OPACITY:
             self._code.raw(f"""
             {grad} = tv::array<float, 1>{{{grad}}}.op<op::{self._model.fused_opacity_act_op[1]}>(tv::array<float, 1>{{{out}}}, {out}_raw)[0];
@@ -373,7 +360,15 @@ class GaussianModelProxyOrigin(GaussianModelProxyBase["GaussianModelOriginFused"
                 self._code.raw(f"""
                 dopacity_val_acc += {grad};
                 """)
-
+        elif field == GaussianCoreFields.XYZ:
+            if self._batch_size == 1:
+                self._code.raw(f"""
+                op::reinterpret_cast_array_nd<3>(xyz_grad_ptr)[{self._gaussian_idx}] = {grad};
+                """)
+            else:
+                self._code.raw(f"""
+                dxyz_acc += {grad};
+                """)
         elif field == GaussianCoreFields.RGB:
             assert normed_dir != "" and normed_dir_grad != ""
             self._code.raw(f"""

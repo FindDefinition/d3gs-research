@@ -2,6 +2,7 @@
 from plyfile import PlyData
 import torch 
 import numpy as np
+from d3sim.algos.d3gs.origin.model import GaussianModelOriginFused
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, PACKAGE_ROOT, IsAppleSiliconMacOs
 from d3sim.algos.d3gs.pvg.model import PVGGaussianModel
 def load_pvg_model(ckpt_path: str, split: bool = True):
@@ -27,7 +28,7 @@ def load_pvg_model(ckpt_path: str, split: bool = True):
     ) = model_params
     # breakpoint()
     # wxyz to xyzw
-    print("PVG Model Meta", T, velocity_decay)
+    print("PVG Model Meta", T, velocity_decay, _features_dc.shape, _features_rest.shape)
     _rotation = _rotation[:, [1, 2, 3, 0]].contiguous()
     sh_coeffs = torch.cat([_features_dc, _features_rest], dim=1).contiguous()
     positions_th = _xyz.to(D3SIM_DEFAULT_DEVICE)
@@ -47,5 +48,9 @@ def load_pvg_model(ckpt_path: str, split: bool = True):
         t=t_th, scaling_t=scaling_t_th, velocity=velocity_th)
     
     model.cur_sh_degree = active_sh_degree
+    # model = GaussianModelOriginFused(xyz=positions_th, quaternion_xyzw=rots_th, scale=scales_th, opacity=opacity_th, color_sh=sh_coeffs_th, color_sh_base=sh_coeffs_base_th)
+    
+    # model.cur_sh_degree = active_sh_degree
+
     return model
 

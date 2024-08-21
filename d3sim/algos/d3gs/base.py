@@ -40,7 +40,11 @@ class GaussianModelProxyBase(Generic[T], abc.ABC):
 
     @abc.abstractmethod
     def read_field(self, field: GaussianCoreFields, 
-            out: str, normed_dir: str = ""): ...
+            out: str, normed_dir: str = ""):
+        """Read field from proxy.
+        Call order of fields is always `xyz, scale|quat, opacity, rgb`,
+        `|` means any order.
+        """
 
     @abc.abstractmethod
     def prepare_field_proxy(self): 
@@ -50,8 +54,11 @@ class GaussianModelProxyBase(Generic[T], abc.ABC):
 
     @abc.abstractmethod
     def accumulate_field_grad(self, field: GaussianCoreFields, 
-            out: str, grad: str, normed_dir: str = "", normed_dir_grad: str = ""): ...
-    
+            out: str, grad: str, normed_dir: str = "", normed_dir_grad: str = ""):
+        """Accumulate grad. if batch size == 0, you can save grad directly.
+        Call order of fields is always `scale|quat|opacity, rgb, xyz`,
+        `|` means any order.
+        """
     @abc.abstractmethod
     def save_accumulated_grad(self): ...
 

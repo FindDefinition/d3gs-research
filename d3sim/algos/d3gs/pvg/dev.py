@@ -1,13 +1,14 @@
 
 
 import torch
+from d3sim.algos.d3gs.origin.data.scene.cameras import fov2focal
 from d3sim.algos.d3gs.pvg.load_pvg import load_pvg_model
-from d3sim.algos.d3gs.render import GaussianSplatOp, rasterize_gaussians_dynamic
+from d3sim.algos.d3gs.render import GaussianSplatOp, rasterize_gaussians, rasterize_gaussians_dynamic
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, IsAppleSiliconMacOs
 from d3sim.algos.d3gs.config_def import GaussianSplatConfig
 
 import numpy as np
-
+from cumm import tensorview as tv 
 from d3sim.data.scene_def.base import Pose, Resource
 from d3sim.data.scene_def.camera import BasicPinholeCamera 
 
@@ -20,7 +21,7 @@ def main():
         debug_inp_path = "/root/debug_pvg.pth"
     model = load_pvg_model(path)
     # breakpoint()
-    op = GaussianSplatOp(GaussianSplatConfig(render_depth=True, render_rgba=True))
+    op = GaussianSplatOp(GaussianSplatConfig(render_depth=True, render_rgba=True, verbose=True, enable_32bit_sort=True, gaussian_std_sigma=2.0))
 
     (viewpoint_camera, bg_color_from_envmap, rendered_image_before, rendered_image, rendered_opacity, rendered_depth) = torch.load(debug_inp_path, map_location="cpu")
 
@@ -29,11 +30,17 @@ def main():
     fy = viewpoint_camera["fy"]
     cx = viewpoint_camera["cx"]
     cy = viewpoint_camera["cy"]
+    # fov_x = -1
+    # fov_y = -1
+    width = int(viewpoint_camera["resolution"][0])
+    height = int(viewpoint_camera["resolution"][1])
+
+    # fx = fov2focal(fov_x, width)
+    # fy = fov2focal(fov_y, height)
+
     intrinsic = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
     intrinsic_4x4 = np.eye(4, dtype=np.float32)
     intrinsic_4x4[:3, :3] = intrinsic
-    width = viewpoint_camera["resolution"][0]
-    height = viewpoint_camera["resolution"][1]
     timestamp = viewpoint_camera["timestamp"]
     cam = BasicPinholeCamera(id="", timestamp=0, pose=Pose(np.eye(4), c2w), 
         image_rc=Resource(base_uri="", loader_type=""), intrinsic=intrinsic_4x4, distortion=np.zeros(4, np.float32),
@@ -44,16 +51,26 @@ def main():
     }, prep_inputs={
         "time_shift": 0,
     })
-    out_color = res.color
-    print(out_color.shape)
+    for j in range(10):
+        with tv.measure_and_print("duration"):
+            res = rasterize_gaussians_dynamic(model, cam, op, prep_input_tensors={
+                "batch_ts": torch.tensor([timestamp], dtype=torch.float32, device=D3SIM_DEFAULT_DEVICE),
+            }, prep_inputs={
+                "time_shift": 0,
+            })
 
+    # res = rasterize_gaussians(model, cam, op)
+
+    out_color = res.color
+    print(out_color.shape, bg_color_from_envmap.shape, rendered_image.shape)
+    # out_color = rendered_image_before.permute(1, 2, 0)[None].to(D3SIM_DEFAULT_DEVICE)
     if not op.is_nchw:
         # to nchw
         out_color = out_color.permute(0, 3, 1, 2)
     out_color = torch.concat([out_color[i] for i in range(out_color.shape[0])], dim=1)
 
     out_color_u8 = out_color.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
-    if op.is_rgba:
+    if out_color_u8.shape[-1] == 4:
         out_color_u8 = out_color_u8[..., [2, 1, 0, 3]]
     else:
         out_color_u8 = out_color_u8[..., ::-1]
