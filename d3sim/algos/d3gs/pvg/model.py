@@ -20,7 +20,11 @@ class PVGInputOperator(VectorSymOperator):
         super().__init__()
         self._cfg = cfg
 
-    def forward(self, t_gaussian: Annotated[sympy.Symbol, Scalar()], velocity: Annotated[sympy.Symbol, Vector(3)], scale_t: Annotated[sympy.Symbol, Scalar()], batch_t: Annotated[sympy.Symbol, Scalar()], _proxy_xyz: Annotated[sympy.Symbol, Vector(3)], _proxy_opacity_val: Annotated[sympy.Symbol, Scalar()], time_shift: Annotated[sympy.Symbol, Scalar()]) -> dict[str, VectorExpr]:
+    def forward(self, t_gaussian: Annotated[sympy.Symbol, Scalar()], velocity: Annotated[sympy.Symbol, Vector(3)], 
+                    scale_t: Annotated[sympy.Symbol, Scalar()], batch_t: Annotated[sympy.Symbol, Scalar()], 
+                    _proxy_xyz: Annotated[sympy.Symbol, Vector(3)], 
+                    _proxy_opacity_val: Annotated[sympy.Symbol, Scalar()], 
+                    time_shift: Annotated[sympy.Symbol, Scalar()]) -> dict[str, VectorExpr]:
         a = 1.0 / self._cfg.cycle * sympy.pi * 2.0
         scale_t_act = sympy.exp(scale_t)
         xyz_shm = _proxy_xyz + velocity * sympy.sin((batch_t - t_gaussian) * a) / a
@@ -33,7 +37,6 @@ class PVGInputOperator(VectorSymOperator):
             "opacity": opacity_t,
             "marginal_t": marginal_t,
         }
-
 
 class PVGProxy(GaussianModelProxyBase["PVGGaussianModel"]):
     def __init__(self, pvg_op: PVGInputOperator, model: "PVGGaussianModel", code: pccm.FunctionCode, gaussian_idx: str, batch_idx: str, batch_size: int, is_bwd: bool = False):
@@ -106,8 +109,6 @@ class PVGProxy(GaussianModelProxyBase["PVGGaussianModel"]):
             auto xyz_shm = {self.pvg_op.generate_result_expr_code("xyz")};
             auto opacity_t = {self.pvg_op.generate_result_expr_code("opacity")};
             auto marginal_t = {self.pvg_op.generate_result_expr_code("marginal_t")};
-            invalid = marginal_t <= 0.05f;
-
             """)
         else:
             self._code.raw(f"""
@@ -118,15 +119,10 @@ class PVGProxy(GaussianModelProxyBase["PVGGaussianModel"]):
             xyz_shm += inst_velocity * time_shift;
             auto marginal_t = math_op_t::exp(-0.5f * (t_gaussian - batch_t) * (t_gaussian - batch_t) / scale_t / scale_t);
             auto opacity_t = tv::array<float, 1>{{_proxy_opacity_val}}.op<op::sigmoid>()[0] * marginal_t;
-
-            invalid = marginal_t <= 0.05f;
-
             """)
-        if self._is_bwd:
+        if not self._is_bwd:
             self._code.raw(f"""
-            tv::array<float, 3> dscale_tmp{{}};
-            float dt_tmp = 0;
-
+            invalid = marginal_t <= 0.05f;
             """)
 
         if self._batch_size == 1:
@@ -178,24 +174,40 @@ class PVGProxy(GaussianModelProxyBase["PVGGaussianModel"]):
                 """)
         elif field == GaussianCoreFields.OPACITY:
             self._code.raw(f"""
-            {grad} = tv::array<float, 1>{{{grad} * marginal_t}}.op<op::{self._model.fused_opacity_act_op[1]}>(tv::array<float, 1>{{{out}}}, _proxy_opacity_val[0])[0];
+            auto _opacity_grad_tmp = {grad};
+            """)
+        elif field == GaussianCoreFields.XYZ:
+            self._code.raw(f"""
+            auto _dxyz_tmp = {grad};
+            """)
+
+            gradient_dict = {
+                "xyz": "_dxyz_tmp",
+                "opacity": "_opacity_grad_tmp",
+                "marginal_t": None
+            }
+            self._code.raw(f"""
+            auto _opacity_grad = _opacity_grad_tmp * {self.pvg_op.generate_gradients_code("_proxy_opacity_val", gradient_dict)};
+            auto _t_gaussian_grad = {self.pvg_op.generate_gradients_code("t_gaussian", gradient_dict)};
+            auto _velocity_grad = {self.pvg_op.generate_gradients_code("velocity", gradient_dict)};
+            auto _scale_t_grad = {self.pvg_op.generate_gradients_code("scale_t", gradient_dict)};
+            auto _proxy_xyz_grad = {self.pvg_op.generate_gradients_code("_proxy_xyz", gradient_dict)};
             """)
             if self._batch_size == 1:
                 self._code.raw(f"""
-                opacity_grad_ptr[{self._gaussian_idx}] = {grad};
+                opacity_grad_ptr[{self._gaussian_idx}] = _opacity_grad;
+                t_grad_ptr[{self._gaussian_idx}] = _t_gaussian_grad;
+                op::reinterpret_cast_array_nd<3>(velocity_grad_ptr)[{self._gaussian_idx}] = _velocity_grad;
+                scaling_t_grad_ptr[{self._gaussian_idx}] = _scale_t_grad;
+                op::reinterpret_cast_array_nd<3>(xyz_grad_ptr)[{self._gaussian_idx}] = _proxy_xyz_grad;
                 """)
             else:
                 self._code.raw(f"""
-                dopacity_acc += {grad};
-                """)
-        elif field == GaussianCoreFields.XYZ:
-            if self._batch_size == 1:
-                self._code.raw(f"""
-                op::reinterpret_cast_array_nd<3>(xyz_grad_ptr)[{self._gaussian_idx}] = {grad};
-                """)
-            else:
-                self._code.raw(f"""
-                dxyz_acc += {grad};
+                dopacity_acc += _opacity_grad;
+                dt_acc += _t_gaussian_grad;
+                dvelo_acc += _velocity_grad;
+                dscale_t_acc += _scale_t_grad;
+                dxyz_acc += _proxy_xyz_grad;
                 """)
         elif field == GaussianCoreFields.RGB:
             assert normed_dir != "" and normed_dir_grad != ""
@@ -226,7 +238,10 @@ class PVGProxy(GaussianModelProxyBase["PVGGaussianModel"]):
             op::reinterpret_cast_array_nd<3>(xyz_grad_ptr)[{self._gaussian_idx}] = dxyz_acc;
             op::reinterpret_cast_array_nd<4>(quaternion_xyzw_grad_ptr)[{self._gaussian_idx}] = dquat_acc;
             op::reinterpret_cast_array_nd<3>(scale_grad_ptr)[{self._gaussian_idx}] = dscale_acc;
-            opacity_grad_ptr[{self._gaussian_idx}] = dopacity_val_acc;
+            opacity_grad_ptr[{self._gaussian_idx}] = dopacity_acc;
+            t_grad_ptr[{self._gaussian_idx}] = dt_acc;
+            op::reinterpret_cast_array_nd<3>(velocity_grad_ptr)[{self._gaussian_idx}] = dvelo_acc;
+            scaling_t_grad_ptr[{self._gaussian_idx}] = dscale_t_acc;
             """) 
 
 
@@ -244,10 +259,8 @@ class PVGGaussianModel(GaussianModelOriginFused):
         if self._pvg_op is None:
             self._pvg_op = PVGInputOperator(PVGModelConfig(cycle=self.cycle)).build()
 
-
     def create_proxy(self, code: pccm.FunctionCode, gaussian_idx: str, batch_idx: str, batch_size: int, is_bwd: bool = False) -> GaussianModelProxyBase:
         assert self._pvg_op is not None
-            
         return PVGProxy(self._pvg_op, self, code, gaussian_idx, batch_idx, batch_size, is_bwd)
     
     def get_proxy_field_dict(self):

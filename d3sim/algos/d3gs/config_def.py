@@ -65,6 +65,7 @@ class GaussianSplatConfig:
     gaussian_lowpass_filter: float = 0.3
     alpha_eps: float = 1.0 / 255.0
     transmittance_eps: float = 0.0001
+    # TODO use far instead of prec for depth sort
     depth_32bit_prec: float = 0.001
 
     enable_32bit_sort: bool = False
@@ -72,6 +73,7 @@ class GaussianSplatConfig:
     bg_color: np.ndarray = dataclasses.field(
         default_factory=lambda: np.zeros((3), np.float32))
     scale_global: float = 1.0
+    # TODO nchw is deprecated. remove it in the future.
     use_nchw: bool = False
     render_rgba: bool = False
 
@@ -83,13 +85,25 @@ class GaussianSplatConfig:
     enable_device_asserts: bool = False
 
     use_cub_sort: bool = False if IsAppleSiliconMacOs else True
-
+    # TODO use_int64_tile_touched should be True by default,
+    # False should only used for performance benchmark.
     use_int64_tile_touched: bool = False
 
-    enable_v2 = True
+    use_proxy_model = True
+
+    # if set to True, you must use custom features instead of rgb
+    # the out.color will only have 1 (if render alpha) or 0 channels
+    # should be used when you want to use complex color model
+    # such as hash grid or embedding.
+
+    # builtin rgb only support simple color model such as sh.
+    # you can use proxy to change the simple color model.
+    disable_builtin_rgb = False
 
     @property 
     def num_channels(self):
+        if self.disable_builtin_rgb:
+            return 1 if self.render_rgba else 0
         return 4 if self.render_rgba else 3
 
     @property

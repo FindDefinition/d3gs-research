@@ -417,6 +417,9 @@ class Gaussian3D(pccm.Class):
         using math_op_t = tv::arrayops::MathScalarOp<T>;
         auto limit = (tan_fov * clamp_factor * mean_camera[2]).template op<op::abs>();
         auto txylimit = op::slice<0, 2>(mean_camera).template op<op::clamp>(-limit, limit);
+	    // txylimit[0] = min(limit[0], max(-limit[0], mean_camera[0]));
+	    // txylimit[1] = min(limit[1], max(-limit[1], mean_camera[1]));
+
         auto txylimit_focal = txylimit * focal_length;
         auto tz_square = mean_camera[2] * mean_camera[2];
         // we need T = W.T @ J.T, if @ is colmajor, we need 

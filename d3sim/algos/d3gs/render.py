@@ -46,7 +46,7 @@ class GaussianSplatOpContext(DataClassWithArrayCheck):
     conic_opacity: Annotated[torch.Tensor, ac.ArrayCheck([-1, 4], ac.F32)]
     radii: Annotated[torch.Tensor, ac.ArrayCheck([-1], ac.I32)]
     uvs: Annotated[torch.Tensor, ac.ArrayCheck([-1, 2], ac.F32)]
-    rgb_gaussian: Annotated[torch.Tensor, ac.ArrayCheck([-1, 3], ac.F32)]
+    rgb_gaussian: Annotated[torch.Tensor | None, ac.ArrayCheck([-1, 3], ac.F32)]
     gaussian_idx_sorted: Annotated[torch.Tensor, ac.ArrayCheck([-1], ac.I32)]
     workload_ranges: Annotated[torch.Tensor, ac.ArrayCheck([-1, 2], ac.I32)]
     image_shape_wh: tuple[int, int]
@@ -92,7 +92,7 @@ class RasterizeGradientOutput(DataClassWithArrayCheck):
     duv: Annotated[torch.Tensor, ac.ArrayCheck(["N", 2], ac.F32)]
     dconic: Annotated[torch.Tensor, ac.ArrayCheck(["N", 3], ac.F32)]
     dopacity: Annotated[torch.Tensor, ac.ArrayCheck(["N"], ac.F32)]
-    dcolor: Annotated[torch.Tensor, ac.ArrayCheck(["N", 3], ac.F32)]
+    dcolor: Annotated[torch.Tensor | None, ac.ArrayCheck(["N", 3], ac.F32)]
     dcustom_features: Annotated[torch.Tensor | None,
                                 ac.ArrayCheck(["N", -1], ac.F32)]
     dz: Annotated[torch.Tensor | None, ac.ArrayCheck(["N"], ac.F32)]
@@ -142,6 +142,8 @@ class GaussianSplatOp:
         # user shouldn't modify cfg in op, create new op instead.
         self._cfg = copy.deepcopy(cfg) 
         self._inliner = create_default_inliner()
+
+        self._code_obj_caches: dict[str, pccm.FunctionCode] = {}
 
     @property 
     def is_nchw(self):
@@ -242,9 +244,13 @@ class GaussianSplatOp:
             tiles_touched = torch.empty(batch_size * num,
                                         dtype=torch.int64 if self._cfg.use_int64_tile_touched else torch.int32,
                                         device=xyz.device)
-            rgb_gaussian = torch.empty([batch_size * num, 3],
-                                       dtype=torch.float32,
-                                       device=xyz.device)
+            rgb_gaussian = None 
+            if not self._cfg.disable_builtin_rgb:
+                rgb_gaussian = torch.empty([batch_size * num, 3],
+                                        dtype=torch.float32,
+                                        device=xyz.device)
+            else:
+                assert not self._cfg.use_nchw, "only support nhwc if disable builtin rgb."
         # debug_cov2d = torch.empty([num, 3], dtype=torch.float32, device=xyz.device)
 
         # debug_ten = torch.empty(num, dtype=torch.float32, device=xyz.device)
@@ -255,7 +261,7 @@ class GaussianSplatOp:
             assert custom_feat.shape[0] == batch_size * num
             assert not self.is_nchw, "custom feat don't support nchw, set use_nchw=False in config."
         t1 = time.time()
-        enable_v2 = self._cfg.enable_v2
+        use_proxy_model = self._cfg.use_proxy_model
         with measure_and_print_torch("gs3d_preprocess", enable=enable_verbose):
             prep_kernel_name = (
                 f"gs3d_preprocess_{self._cfg.tile_size}_{training}_"
@@ -329,15 +335,11 @@ class GaussianSplatOp:
             // auto focal_xy_debug_for_proj = resolution_wh.cast<float>() / 2.0f / tan_fov;
             """)
 
-            if not enable_v2:
+            if not use_proxy_model:
                 quat_xyzw = model.quaternion_xyzw
                 scales = model.scale
                 opacity = model.opacity
-                color_sh = model.color_sh
-                color_sh_base = model.color_sh_base
-                degree = model.color_sh_degree
-                cur_degree = model.cur_sh_degree
-                has_color_base = color_sh_base is not None
+
                 fused_scale_act = model.fused_scale_act_op
                 fused_q_act = model.fused_quaternion_xyzw_act_op
                 fused_opacity_act = model.fused_opacity_act_op
@@ -406,40 +408,51 @@ class GaussianSplatOp:
                 code_prep.raw(f"""
                 tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], opacity_val}};
                 op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
-                auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + gaussian_idx * {(degree + 1) * (degree + 1) - has_color_base};
                 
-                """)
-                if (training):
-                    if has_color_base:
+                """)             
+                if not self._cfg.disable_builtin_rgb:
+                    color_sh = model.color_sh
+                    color_sh_base = model.color_sh_base
+                    degree = model.color_sh_degree
+                    cur_degree = model.cur_sh_degree
+                    has_color_base = color_sh_base is not None
+                    code_prep.raw(f"""
+                    auto sh_ptr = op::reinterpret_cast_array_nd<3>($color_sh) + gaussian_idx * {(degree + 1) * (degree + 1) - has_color_base};
+                    """)
+                    if (training):
+                        if has_color_base:
+                            code_prep.raw(f"""
+                            auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + gaussian_idx;
+                            auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr, sh_base_ptr);
+                            """)
+                        else:
+                            code_prep.raw(f"""
+                            auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr);
+                            """)
                         code_prep.raw(f"""
-                        auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + gaussian_idx;
-                        auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr, sh_base_ptr);
+                        uint8_t ne_0_packed = (uint8_t(rgb[0] < 0) << 2) | (uint8_t(rgb[1] < 0) << 1) | uint8_t(rgb[2] < 0);
+                        op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = rgb.op<op::maximum>(0.0f);
+                        $sh_to_rgb_ne_0[i] = ne_0_packed;
                         """)
                     else:
-                        code_prep.raw(f"""
-                        auto rgb = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr);
-                        """)
+                        if has_color_base:
+                            code_prep.raw(f"""
+                            auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + gaussian_idx;
+                            op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr, sh_base_ptr).op<op::maximum>(0.0f);
+                            """)
+                        else:
+                            code_prep.raw(f"""
+                            op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr).op<op::maximum>(0.0f);
+                            """)
+                if (training):
                     code_prep.raw(f"""
-                    uint8_t ne_0_packed = (uint8_t(rgb[0] < 0) << 2) | (uint8_t(rgb[1] < 0) << 1) | uint8_t(rgb[2] < 0);
-                    op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = rgb.op<op::maximum>(0.0f);
-                    $sh_to_rgb_ne_0[i] = ne_0_packed;
-
                     op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i] = cov2d_vec;
                     """)
                     if not self._cfg.recalc_cov3d_in_bwd:
                         code_prep.raw(f"""
                         op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i] = cov3d_vec;
                         """)
-                else:
-                    if has_color_base:
-                        code_prep.raw(f"""
-                        auto sh_base_ptr = op::reinterpret_cast_array_nd<3>($color_sh_base) + gaussian_idx;
-                        op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr, sh_base_ptr).op<op::maximum>(0.0f);
-                        """)
-                    else:
-                        code_prep.raw(f"""
-                        op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = Gaussian3D::sh_dir_to_rgb<{cur_degree}>((point - cam2world_center).op<op::normalize>(), sh_ptr).op<op::maximum>(0.0f);
-                        """)
+
                 self._inliner.kernel_1d(prep_kernel_name, batch_size * num, 0, code_prep)
 
             else:
@@ -500,23 +513,27 @@ class GaussianSplatOp:
                 op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
                 auto normed_dir = (point - cam2world_center).op<op::normalize>();
                 """)
-                proxy.read_field(GaussianCoreFields.RGB, "rgb", "normed_dir")
-                if (training):
+                if not self._cfg.disable_builtin_rgb:
+                    proxy.read_field(GaussianCoreFields.RGB, "rgb", "normed_dir")
+                    if (training):
+                        code_prep.raw(f"""
+                        uint8_t ne_0_packed = (uint8_t(rgb[0] < 0) << 2) | (uint8_t(rgb[1] < 0) << 1) | uint8_t(rgb[2] < 0);
+                        op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = rgb.op<op::maximum>(0.0f);
+                        $sh_to_rgb_ne_0[i] = ne_0_packed;
+                        """)
+                    else:
+                        code_prep.raw(f"""
+                        op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = rgb.op<op::maximum>(0.0f);
+                        """)
+                if training:
                     code_prep.raw(f"""
-                    uint8_t ne_0_packed = (uint8_t(rgb[0] < 0) << 2) | (uint8_t(rgb[1] < 0) << 1) | uint8_t(rgb[2] < 0);
-                    op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = rgb.op<op::maximum>(0.0f);
-                    $sh_to_rgb_ne_0[i] = ne_0_packed;
-
                     op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i] = cov2d_vec;
                     """)
                     if not self._cfg.recalc_cov3d_in_bwd:
                         code_prep.raw(f"""
                         op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i] = cov3d_vec;
                         """)
-                else:
-                    code_prep.raw(f"""
-                    op::reinterpret_cast_array_nd<3>($rgb_gaussian)[i] = rgb.op<op::maximum>(0.0f);
-                    """)
+
                 add_vars = {f"{k}_ptr": v for k, v in model.get_proxy_field_dict().items()}
                 if prep_user_inputs is not None:
                     add_vars.update(prep_user_inputs)
@@ -566,7 +583,7 @@ class GaussianSplatOp:
             dtype=torch.int64 if not enable_32bit_sort else torch.int32,
             device=xyz.device)
         gaussian_idx = torch.empty(num_rendered,
-                                   dtype=torch.int32,
+                                   dtype=tiles_touched.dtype,
                                    device=xyz.device)
         with measure_and_print_torch(f"prepare sort {num_rendered}",
                                      enable=enable_verbose):
@@ -817,7 +834,9 @@ class GaussianSplatOp:
         uvs_tv = torch_tensor_to_tv(ctx.uvs, to_const=True)
         gaussian_idx_sorted_tv = torch_tensor_to_tv(ctx.gaussian_idx_sorted,
                                                     to_const=True)
-        rgb_gaussian_tv = torch_tensor_to_tv(ctx.rgb_gaussian, to_const=True)
+        rgb_gaussian_tv = None 
+        if ctx.rgb_gaussian is not None:
+            rgb_gaussian_tv = torch_tensor_to_tv(ctx.rgb_gaussian, to_const=True)
         final_custom_feat = out.custom_features
         # assume nhwc
         num_custom_feat = 0 if final_custom_feat is None else final_custom_feat.shape[
@@ -856,9 +875,11 @@ class GaussianSplatOp:
             dopacity = torch.zeros([batch_size * num],
                                    dtype=torch.float32,
                                    device=final_T.device)
-            dcolor = torch.zeros([batch_size * num, 3],
-                                 dtype=torch.float32,
-                                 device=final_T.device)
+            dcolor = None 
+            if not self._cfg.disable_builtin_rgb:
+                dcolor = torch.zeros([batch_size * num, 3],
+                                    dtype=torch.float32,
+                                    device=final_T.device)
             dcustom_features = None 
             if num_custom_feat > 0:
                 dcustom_features = torch.zeros([batch_size * num, num_custom_feat],
@@ -886,16 +907,25 @@ class GaussianSplatOp:
             f"_{final_n_contrib is None}_{self._cfg.backward_reduction}")
         num_channels = self._cfg.num_channels
         render_rgba = self._cfg.render_rgba
+        # when use raw kernel in metal, we don't use nonuniform grid to
+        # keep logic same as cuda.
+        launch_param = tv.LaunchParam(
+            (tile_num_x, tile_num_y, batch_size),
+            (self._cfg.tile_size[0], self._cfg.tile_size[1], 1))
+        if kernel_unique_name in self._code_obj_caches:
+            code_rasterize = self._code_obj_caches[kernel_unique_name]
+            with measure_and_print_torch(
+                    f"BWD-rasterize-{gaussian_idx_sorted_tv.shape[0]}",
+                    enable=self._cfg.verbose):
+                self._inliner.kernel_raw(kernel_unique_name, launch_param,
+                                        code_rasterize)
+            return grad_out
+
         code_rasterize = pccm.code()
         code_rasterize.raw(f"""
         namespace op = tv::arrayops;
         using math_op_t = tv::arrayops::MathScalarOp<float>;
         """)
-        # when use raw kernel, we don't use nonuniform grid to
-        # keep logic same as cuda.
-        launch_param = tv.LaunchParam(
-            (tile_num_x, tile_num_y, batch_size),
-            (self._cfg.tile_size[0], self._cfg.tile_size[1], 1))
         if IsAppleSiliconMacOs:
             code_rasterize.raw(f"""
             tv::array<uint32_t, 2> pixel_idx_xy{{threadPositionInGrid.x, threadPositionInGrid.y}};
@@ -931,7 +961,7 @@ class GaussianSplatOp:
         TV_SHARED_MEMORY float2 collected_xy[{block_size}];
         TV_SHARED_MEMORY float4 collected_conic_opacity[{block_size}];
         """)
-        if color_use_smem:
+        if color_use_smem and not self._cfg.disable_builtin_rgb:
             code_rasterize.raw(f"""
             TV_SHARED_MEMORY float collected_rgb_gaussian[{block_size * 3}];
             """)
@@ -1033,6 +1063,9 @@ class GaussianSplatOp:
             auto dT_val = inside ? $dT[pixel_id] : 0.0f;
             """)
             if self._cfg.use_nchw:
+                # disable_builtin_rgb not implemented here
+                # because we don't support this to reduce code size.
+                # check is done in forward pass.
                 if batch_size == 1:
                     code_rasterize.raw(f"""
                     tv::array<float, {num_channels}> render_rgb, drgb_array;
@@ -1066,10 +1099,12 @@ class GaussianSplatOp:
                         drgb_array[3] = inside ? $drgb[(batch_idx * {num_channels} + 3) * $height * $width + pixel_id_no_batch] : 0.0f;
                         """)
             else:
-                code_rasterize.raw(f"""
-                tv::array<float, {num_channels}> render_rgb = inside ? op::reinterpret_cast_array_nd<{num_channels}>($final_color)[pixel_id] : tv::array<float, {num_channels}>{{}};
-                auto drgb_array = inside ? op::reinterpret_cast_array_nd<{num_channels}>($drgb)[pixel_id] : tv::array<float, {num_channels}>{{}};
-                """)
+                # support disable-builtin-rgb natively.
+                if num_channels > 0:
+                    code_rasterize.raw(f"""
+                    tv::array<float, {num_channels}> render_rgb = inside ? op::reinterpret_cast_array_nd<{num_channels}>($final_color)[pixel_id] : tv::array<float, {num_channels}>{{}};
+                    auto drgb_array = inside ? op::reinterpret_cast_array_nd<{num_channels}>($drgb)[pixel_id] : tv::array<float, {num_channels}>{{}};
+                    """)
                 if has_custom_feat:
                     code_rasterize.raw(f"""
                     auto render_custom_feat = inside ? op::reinterpret_cast_array_nd<{num_custom_feat}>($final_custom_feat)[pixel_id] : tv::array<float, {num_custom_feat}>{{}};
@@ -1115,7 +1150,7 @@ class GaussianSplatOp:
                     code_rasterize.raw(f"""
                     assert(gaussian_id >= 0 && gaussian_id < $num);
                     """)
-                if color_use_smem:
+                if color_use_smem and not self._cfg.disable_builtin_rgb:
                     code_rasterize.raw(f"""
                     auto rgb_gaussian_val = op::reinterpret_cast_array_nd<3>($rgb_gaussian_tv)[gaussian_id];
                     collected_rgb_gaussian[thread_rank * 3 + 0] = rgb_gaussian_val[0];
@@ -1165,7 +1200,6 @@ class GaussianSplatOp:
                     """)
                     if bwd_reduce_method == "warp":
                         code_rasterize.raw(f"""
-                        // avoid empty atomic write
                         if (!tv::parallel::warp_any(valid)){{
                             continue;
                         }}
@@ -1184,7 +1218,6 @@ class GaussianSplatOp:
                 else:
                     if is_bwd:
                         code_rasterize.raw(f"""
-                        // TODO if remove the 'f', this kernel runs 4x slower.
                         if (alpha < 1.0f / 255.0f || power > 0.0f){{
                             continue;
                         }}
@@ -1209,12 +1242,19 @@ class GaussianSplatOp:
                     """)
                 ifctx = nullcontext()
                 if is_bwd and use_bwd_reduce:
+                    if not self._cfg.disable_builtin_rgb:
+                        code_rasterize.raw(f"""
+                        tv::array<float, 3> dL_drgb{{}};
+                        """)
                     code_rasterize.raw(f"""
-                    tv::array<float, 3> dL_drgb{{}};
                     tv::array<float, 2> dL_duv{{}};
                     tv::array<float, 3> dL_dcov2d{{}};
                     float dL_dopacity = 0.0f;
                     """)
+                    if has_custom_feat:
+                        code_rasterize.raw(f"""
+                        tv::array<float, {num_custom_feat}> dL_dcustom_feat{{}};
+                        """)
                     if render_depth:
                         code_rasterize.raw(f"""
                         float dL_dz = 0.0f;
@@ -1230,20 +1270,21 @@ class GaussianSplatOp:
                         contributor = i * {block_size} + j;
                         """)
                     gaussian_id_inited = False
-                    if color_use_smem:
-                        code_rasterize.raw(f"""
-                        auto rgb_val = op::reinterpret_cast_array_nd<3>(collected_rgb_gaussian)[j];
-                        """)
-                    else:
-                        gaussian_id_inited = True
-                        code_rasterize.raw(f"""
-                        auto gaussian_id = collected_id[j];
-                        auto rgb_val = op::reinterpret_cast_array_nd<3>($rgb_gaussian_tv)[gaussian_id];
-                        """)
-                        if self._cfg.enable_device_asserts:
+                    if not self._cfg.disable_builtin_rgb:
+                        if color_use_smem:
                             code_rasterize.raw(f"""
-                            assert(gaussian_id >= 0 && gaussian_id < $num);
+                            auto rgb_val = op::reinterpret_cast_array_nd<3>(collected_rgb_gaussian)[j];
                             """)
+                        else:
+                            gaussian_id_inited = True
+                            code_rasterize.raw(f"""
+                            auto gaussian_id = collected_id[j];
+                            auto rgb_val = op::reinterpret_cast_array_nd<3>($rgb_gaussian_tv)[gaussian_id];
+                            """)
+                            if self._cfg.enable_device_asserts:
+                                code_rasterize.raw(f"""
+                                assert(gaussian_id >= 0 && gaussian_id < $num);
+                                """)
                     if has_custom_feat:
                         if custom_feat_use_smem:
                             code_rasterize.raw(f"""
@@ -1254,21 +1295,29 @@ class GaussianSplatOp:
                                 code_rasterize.raw(f"""
                                 auto gaussian_id = collected_id[j];
                                 """)
+                                gaussian_id_inited = True
                             code_rasterize.raw(f"""
                             auto custom_feat_val = op::reinterpret_cast_array_nd<{num_custom_feat}>($custom_features)[gaussian_id];
                             """)
                     if is_bwd:
-                        if render_rgba:
-                            code_rasterize.raw(f"""
-                            render_rgb[0] -= weight * rgb_val[0];
-                            render_rgb[1] -= weight * rgb_val[1];
-                            render_rgb[2] -= weight * rgb_val[2];
-                            render_rgb[3] -= weight;
-                            """)
+                        if not self._cfg.disable_builtin_rgb:
+
+                            if render_rgba:
+                                code_rasterize.raw(f"""
+                                render_rgb[0] -= weight * rgb_val[0];
+                                render_rgb[1] -= weight * rgb_val[1];
+                                render_rgb[2] -= weight * rgb_val[2];
+                                render_rgb[3] -= weight;
+                                """)
+                            else:
+                                code_rasterize.raw(f"""
+                                render_rgb -= weight * rgb_val;
+                                """)
                         else:
-                            code_rasterize.raw(f"""
-                            render_rgb -= weight * rgb_val;
-                            """)
+                            if render_rgba:
+                                code_rasterize.raw(f"""
+                                render_rgb -= weight;
+                                """)
                         if render_depth:
                             code_rasterize.raw(f"""
                             auto depth_val = collected_depth[j];
@@ -1280,17 +1329,23 @@ class GaussianSplatOp:
                             """)
 
                     if not is_bwd:
-                        if render_rgba:
-                            code_rasterize.raw(f"""
-                            rgb[0] += weight * rgb_val[0];
-                            rgb[1] += weight * rgb_val[1];
-                            rgb[2] += weight * rgb_val[2];
-                            rgb[3] += weight;
-                            """)
+                        if not self._cfg.disable_builtin_rgb:
+                            if render_rgba:
+                                code_rasterize.raw(f"""
+                                rgb[0] += weight * rgb_val[0];
+                                rgb[1] += weight * rgb_val[1];
+                                rgb[2] += weight * rgb_val[2];
+                                rgb[3] += weight;
+                                """)
+                            else:
+                                code_rasterize.raw(f"""
+                                rgb += weight * rgb_val;
+                                """)
                         else:
-                            code_rasterize.raw(f"""
-                            rgb += weight * rgb_val;
-                            """)
+                            if render_rgba:
+                                code_rasterize.raw(f"""
+                                rgb += weight;
+                                """)
                         if render_depth:
                             code_rasterize.raw(f"""
                             auto depth_val = collected_depth[j];
@@ -1301,22 +1356,52 @@ class GaussianSplatOp:
                             custom_feat_accum += weight * custom_feat_val;
                             """)
                     if is_bwd:
-                        code_rasterize.raw(f"""
-                        float dL_dalpha_without_div = (drgb_array.op<op::dot>(T * rgb_val - render_rgb));
-                        // grad from T, we don't apply background when training, apply it in torch side.
-                        dL_dalpha_without_div += -dT_val * render_T;
-                        """)
+                        if not self._cfg.disable_builtin_rgb:
+                            if render_rgba:
+                                code_rasterize.raw(f"""
+                                float dL_dalpha_without_div = (drgb_array.op<op::dot>(T * op::concat(rgb_val, tv::array<float, 1>{{1.0f}}) - render_rgb));
+                                // grad from T, we don't apply background when training, apply it in torch side.
+                                dL_dalpha_without_div += -dT_val * render_T;
+                                """)
+                            else:
+                                code_rasterize.raw(f"""
+                                float dL_dalpha_without_div = (drgb_array.op<op::dot>(T * rgb_val - render_rgb));
+                                dL_dalpha_without_div += -dT_val * render_T;
+                                """)
+                        else:
+                            if render_rgba:
+                                code_rasterize.raw(f"""
+                                float dL_dalpha_without_div = (drgb_array.op<op::dot>(T - render_rgb));
+                                dL_dalpha_without_div += -dT_val * render_T;
+                                """)
+                            else:
+                                code_rasterize.raw(f"""
+                                float dL_dalpha_without_div = -dT_val * render_T;
+                                """)
+
                         if render_depth:
                             code_rasterize.raw(f"""
                             dL_dalpha_without_div += ddepth * (T * depth_val - render_depth);
                             """)
+                        if has_custom_feat:
+                            code_rasterize.raw(f"""
+                            dL_dalpha_without_div += (dcustom_feat.op<op::dot>(T * custom_feat_val - render_custom_feat));
+                            """)
                         code_rasterize.raw(f"""
                         auto dL_dalpha = dL_dalpha_without_div / (1.0f - alpha);
-                        {"" if use_bwd_reduce else "auto"} dL_drgb = weight * {"op::slice<0, 3>(drgb_array)" if render_rgba else "drgb_array"};
+                        
                         """)
+                        if not self._cfg.disable_builtin_rgb:
+                            code_rasterize.raw(f"""
+                            {"" if use_bwd_reduce else "auto"} dL_drgb = weight * {"op::slice<0, 3>(drgb_array)" if render_rgba else "drgb_array"};
+                            """)
                         if render_depth:
                             code_rasterize.raw(f"""
                             {"" if use_bwd_reduce else "float"} dL_dz = weight * ddepth;
+                            """)
+                        if has_custom_feat:
+                            code_rasterize.raw(f"""
+                            {"" if use_bwd_reduce else f"tv::array<float, {num_custom_feat}>"} dL_dcustom_feat = weight * dcustom_feat;
                             """)
                         code_rasterize.raw(f"""
 
@@ -1352,11 +1437,13 @@ class GaussianSplatOp:
                     elif bwd_reduce_method == "block":
                         reduce_if_ctx = code_rasterize.if_("thread_rank == 0")
                     if use_bwd_reduce:
+                        if not self._cfg.disable_builtin_rgb:
+                            code_rasterize.raw(f"""
+                            dL_drgb[0] = tv::parallel::warp_sum(dL_drgb[0]);
+                            dL_drgb[1] = tv::parallel::warp_sum(dL_drgb[1]);
+                            dL_drgb[2] = tv::parallel::warp_sum(dL_drgb[2]);
+                            """)
                         code_rasterize.raw(f"""
-                        dL_drgb[0] = tv::parallel::warp_sum(dL_drgb[0]);
-                        dL_drgb[1] = tv::parallel::warp_sum(dL_drgb[1]);
-                        dL_drgb[2] = tv::parallel::warp_sum(dL_drgb[2]);
-
                         dL_duv[0] = tv::parallel::warp_sum(dL_duv[0]);
                         dL_duv[1] = tv::parallel::warp_sum(dL_duv[1]);
 
@@ -1396,6 +1483,7 @@ class GaussianSplatOp:
                             code_rasterize.raw(f"""
                             auto gaussian_id = collected_id[j];
                             """)
+                            gaussian_id_inited = True
                             if self._cfg.enable_device_asserts:
                                 code_rasterize.raw(f"""
                                 assert(gaussian_id >= 0 && gaussian_id < $num);
@@ -1414,11 +1502,13 @@ class GaussianSplatOp:
                             """)
                             if render_depth:
                                 raise NotImplementedError("not implemented yet")
+                        if not self._cfg.disable_builtin_rgb:
+                            code_rasterize.raw(f"""
+                            tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 0, dL_drgb[0]);
+                            tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 1, dL_drgb[1]);
+                            tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 2, dL_drgb[2]);
+                            """)
                         code_rasterize.raw(f"""
-                        tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 0, dL_drgb[0]);
-                        tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 1, dL_drgb[1]);
-                        tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 2, dL_drgb[2]);
-
                         tv::parallel::atomicAdd($duv + gaussian_id * 2 + 0, dL_duv[0]);
                         tv::parallel::atomicAdd($duv + gaussian_id * 2 + 1, dL_duv[1]);
 
@@ -1444,15 +1534,21 @@ class GaussianSplatOp:
                     #     """)
         if not is_bwd:
             if not training:
-                if render_rgba:
-                    code_rasterize.raw(f"""
-                    auto bg_color_val_rgb = $(self._cfg.bg_color);
-                    auto bg_color_val = op::concat(bg_color_val_rgb, tv::array<float, 1>{{0.0f}});
-                    """)
+                if not self._cfg.disable_builtin_rgb:
+                    if render_rgba:
+                        code_rasterize.raw(f"""
+                        auto bg_color_val_rgb = $(self._cfg.bg_color);
+                        auto bg_color_val = op::concat(bg_color_val_rgb, tv::array<float, 1>{{0.0f}});
+                        """)
+                    else:
+                        code_rasterize.raw(f"""
+                        auto bg_color_val = $(self._cfg.bg_color);
+                        """)
                 else:
-                    code_rasterize.raw(f"""
-                    auto bg_color_val = $(self._cfg.bg_color);
-                    """)
+                    if render_rgba:
+                        code_rasterize.raw(f"""
+                        auto bg_color_val = tv::array<float, 1>{{0.0f}};
+                        """)
             with code_rasterize.if_("inside"):
                 code_rasterize.raw(f"""
                 $final_T[pixel_id] = T;
@@ -1471,16 +1567,17 @@ class GaussianSplatOp:
                 # use fused background color on inference.
                 # TODO how to support envmap?
                 if not self._cfg.use_nchw:
-                    if not training:
-                        code_rasterize.raw(f"""
-                        auto rgb_before_clamp = rgb + T * bg_color_val;
-                        rgb_before_clamp = rgb_before_clamp.op<op::clamp>(0.0f, 1.0f);
-                        op::reinterpret_cast_array_nd<{num_channels}>($final_color)[pixel_id] = rgb_before_clamp;
-                        """)
-                    else:
-                        code_rasterize.raw(f"""
-                        op::reinterpret_cast_array_nd<{num_channels}>($final_color)[pixel_id] = rgb;
-                        """)
+                    if num_channels > 0:
+                        if not training:
+                            code_rasterize.raw(f"""
+                            auto rgb_before_clamp = rgb + T * bg_color_val;
+                            rgb_before_clamp = rgb_before_clamp.op<op::clamp>(0.0f, 1.0f);
+                            op::reinterpret_cast_array_nd<{num_channels}>($final_color)[pixel_id] = rgb_before_clamp;
+                            """)
+                        else:
+                            code_rasterize.raw(f"""
+                            op::reinterpret_cast_array_nd<{num_channels}>($final_color)[pixel_id] = rgb;
+                            """)
                     if has_custom_feat:
                         code_rasterize.raw(f"""
                         op::reinterpret_cast_array_nd<{num_custom_feat}>($final_custom_feat)[pixel_id] = custom_feat_accum;
@@ -1517,6 +1614,7 @@ class GaussianSplatOp:
         #         }}
         #     }}
         #     """)
+        self._code_obj_caches[kernel_unique_name] = code_rasterize
         with measure_and_print_torch(
                 f"BWD-rasterize-{gaussian_idx_sorted_tv.shape[0]}",
                 enable=self._cfg.verbose):
@@ -1627,7 +1725,7 @@ class GaussianSplatOp:
             using math_op_t = tv::arrayops::MathScalarOp<float>;
             auto resolution_wh = $resolution_wh_np;
             """)
-            if not self._cfg.enable_v2:
+            if not self._cfg.use_proxy_model:
                 xyz = model.xyz
                 scales = model.scale
                 quat_xyzw = model.quaternion_xyzw
@@ -2397,7 +2495,7 @@ def rasterize_gaussians_dynamic(
     prep_inputs: dict[str, Any] | None = None,
     mask: torch.Tensor | None = None,
 ):
-    assert op._cfg.enable_v2, "only v2 (proxy) is supported"
+    assert op._cfg.use_proxy_model, "only v2 (proxy) is supported"
     model = model.create_model_with_act()  # apply activation
     c2w_T = None 
     frame_ids = None 

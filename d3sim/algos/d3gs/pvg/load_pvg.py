@@ -26,7 +26,6 @@ def load_pvg_model(ckpt_path: str, split: bool = True):
         T,
         velocity_decay,
     ) = model_params
-    # breakpoint()
     # wxyz to xyzw
     print("PVG Model Meta", T, velocity_decay, _features_dc.shape, _features_rest.shape)
     _rotation = _rotation[:, [1, 2, 3, 0]].contiguous()

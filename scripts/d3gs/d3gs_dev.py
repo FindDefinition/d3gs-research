@@ -74,7 +74,7 @@ def _main_bwd():
     if check_grad:
         grads = torch.load(grad_path, map_location=D3SIM_DEFAULT_DEVICE)
 
-        (xyz_grads, opacity_grads, scale_grads, rotation_grads, feature_grads, mean2d_grads, dout) = grads
+        (camera, rendering, radii, xyz_grads, opacity_grads, scale_grads, rotation_grads, feature_grads, mean2d_grads, dout) = grads
         mean2d_grads = mean2d_grads[:, :2]
 
     uv_grad_holder = torch.empty(mod.xyz.shape[0], 2, dtype=torch.float32, device=mod.xyz.device)
@@ -96,7 +96,12 @@ def _main_bwd():
         sync()
         print("FWD", time.time() - t)
         assert res is not None 
-        out_color = res.color[0]
+        out_color = res.color # [0]
+        if not op.is_nchw:
+            # to nchw
+            out_color = out_color.permute(0, 3, 1, 2)
+        print(torch.linalg.norm(out_color[0, :3] - rendering))
+        print(torch.linalg.norm(res.radii.float() - radii.float()))
 
 
         # torch.manual_seed(50051)
@@ -105,9 +110,9 @@ def _main_bwd():
             dout = torch.rand(out_color.shape, device=out_color.device)
 
         t = time.time()
-        if not op.is_nchw:
-            dout = dout.permute(1, 2, 0)
-        out_color.backward(dout)
+        # if not op.is_nchw:
+        #     dout = dout.permute(1, 2, 0)
+        out_color[0].backward(dout)
         sync()
         print("BWD", time.time() - t)
         # assert not mod.act_applied

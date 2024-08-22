@@ -15,15 +15,18 @@ from d3sim.data.scene_def.camera import BasicPinholeCamera
 def main():
     if IsAppleSiliconMacOs:
         path = "/Users/yanyan/Downloads/PVG-chkpnt30000.pth"
-        debug_inp_path = "/Users/yanyan/Downloads/debug_pvg.pth"
+        debug_bwd_path = "/Users/yanyan/Downloads/debug_pvg.pth"
     else:
         path = "/root/Projects/3dgs/PVG/eval_output/waymo_reconstruction/0145050/chkpnt30000.pth"
-        debug_inp_path = "/root/debug_pvg.pth"
-    model = load_pvg_model(path)
+        debug_bwd_path = "/root/Projects/3dgs/PVG/pvg_grads.pt"
+    model = load_pvg_model(path).to_parameter()
     # breakpoint()
-    op = GaussianSplatOp(GaussianSplatConfig(render_depth=True, render_rgba=True, verbose=True, ))
+    op = GaussianSplatOp(GaussianSplatConfig(render_depth=True, render_rgba=True, verbose=True))
 
-    (viewpoint_camera, bg_color_from_envmap, rendered_image_before, rendered_image, rendered_opacity, rendered_depth) = torch.load(debug_inp_path, map_location="cpu")
+    (viewpoint_camera, rendered_image_before, rendered_opacity, rendered_depth, 
+            xyz_grads, opacity_grads,
+             scale_grads, rotation_grads, feature_grads, t_grad, scaling_t_grad, velo_grad,
+              _, dout_color) = torch.load(debug_bwd_path, map_location=D3SIM_DEFAULT_DEVICE)
 
     c2w = viewpoint_camera["c2w"].cpu().numpy()
     fx = viewpoint_camera["fx"]
@@ -45,43 +48,31 @@ def main():
     cam = BasicPinholeCamera(id="", timestamp=0, pose=Pose(np.eye(4), c2w), 
         image_rc=Resource(base_uri="", loader_type=""), intrinsic=intrinsic_4x4, distortion=np.zeros(4, np.float32),
         image_shape_wh=(width, height), objects=[])
-    batch_ts = torch.tensor([timestamp], dtype=torch.float32, device=D3SIM_DEFAULT_DEVICE)
-    res = rasterize_gaussians_dynamic(model, cam, op, prep_input_tensors={
-        "batch_ts": batch_ts,
+    
+    res = rasterize_gaussians_dynamic(model, cam, op, training=True, prep_input_tensors={
+        "batch_ts": torch.tensor([timestamp], dtype=torch.float32, device=D3SIM_DEFAULT_DEVICE),
     }, prep_inputs={
         "time_shift": 0,
     })
-    for j in range(10):
-        with tv.measure_and_print("duration"):
-            res = rasterize_gaussians_dynamic(model, cam, op, prep_input_tensors={
-                "batch_ts": batch_ts,
-            }, prep_inputs={
-                "time_shift": 0,
-            })
-
+    res.color
     # res = rasterize_gaussians(model, cam, op)
 
     out_color = res.color
-    print(out_color.shape, bg_color_from_envmap.shape, rendered_image.shape)
+    # print(out_color.shape, bg_color_from_envmap.shape, rendered_image.shape)
     # out_color = rendered_image_before.permute(1, 2, 0)[None].to(D3SIM_DEFAULT_DEVICE)
     if not op.is_nchw:
         # to nchw
         out_color = out_color.permute(0, 3, 1, 2)
-    out_color = torch.concat([out_color[i] for i in range(out_color.shape[0])], dim=1)
+    print(torch.linalg.norm(out_color[:, :3] - rendered_image_before))
+    out_color[0, :3].backward(dout_color.to(D3SIM_DEFAULT_DEVICE))    
+    print("depth", torch.linalg.norm(res.depth.view(-1) - rendered_depth.view(-1)))
+    print("alpha", torch.linalg.norm(out_color[0, 3].view(-1) - rendered_opacity.view(-1)))
 
-    out_color_u8 = out_color.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
-    if out_color_u8.shape[-1] == 4:
-        out_color_u8 = out_color_u8[..., [2, 1, 0, 3]]
-    else:
-        out_color_u8 = out_color_u8[..., ::-1]
-    # if res.depth is not None:
-    #     depth = res.depth
-    #     depth_rgb = depth_map_to_jet_rgb(depth, (0.2, 25.0)).cpu().numpy()
-    #     out_color_u8 = np.concatenate([out_color_u8, depth_rgb], axis=0)
-
-    # out_color_u8 = (out_color.permute(1, 2, 0) * 255).to(torch.uint8).cpu().numpy()
-    import cv2 
-    cv2.imwrite("test_pvg.png", out_color_u8)
+    print(torch.linalg.norm(xyz_grads - model.xyz.grad))
+    print("q", torch.linalg.norm(model.quaternion_xyzw.grad - rotation_grads[:, [1, 2, 3, 0]]))
+    print("t", torch.linalg.norm(model.t.grad - t_grad))
+    print("st", torch.linalg.norm(model.scaling_t.grad - scaling_t_grad))
+    print("velo", torch.linalg.norm(model.velocity.grad - velo_grad))
 
     breakpoint()
     # rasterize_gaussians_dynamic

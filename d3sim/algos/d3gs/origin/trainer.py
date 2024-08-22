@@ -443,7 +443,7 @@ def __main():
     op = GaussianSplatOp(cfg.model.op)
     optim = GaussianOptimizerOrigin()
     strategy = GaussianStrategyOrigin()
-    trainer = Trainer(model, ds, op, optim, strategy, iterations=7000, batch_size=8)
+    trainer = Trainer(model, ds, op, optim, strategy, iterations=7000, batch_size=1)
     with create_enter_debug_store():
 
         trainer.train(ds)
