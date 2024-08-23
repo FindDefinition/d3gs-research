@@ -1813,6 +1813,7 @@ class GaussianSplatOp:
                         code_prep.raw(f"""
                         auto _conic_w_tmp = $conic_opacity[i_with_batch * 4 + 3];
                         uv_grad *= _conic_w_tmp;
+                        op::reinterpret_cast_array_nd<2>($duv)[i_with_batch] = uv_grad;
                         conic_grad[0] *= -0.5f * _conic_w_tmp;
                         conic_grad[1] *= -_conic_w_tmp;
                         conic_grad[2] *= -0.5f * _conic_w_tmp;
@@ -2032,6 +2033,7 @@ class GaussianSplatOp:
                         code_prep.raw(f"""
                         auto _conic_w_tmp = $conic_opacity[i_with_batch * 4 + 3];
                         uv_grad *= _conic_w_tmp;
+                        op::reinterpret_cast_array_nd<2>($duv)[i_with_batch] = uv_grad;
                         conic_grad[0] *= -0.5f * _conic_w_tmp;
                         conic_grad[1] *= -_conic_w_tmp;
                         conic_grad[2] *= -0.5f * _conic_w_tmp;
