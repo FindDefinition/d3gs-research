@@ -43,7 +43,8 @@ def _update_optimizer_only(
             for key in p_state.keys():
                 if key != "step":
                     v = p_state[key]
-                    p_state[key] = optimizer_fn(key, v)
+                    if v is not None:
+                        p_state[key] = optimizer_fn(key, v)
             p_new = param_fn(name, p)
             optimizers.param_groups[i]["params"] = [p_new]
             optimizers.state[p_new] = p_state
@@ -57,7 +58,8 @@ def _update_optimizer_only(
                 for key in p_state.keys():
                     if key != "step":
                         v = p_state[key]
-                        p_state[key] = optimizer_fn(key, v)
+                        if v is not None:
+                            p_state[key] = optimizer_fn(key, v)
                 p_new = param_fn(name, p)
                 optimizer.param_groups[i]["params"] = [p_new]
                 optimizer.state[p_new] = p_state

@@ -58,6 +58,7 @@ class Train:
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatConfig:
     tile_size: tuple[int, int] = (16, 16)
+    warp_size: tuple[int, int] = (8, 4)
     eps: float = 1e-6
     cov2d_radii_eigen_eps: float = 0.1
     projected_clamp_factor: float = 1.3
@@ -103,6 +104,8 @@ class GaussianSplatConfig:
     disable_builtin_rgb = False
 
     move_opacity_in_grad_to_prep: bool = False
+
+    measure_atomic_add_count: bool = False
 
     @property 
     def num_channels(self):

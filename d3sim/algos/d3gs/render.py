@@ -924,9 +924,17 @@ class GaussianSplatOp:
         render_rgba = self._cfg.render_rgba
         # when use raw kernel in metal, we don't use nonuniform grid to
         # keep logic same as cuda.
-        launch_param = tv.LaunchParam(
-            (tile_num_x, tile_num_y, batch_size),
-            (self._cfg.tile_size[0], self._cfg.tile_size[1], 1))
+        if IsAppleSiliconMacOs:
+            launch_param = tv.LaunchParam(
+                (tile_num_x, tile_num_y, batch_size),
+                (self._cfg.tile_size[0], self._cfg.tile_size[1], 1))
+        else:
+            launch_param = tv.LaunchParam(
+                (tile_num_x, tile_num_y, batch_size),
+                (self._cfg.tile_size[0] * self._cfg.tile_size[1], 1, 1))
+        atomic_add_count = None 
+        if is_bwd and self._cfg.measure_atomic_add_count:
+            atomic_add_count = torch.zeros([1], dtype=torch.int32, device=final_T.device)
         if kernel_unique_name in self._code_obj_caches:
             code_rasterize = self._code_obj_caches[kernel_unique_name]
             with measure_and_print_torch(
@@ -934,6 +942,9 @@ class GaussianSplatOp:
                     enable=self._cfg.verbose):
                 self._inliner.kernel_raw(kernel_unique_name, launch_param,
                                         code_rasterize)
+            if atomic_add_count is not None:
+                print(f"atomic add count: {atomic_add_count.item()}")
+
             return grad_out
 
         code_rasterize = pccm.code()
@@ -958,11 +969,31 @@ class GaussianSplatOp:
                 constexpr int batch_idx = 0;
                 """)
         else:
+            # for 16x16 tile, the warp shape is 16x2, we need to convert to 8x4
+            # slightly faster.
+            lane_matrix_shape = self._cfg.warp_size
+            num_lane_matrix_shape = (self._cfg.tile_size[0] // lane_matrix_shape[0], self._cfg.tile_size[1] // lane_matrix_shape[1])
+            assert self._cfg.tile_size[0] % lane_matrix_shape[0] == 0
+            assert self._cfg.tile_size[1] % lane_matrix_shape[1] == 0
             code_rasterize.raw(f"""
-            tv::array<uint32_t, 2> pixel_idx_xy{{blockIdx.x * {self._cfg.tile_size[0]} + threadIdx.x, blockIdx.y * {self._cfg.tile_size[1]} + threadIdx.y}};
+            int warp_idx_tmp = threadIdx.x / 32;
+            int warp_x = warp_idx_tmp % {num_lane_matrix_shape[0]};
+            int warp_y = warp_idx_tmp / {num_lane_matrix_shape[0]};
+            int lane_idx_tmp = threadIdx.x % 32;
+            int lane_x = lane_idx_tmp % {lane_matrix_shape[0]};
+            int lane_y = lane_idx_tmp / {lane_matrix_shape[0]};
+
+            tv::array<uint32_t, 2> pixel_idx_xy{{blockIdx.x * {self._cfg.tile_size[0]} + warp_x * {lane_matrix_shape[0]} + lane_x, 
+                                                 blockIdx.y * {self._cfg.tile_size[1]} + warp_y * {lane_matrix_shape[1]} + lane_y}};
             tv::array<uint32_t, 2> tile_idx_xy{{blockIdx.x, blockIdx.y}};
-            uint32_t thread_rank = threadIdx.y * {self._cfg.tile_size[0]} + threadIdx.x;
+            uint32_t thread_rank = threadIdx.x;
             """)
+
+            # code_rasterize.raw(f"""
+            # tv::array<uint32_t, 2> pixel_idx_xy{{blockIdx.x * {self._cfg.tile_size[0]} + threadIdx.x, blockIdx.y * {self._cfg.tile_size[1]} + threadIdx.y}};
+            # tv::array<uint32_t, 2> tile_idx_xy{{blockIdx.x, blockIdx.y}};
+            # uint32_t thread_rank = threadIdx.y * {self._cfg.tile_size[0]} + threadIdx.x;
+            # """)
             if batch_size != 1:
                 code_rasterize.raw(f"""
                 int batch_idx = blockIdx.z;
@@ -1562,6 +1593,10 @@ class GaussianSplatOp:
                                 code_rasterize.raw(f"""
                                 tv::parallel::atomicAdd($dcustom_features + gaussian_id * {num_custom_feat} + {j}, dL_dcustom_feat[{j}]);
                                 """)
+                        if self._cfg.measure_atomic_add_count:
+                            code_rasterize.raw(f"""
+                            tv::parallel::atomicAdd($atomic_add_count, 1);
+                            """)
                     # if has_custom_feat:
                     #     code_rasterize.raw(f"""
                     #     for (int channel_idx = 0; channel_idx < {num_custom_feat}; ++channel_idx){{
@@ -1656,6 +1691,8 @@ class GaussianSplatOp:
                 enable=self._cfg.verbose):
             self._inliner.kernel_raw(kernel_unique_name, launch_param,
                                      code_rasterize)
+        if atomic_add_count is not None:
+            print(f"atomic add count: {atomic_add_count.item()}")
         # if is_bwd:
         # print(self._inliner.get_nvrtc_module(kernel_unique_name).params.debug_code)
 
@@ -1885,7 +1922,7 @@ class GaussianSplatOp:
                         tv::array<float, 1> dopacity_val{{$dopacity[i_with_batch]}};
                         auto ddet_div_det_lowpass_clamp = dopacity_val[0] * opacity_val_with_act[0];
 
-                        auto ddet_div_det_lowpass = det_div_det_lowpass <= 0.000025f ? 0.0f : ddet_div_det_lowpass_clamp * 0.5f / det_div_lowpass_sqrt_clamp;
+                        auto ddet_div_det_lowpass = det_div_lowpass <= 0.000025f ? 0.0f : ddet_div_det_lowpass_clamp * 0.5f / det_div_lowpass_sqrt_clamp;
 
                         auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad_with_comp(conic_grad, ddet_div_det_lowpass, 
                             cov2d_vec, {self._cfg.gaussian_lowpass_filter}f);
@@ -2110,7 +2147,7 @@ class GaussianSplatOp:
                         tv::array<float, 1> dopacity_val{{$dopacity[i_with_batch]}};
                         auto ddet_div_det_lowpass_clamp = dopacity_val[0] * opacity;
 
-                        auto ddet_div_det_lowpass = det_div_det_lowpass <= 0.000025f ? 0.0f : ddet_div_det_lowpass_clamp * 0.5f / det_div_lowpass_sqrt_clamp;
+                        auto ddet_div_det_lowpass = det_div_lowpass <= 0.000025f ? 0.0f : ddet_div_det_lowpass_clamp * 0.5f / det_div_lowpass_sqrt_clamp;
                         auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad_with_comp(conic_grad, ddet_div_det_lowpass, 
                             cov2d_vec, {self._cfg.gaussian_lowpass_filter}f);
                         dopacity_val = (dopacity_val * det_div_lowpass_sqrt_clamp);

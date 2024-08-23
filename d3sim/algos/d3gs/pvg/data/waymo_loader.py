@@ -161,7 +161,7 @@ def transform_poses_pca(poses, fix_radius: float=0):
 class PVGArgs:
     source_path: str
     model_path: str
-    resolution_scales: list[float] = dataclasses.field(default_factory=lambda: [1, 2, 4, 8, 16])
+    resolution_scales: list[float] = dataclasses.field(default_factory=lambda: [1, 4, 16])
     cam_num: int = 3
     num_pts: int = 600000
     frame_interval: float = 0.02

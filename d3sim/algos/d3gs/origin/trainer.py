@@ -93,6 +93,10 @@ class GaussianOptimizerOrigin(GaussianOptimizerBase[GaussianModelOriginBase]):
             if k == "xyz":
                 lr = self.lr_dict[k] * bs_scale * dataset.extent
             pgs.append({'params': [p], 'lr': lr, "name": k})
+            # if k == "color_sh":
+            #     # use sgd
+            #     optim = torch.optim.SGD([{"params": [p], "lr": lr * 10, "name": k}])
+            # else:
             optim = torch.optim.Adam([{"params": [p], "lr": lr, "name": k}], eps=1e-15 / bs_scale, fused=fused, betas=(1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.999)))
             schr = None 
             if k == "xyz":
