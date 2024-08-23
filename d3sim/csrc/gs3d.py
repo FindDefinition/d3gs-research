@@ -4,6 +4,36 @@ from d3sim.core.geodef import EulerIntrinsicOrder
 
 from d3sim.core import dataclass_dispatch as dataclasses
 from ccimport import compat
+from cumm.inliner.sympy_codegen import sigmoid, tvarray_math_expr, VectorSymOperator, Scalar, Vector, VectorExpr
+import sympy
+
+
+class Cov2dInvWithCompOp(VectorSymOperator):
+    def __init__(self, lowpass_filter: float = 0.3):
+        super().__init__()
+        self.lowpass_filter = lowpass_filter
+
+    def forward(self, a: sympy.Symbol, 
+                b: sympy.Symbol,
+                c: sympy.Symbol,
+                lf: sympy.Symbol) -> dict[str, VectorExpr | sympy.Expr]:
+        det_l = a * c - b * b
+        a_l = a - lf
+        c_l = c - lf
+        det = a_l * c_l - b * b
+        comp = det / det_l
+        det_inv = 1.0 / det_l
+
+        
+        return {
+            "a_inv": c * det_inv,
+            "b_inv": -b * det_inv,
+            "c_inv": a * det_inv,
+            "comp": comp
+        }
+
+_COV2D_INV_OP = Cov2dInvWithCompOp().build()
+
 class SHConstants:
     C0: float = 0.28209479177387814
     C1: float = 0.4886025119029199
@@ -519,16 +549,20 @@ class Gaussian3D(pccm.Class):
         code = pccm.code()
         code.targ("T")
         code.arg("cov2d_vec", "tv::array<T, 3>")
+        code.arg("lowpass_filter", "T")
         code.arg("eps", "T", "1e-6")
         code.raw(f"""
         namespace op = tv::arrayops;
+        auto a = cov2d_vec[0];
+        auto b = cov2d_vec[1];
+        auto c = cov2d_vec[2];
         using math_op_t = tv::arrayops::MathScalarOp<T>;
-        T det = cov2d_vec[0] * cov2d_vec[2] - cov2d_vec[1] * cov2d_vec[1];
+        T det = a * c - b * b;
         T det_inv = T(1) / (det + eps);
         tv::array<T, 3> ret{{
-            cov2d_vec[2] * det_inv,
-            -cov2d_vec[1] * det_inv,
-            cov2d_vec[0] * det_inv,
+            c * det_inv,
+            -b * det_inv,
+            a * det_inv,
         }};
         return std::make_tuple(ret, det);
         """)
@@ -541,6 +575,7 @@ class Gaussian3D(pccm.Class):
         code.arg("dcov2d_inv_vec", "tv::array<T, 3>")
 
         code.arg("cov2d_vec", "tv::array<T, 3>")
+        code.arg("lowpass_filter", "T")
         code.arg("eps", "T", "1e-8")
         code.raw(f"""
         namespace op = tv::arrayops;
@@ -563,6 +598,100 @@ class Gaussian3D(pccm.Class):
         return ret;
         """)
         return code.ret("tv::array<T, 3>")
+
+
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def gaussian_2d_inverse_and_det_with_comp(self):
+        code = pccm.code()
+        code.targ("T")
+        code.arg("cov2d_vec", "tv::array<T, 3>")
+        code.arg("lowpass_filter", "T")
+
+        code.arg("eps", "T", "1e-8")
+        code.raw(f"""
+        namespace op = tv::arrayops;
+        using math_op_t = tv::arrayops::MathScalarOp<T>;
+        auto a = cov2d_vec[0] - lowpass_filter;
+        auto c = cov2d_vec[2] - lowpass_filter;
+        auto a_l = cov2d_vec[0];
+        auto b = cov2d_vec[1];
+        auto c_l = cov2d_vec[2];
+        T det_lowpass = a_l * c_l - b * b;
+        T det = a * c - b * b;
+        T det_lowpass_inv = T(1) / det_lowpass;
+        tv::array<T, 3> ret{{
+            c_l * det_lowpass_inv,
+            -b * det_lowpass_inv,
+            a_l * det_lowpass_inv,
+        }};
+        return std::make_tuple(ret, det, det / det_lowpass);
+        """)
+        return code.ret("std::tuple<tv::array<T, 3>, T, T>")
+
+
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def gaussian_2d_inverse_and_det_grad_with_comp(self):
+        code = pccm.code()
+        code.targ("T")
+        code.arg("dcov2d_inv_vec", "tv::array<T, 3>")
+        code.arg("ddet_div_det_lowpass", "T")
+
+        code.arg("cov2d_vec", "tv::array<T, 3>")
+        code.arg("lowpass_filter", "T")
+        code.arg("eps", "T", "1e-8")
+        use_sympy = False
+        if use_sympy:
+            # only for validation
+            gdict = {
+                "a_inv": "dcov2d_inv_vec[0]",
+                "b_inv": "dcov2d_inv_vec[1]",
+                "c_inv": "dcov2d_inv_vec[2]",
+                "comp": "ddet_div_det_lowpass"
+            }
+            code.raw(f"""
+            namespace op = tv::arrayops;
+            using math_op_t = tv::arrayops::MathScalarOp<T>;
+            T a = cov2d_vec[0];
+            T b = cov2d_vec[1];
+            T c = cov2d_vec[2];
+            T lf = lowpass_filter;
+            auto da = {_COV2D_INV_OP.generate_gradients_code("a", gdict)};
+            auto db = {_COV2D_INV_OP.generate_gradients_code("b", gdict)};
+            auto dc = {_COV2D_INV_OP.generate_gradients_code("c", gdict)};
+            return tv::array<T, 3>{{da, db, dc}};
+            """) 
+            return code.ret("tv::array<T, 3>")
+        else:
+            code.raw(f"""
+            namespace op = tv::arrayops;
+            using math_op_t = tv::arrayops::MathScalarOp<T>;
+            T a = cov2d_vec[0];
+            T b = cov2d_vec[1];
+            T c = cov2d_vec[2];
+            T det = a * c - b * b;
+
+            T det2_inv = T(1) / (det * det + eps);
+            // in original code, the dcov2d_inv_vec[1] is multipled by 2.
+            // this is due to original code treat dcov2d_inv_vec as 2x2 symmetric matrix,
+            // dcov2d_inv_vec is [da, db; db, dc]
+            // so dcov2d_inv_vec[2] need to be multiplied by 2.
+            // in our implementation, we treat dcov2d_inv_vec as a regular vector.
+            tv::array<T, 3> ret{{
+                det2_inv * (-c * c * dcov2d_inv_vec[0] + b * c * dcov2d_inv_vec[1] + (det - a * c) * dcov2d_inv_vec[2]),
+                det2_inv * T(2) * (b * c * dcov2d_inv_vec[0] - (det / T(2) + b * b) * dcov2d_inv_vec[1] + a * b * dcov2d_inv_vec[2]),
+                det2_inv * (-a * a * dcov2d_inv_vec[2] + a * b * dcov2d_inv_vec[1] + (det - a * c) * dcov2d_inv_vec[0]),
+            }};
+            const T lf = lowpass_filter;
+            const T grad_mul_det2_inv = ddet_div_det_lowpass * det2_inv;
+            ret += tv::array<T, 3>{{
+                lf * (c * c + b * b - c * lf) * grad_mul_det2_inv,
+                T(-2) * b * lf * (a + c - lf) * grad_mul_det2_inv,
+                lf * (a * a + b * b - a * lf) * grad_mul_det2_inv,
+            }};
+            return ret;
+            """)
+            return code.ret("tv::array<T, 3>")
+
 
     @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
     def get_gaussian_2d_ellipse(self):

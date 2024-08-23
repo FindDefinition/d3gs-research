@@ -203,6 +203,7 @@ class CameraFieldTypes(enum.Enum):
     IMAGE = "image"
     SEGMENTATION = "segmentation"
     VALID_MASK = "valid_mask"
+    DEPTH = "depth"
 
 class LidarFieldTypes(enum.Enum):
     POINT_CLOUD = "point_cloud"

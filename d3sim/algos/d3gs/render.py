@@ -352,15 +352,9 @@ class GaussianSplatOp:
                 auto z_in_cam = std::get<1>(uvz);
                 auto scale = op::reinterpret_cast_array_nd<3>($scales)[gaussian_idx];
                 auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[gaussian_idx];
+                quat = quat.op<op::{fused_q_act[0]}>();
+                scale = scale.op<op::{fused_scale_act[0]}>();
                 """)
-                if fused_q_act is not None:
-                    code_prep.raw(f"""
-                    quat = quat.op<op::{fused_q_act[0]}>();
-                    """)
-                if fused_scale_act is not None:
-                    code_prep.raw(f"""
-                    scale = scale.op<op::{fused_scale_act[0]}>();
-                    """)
                 if training:
                     code_prep.raw(f"""
                     auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale, quat);
@@ -372,11 +366,19 @@ class GaussianSplatOp:
                     """)
                 code_prep.raw(f"""
                 auto cov2d_vec = Gaussian3D::project_gaussian_to_2d<float, 3>(point_cam, focal_xy, tan_fov, cam2world_R_T, cov3d_vec, $projected_clamp_factor);
-                
-                cov2d_vec[0] += $lowpass_filter;
-                cov2d_vec[2] += $lowpass_filter;
-
-                auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det(cov2d_vec, $eps);
+                cov2d_vec[0] += {lowpass_filter}f;
+                cov2d_vec[2] += {lowpass_filter}f;
+                """)
+                if self._cfg.enable_anti_aliasing:
+                    code_prep.raw(f"""
+                    auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det_with_comp(cov2d_vec, {lowpass_filter}f, $eps);
+                    auto det_div_lowpass_sqrt_clamp = math_op_t::sqrt(math_op_t::max(0.000025f, std::get<2>(cov2d_inv_and_det))); 
+                    """)
+                else:
+                    code_prep.raw(f"""
+                    auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det(cov2d_vec, {lowpass_filter}f, $eps);
+                    """)
+                code_prep.raw(f"""
                 auto cov2d_inv = std::get<0>(cov2d_inv_and_det);
                 auto det = std::get<1>(cov2d_inv_and_det);
                 auto radii_fp = math_op_t::ceil(Gaussian3D::get_gaussian_2d_ellipse(cov2d_vec, det, 
@@ -400,10 +402,11 @@ class GaussianSplatOp:
 
                 op::reinterpret_cast_array_nd<2>($uvs)[i] = uv;
                 auto opacity_val = $opacity[gaussian_idx];
+                opacity_val = tv::array<float, 1>{{opacity_val}}.op<op::{fused_opacity_act[0]}>()[0];
                 """)
-                if fused_opacity_act is not None:
+                if self._cfg.enable_anti_aliasing:
                     code_prep.raw(f"""
-                    opacity_val = tv::array<float, 1>{{opacity_val}}.op<op::{fused_opacity_act[0]}>()[0];
+                    opacity_val = opacity_val * det_div_lowpass_sqrt_clamp;
                     """)
                 code_prep.raw(f"""
                 tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], opacity_val}};
@@ -479,11 +482,19 @@ class GaussianSplatOp:
                     """)
                 code_prep.raw(f"""
                 auto cov2d_vec = Gaussian3D::project_gaussian_to_2d<float, 3>(point_cam, focal_xy, tan_fov, cam2world_R_T, cov3d_vec, $projected_clamp_factor);
-                
-                cov2d_vec[0] += $lowpass_filter;
-                cov2d_vec[2] += $lowpass_filter;
-
-                auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det(cov2d_vec, $eps);
+                cov2d_vec[0] += {self._cfg.gaussian_lowpass_filter}f;
+                cov2d_vec[2] += {self._cfg.gaussian_lowpass_filter}f;
+                """)
+                if self._cfg.enable_anti_aliasing:
+                    code_prep.raw(f"""
+                    auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det_with_comp(cov2d_vec, {lowpass_filter}f, $eps);
+                    auto det_div_lowpass_sqrt_clamp = math_op_t::sqrt(math_op_t::max(0.000025f, std::get<2>(cov2d_inv_and_det))); 
+                    """)
+                else:
+                    code_prep.raw(f"""
+                    auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det(cov2d_vec, {lowpass_filter}f, $eps);
+                    """)
+                code_prep.raw(f"""
                 auto cov2d_inv = std::get<0>(cov2d_inv_and_det);
                 auto det = std::get<1>(cov2d_inv_and_det);
                 auto radii_fp = math_op_t::ceil(Gaussian3D::get_gaussian_2d_ellipse(cov2d_vec, det, 
@@ -503,11 +514,15 @@ class GaussianSplatOp:
                     // this will cause warp divergence, but save io.
                     return;
                 }}
-                $depths[i] = z_in_cam;
+                $depths[i] = {"z_in_cam" if not self._cfg.render_inv_depth else "1.0f / z_in_cam"};
 
                 op::reinterpret_cast_array_nd<2>($uvs)[i] = uv;
                 """)
                 proxy.read_field(GaussianCoreFields.OPACITY, "opacity_val")
+                if self._cfg.enable_anti_aliasing:
+                    code_prep.raw(f"""
+                    opacity_val = opacity_val * det_div_lowpass_sqrt_clamp;
+                    """)
                 code_prep.raw(f"""
                 tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], opacity_val}};
                 op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
@@ -902,7 +917,7 @@ class GaussianSplatOp:
         use_bwd_reduce = bwd_reduce_method != "none"
         kernel_unique_name = (
             f"rasterize_{is_bwd}_{self._cfg.tile_size}_{training}"
-            f"_{num_custom_feat}_{self._cfg.render_depth}"
+            f"_{num_custom_feat}_{self._cfg.render_depth}_{self._cfg.render_inv_depth}"
             f"_{self._cfg.use_nchw}_{self._cfg.render_rgba}_{batch_size == 1}"
             f"_{final_n_contrib is None}_{self._cfg.backward_reduction}")
         num_channels = self._cfg.num_channels
@@ -1396,6 +1411,7 @@ class GaussianSplatOp:
                             {"" if use_bwd_reduce else "auto"} dL_drgb = weight * {"op::slice<0, 3>(drgb_array)" if render_rgba else "drgb_array"};
                             """)
                         if render_depth:
+                            # WARNING this is actually dL/dz_inv if render_inv_depth is True.
                             code_rasterize.raw(f"""
                             {"" if use_bwd_reduce else "float"} dL_dz = weight * ddepth;
                             """)
@@ -1818,28 +1834,54 @@ class GaussianSplatOp:
                     point = point - cam2world_center;
 
                     auto point_cam = cam2world_R_T.op<op::mv_rowmajor>(point);
-                    auto cov2d_arr = op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i_with_batch];
-                    auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, {"$dz[i_with_batch]" if dz is not None else "0.0f"}, point_cam, principal_point, focal_xy);
-                    auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad(conic_grad, cov2d_arr);
+                    auto cov2d_vec = op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i_with_batch];
+                    """)
+                    if self._cfg.render_inv_depth:
+                        code_prep.raw(f"""
+                        auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, {"-$dz[i_with_batch] / (point_cam[2] * point_cam[2])" if dz is not None else "0.0f"}, point_cam, principal_point, focal_xy);
+                        """)
+                    else:
+                        code_prep.raw(f"""
+                        auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, {"$dz[i_with_batch]" if dz is not None else "0.0f"}, point_cam, principal_point, focal_xy);
+                        """)
+
+                    if self._cfg.enable_anti_aliasing:
+                        code_prep.raw(f"""
+                        auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det_with_comp(cov2d_vec, {self._cfg.gaussian_lowpass_filter}f);
+                        
+                        auto det_div_lowpass = std::get<2>(cov2d_inv_and_det);
+                        auto det_div_lowpass_sqrt_clamp = math_op_t::sqrt(math_op_t::max(0.000025f, det_div_lowpass)); 
+                        tv::array<float, 1> opacity_val{{$opacity[i]}};
+                        auto opacity_val_with_act = opacity_val.op<op::{fused_opacity_act[0]}>();
+                        tv::array<float, 1> dopacity_val{{$dopacity[i_with_batch]}};
+                        auto ddet_div_det_lowpass_clamp = dopacity_val[0] * opacity_val_with_act[0];
+
+                        auto ddet_div_det_lowpass = det_div_det_lowpass <= 0.000025f ? 0.0f : ddet_div_det_lowpass_clamp * 0.5f / det_div_lowpass_sqrt_clamp;
+
+                        auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad_with_comp(conic_grad, ddet_div_det_lowpass, 
+                            cov2d_vec, {self._cfg.gaussian_lowpass_filter}f);
+                        dopacity_val = (dopacity_val * det_div_lowpass_sqrt_clamp).op<op::{fused_opacity_act[1]}>(opacity_val_with_act, opacity_val);
+                        """)
+                        if batch_size > 1:
+                            code_prep.raw(f"""
+                            dopacity_val_acc += dopacity_val[0];
+                            """)
+                        else:
+                            code_prep.raw(f"""
+                            $dopacity[i] = dopacity_val[0];
+                            """)
+                    else:
+                        code_prep.raw(f"""
+                        auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad(conic_grad, cov2d_vec, {self._cfg.gaussian_lowpass_filter}f);
+                        """)
+
+                    code_prep.raw(f"""
                     auto scale = op::reinterpret_cast_array_nd<3>($scales)[i];
                     auto quat = op::reinterpret_cast_array_nd<4>($quat_xyzw)[i];
+                    auto scale_act = scale.op<op::{fused_scale_act[0]}>();
+                    auto quat_act = quat.op<op::{fused_q_act[0]}>();
+
                     """)
-                    if fused_scale_act:
-                        code_prep.raw(f"""
-                        auto scale_act = scale.op<op::{fused_scale_act[0]}>();
-                        """)
-                    else:
-                        code_prep.raw(f"""
-                        auto scale_act = scale;
-                        """)
-                    if fused_q_act:
-                        code_prep.raw(f"""
-                        auto quat_act = quat.op<op::{fused_q_act[0]}>();
-                        """)
-                    else:
-                        code_prep.raw(f"""
-                        auto quat_act = quat;
-                        """)
                     if self._cfg.recalc_cov3d_in_bwd:
                         code_prep.raw(f"""
                         auto cov3d_vec = Gaussian3D::scale_quat_to_cov3d(scale_act, quat_act);
@@ -1856,16 +1898,10 @@ class GaussianSplatOp:
                     auto cov3d_grad_res = Gaussian3D::scale_quat_to_cov3d_grad(std::get<1>(proj_grad_res), scale_act, quat_act);
                     auto dscale = std::get<0>(cov3d_grad_res);
                     auto dquat = std::get<1>(cov3d_grad_res);
+                    dscale = dscale.op<op::{fused_scale_act[1]}>(scale_act, scale);
+                    dquat = dquat.op<op::{fused_q_act[1]}>(quat_act, quat);
                     """)
-                    if fused_scale_act:
-                        code_prep.raw(f"""
-                        dscale = dscale.op<op::{fused_scale_act[1]}>(scale_act, scale);
-                        """)
-                    if fused_q_act:
-                        code_prep.raw(f"""
-                        dquat = dquat.op<op::{fused_q_act[1]}>(quat_act, quat);
-                        """)
-                    if fused_opacity_act:
+                    if not self._cfg.enable_anti_aliasing:
                         code_prep.raw(f"""
                         tv::array<float, 1> opacity_val{{$opacity[i]}};
                         tv::array<float, 1> dopacity_val{{$dopacity[i_with_batch]}};
@@ -1880,10 +1916,6 @@ class GaussianSplatOp:
                             $dopacity[i] = dopacity_val[0];
                             """)
                     if batch_size > 1:
-                        if not fused_opacity_act:
-                            code_prep.raw(f"""
-                            dopacity_val_acc += $dopacity[i_with_batch];
-                            """)
                         code_prep.raw(f"""
                         dscale_acc += dscale;
                         dquat_acc += dquat;
@@ -2015,10 +2047,42 @@ class GaussianSplatOp:
                     point = point - cam2world_center;
 
                     auto point_cam = cam2world_R_T.op<op::mv_rowmajor>(point);
-                    auto cov2d_arr = op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i_with_batch];
-                    auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, {"$dz[i_with_batch]" if dz is not None else "0.0f"}, point_cam, principal_point, focal_xy);
-                    auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad(conic_grad, cov2d_arr);
+                    auto cov2d_vec = op::reinterpret_cast_array_nd<3>($cov2d_vecs)[i_with_batch];
                     """)
+                    if self._cfg.render_inv_depth:
+                        code_prep.raw(f"""
+                        auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, 
+                            {"-$dz[i_with_batch] / (point_cam[2] * point_cam[2])" if dz is not None else "0.0f"}, 
+                            point_cam, principal_point, focal_xy);
+                        """)
+                    else:
+                        code_prep.raw(f"""
+                        auto dpoint_cam = CameraOps::pos_cam_to_uv_no_distort_grad(uv_grad, 
+                            {"$dz[i_with_batch]" if dz is not None else "0.0f"}, 
+                            point_cam, principal_point, focal_xy);
+                        """)
+                    if self._cfg.enable_anti_aliasing:
+                        proxy.read_field(GaussianCoreFields.OPACITY, "opacity")
+
+                        code_prep.raw(f"""
+                        auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det_with_comp(cov2d_vec, {self._cfg.gaussian_lowpass_filter}f);
+                        
+                        auto det_div_lowpass = std::get<2>(cov2d_inv_and_det);
+                        auto det_div_lowpass_sqrt_clamp = math_op_t::sqrt(math_op_t::max(0.000025f, det_div_lowpass)); 
+                        tv::array<float, 1> dopacity_val{{$dopacity[i_with_batch]}};
+                        auto ddet_div_det_lowpass_clamp = dopacity_val[0] * opacity;
+
+                        auto ddet_div_det_lowpass = det_div_det_lowpass <= 0.000025f ? 0.0f : ddet_div_det_lowpass_clamp * 0.5f / det_div_lowpass_sqrt_clamp;
+                        auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad_with_comp(conic_grad, ddet_div_det_lowpass, 
+                            cov2d_vec, {self._cfg.gaussian_lowpass_filter}f);
+                        dopacity_val = (dopacity_val * det_div_lowpass_sqrt_clamp);
+
+                        """)
+                        proxy.accumulate_field_grad(GaussianCoreFields.OPACITY, "opacity", "dopacity_val[0]")
+                    else:
+                        code_prep.raw(f"""
+                        auto dcov2d = Gaussian3D::gaussian_2d_inverse_and_det_grad(conic_grad, cov2d_vec, {self._cfg.gaussian_lowpass_filter}f);
+                        """)
                     proxy.read_field(GaussianCoreFields.SCALE, "scale")
                     proxy.read_field(GaussianCoreFields.QUATERNION_XYZW, "quat")
 
@@ -2038,14 +2102,16 @@ class GaussianSplatOp:
                     auto cov3d_grad_res = Gaussian3D::scale_quat_to_cov3d_grad(std::get<1>(proj_grad_res), scale, quat);
                     auto dscale = std::get<0>(cov3d_grad_res);
                     auto dquat = std::get<1>(cov3d_grad_res);
-                    tv::array<float, 1> dopacity_val{{$dopacity[i_with_batch]}};
 
                     """)
                     proxy.accumulate_field_grad(GaussianCoreFields.SCALE, "scale", "dscale")
                     proxy.accumulate_field_grad(GaussianCoreFields.QUATERNION_XYZW, "quat", "dquat")
-                    
-                    proxy.read_field(GaussianCoreFields.OPACITY, "opacity")
-                    proxy.accumulate_field_grad(GaussianCoreFields.OPACITY, "opacity", "dopacity_val[0]")
+                    if not self._cfg.enable_anti_aliasing:
+                        code_prep.raw(f"""
+                        tv::array<float, 1> dopacity_val{{$dopacity[i_with_batch]}};
+                        """)
+                        proxy.read_field(GaussianCoreFields.OPACITY, "opacity")
+                        proxy.accumulate_field_grad(GaussianCoreFields.OPACITY, "opacity", "dopacity_val[0]")
 
                     code_prep.raw(f"""
                     auto normed_dir = (point).op<op::normalize>();

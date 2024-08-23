@@ -32,3 +32,8 @@ class D3simDataset(abc.ABC):
     def get_cameras(self, split: Literal["train", "test"]) -> list[BasicPinholeCamera]:
         raise NotImplementedError
 
+class D3simDatasetTransform(abc.ABC):
+    
+    @abc.abstractmethod
+    def transform(self, dataset: D3simDataset) -> D3simDataset:
+        raise NotImplementedError

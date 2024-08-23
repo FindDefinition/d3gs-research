@@ -70,6 +70,8 @@ class GaussianSplatConfig:
 
     enable_32bit_sort: bool = False
     render_depth: bool = False
+    render_inv_depth: bool = False
+    enable_anti_aliasing: bool = False
     bg_color: np.ndarray = dataclasses.field(
         default_factory=lambda: np.zeros((3), np.float32))
     scale_global: float = 1.0
@@ -99,6 +101,8 @@ class GaussianSplatConfig:
     # builtin rgb only support simple color model such as sh.
     # you can use proxy to change the simple color model.
     disable_builtin_rgb = False
+
+    move_opacity_in_grad_to_prep: bool = False
 
     @property 
     def num_channels(self):

@@ -20,8 +20,16 @@ def main():
         path = "/root/Projects/3dgs/PVG/eval_output/waymo_reconstruction/0145050/chkpnt30000.pth"
         debug_inp_path = "/root/debug_pvg.pth"
     model = load_pvg_model(path)
+    # xyz = model.xyz 
+    # xyz_mean = xyz.mean(0)
+    # xyz_centered = xyz - xyz_mean
+    # max_radius = torch.linalg.norm(xyz_centered, dim=1).max()
     # breakpoint()
-    op = GaussianSplatOp(GaussianSplatConfig(render_depth=True, render_rgba=True, verbose=True, ))
+    if IsAppleSiliconMacOs:
+
+        op = GaussianSplatOp(GaussianSplatConfig(render_depth=True, render_rgba=True, verbose=True, enable_32bit_sort=True, gaussian_std_sigma=2.0))
+    else:
+        op = GaussianSplatOp(GaussianSplatConfig(render_depth=True, render_rgba=True, verbose=True, ))
 
     (viewpoint_camera, bg_color_from_envmap, rendered_image_before, rendered_image, rendered_opacity, rendered_depth) = torch.load(debug_inp_path, map_location="cpu")
 

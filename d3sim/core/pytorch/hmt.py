@@ -107,7 +107,7 @@ class HomogeneousTensor(DataClassWithArrayCheck):
             setattr(self, key, getattr(other, key))
         return self
 
-    def to_device(self, device: Literal["cpu", "cuda"]) -> Self:
+    def to_device(self, device: torch.device | Literal["cpu", "cuda", "mps"]) -> Self:
         tensor_fields = self.get_all_tensor_fields()
         for key, value in tensor_fields.items():
             is_parameter = isinstance(value, torch.nn.Parameter)
@@ -117,7 +117,7 @@ class HomogeneousTensor(DataClassWithArrayCheck):
             tensor_fields[key] = res
         return self.__class__(**tensor_fields, **self.get_all_non_tensor_fields())
 
-    def to_device_inplace(self, device: Literal["cpu", "cuda"]) -> Self:
+    def to_device_inplace(self, device: torch.device | Literal["cpu", "cuda", "mps"]) -> Self:
         for key, value in self.get_all_tensor_fields().items():
             is_parameter = isinstance(value, torch.nn.Parameter)
             res = value.to(device)
