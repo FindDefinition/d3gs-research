@@ -102,7 +102,7 @@ class GaussianSplatConfig:
     # you can use proxy to change the simple color model.
     disable_builtin_rgb = False
 
-    move_opacity_in_grad_to_prep: bool = False
+    move_opacity_in_grad_to_prep: bool = True
 
     @property 
     def num_channels(self):

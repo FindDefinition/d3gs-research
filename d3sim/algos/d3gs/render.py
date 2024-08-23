@@ -1419,33 +1419,53 @@ class GaussianSplatOp:
                             code_rasterize.raw(f"""
                             {"" if use_bwd_reduce else f"tv::array<float, {num_custom_feat}>"} dL_dcustom_feat = weight * dcustom_feat;
                             """)
-                        code_rasterize.raw(f"""
+                        if self._cfg.move_opacity_in_grad_to_prep:
+                            code_rasterize.raw(f"""
+                            const float dL_dG = dL_dalpha;
+                            const float gdx = G * dist[0];
+                            const float gdy = G * dist[1];
+                            const float dG_du = -gdx * conic_opacity_vec.x - gdy * conic_opacity_vec.y;
+                            const float dG_dv = -gdy * conic_opacity_vec.z - gdx * conic_opacity_vec.y;
+                            {"" if use_bwd_reduce else "tv::array<float, 2>"} dL_duv =  {{
+                                dL_dG * dG_du,
+                                dL_dG * dG_dv
+                            }};
+                            {"" if use_bwd_reduce else "tv::array<float, 3>"} dL_dcov2d = {{
+                                gdx * dist[0] * dL_dG,
+                                gdx * dist[1] * dL_dG,
+                                gdy * dist[1] * dL_dG,
+                            }};
+                            {"" if use_bwd_reduce else "float"} dL_dopacity = dL_dalpha * G;
+                            """)
 
-                        const float dL_dG = conic_opacity_vec.w * dL_dalpha;
-                        const float gdx = G * dist[0];
-                        const float gdy = G * dist[1];
-                        // in original code, the proj matrix map point to ndc,
-                        // so their gradient contains 0.5 * W/H.
-                        // we don't do this, so that grad is removed.
-                        const float dG_du = -gdx * conic_opacity_vec.x - gdy * conic_opacity_vec.y;
-                        const float dG_dv = -gdy * conic_opacity_vec.z - gdx * conic_opacity_vec.y;
-                        {"" if use_bwd_reduce else "tv::array<float, 2>"} dL_duv =  {{
-                            dL_dG * dG_du,
-                            dL_dG * dG_dv
-                        }};
-                        // in origin 3dgs code, this is -0.5f * gdx * d.y * dL_dG
-                        // this is actually sym grad, means dL_dcov2d is 2x2,
-                        // grad[0][1] == grad[1][0] == -0.5f * gdx * d.y * dL_dG
-                        // this make the input of grad of inverse (cov2d) is actually 2x2
-                        // here we remove the 0.5 and modify cov2d inverse grad code,
-                        // remove the 2 multipler in cov2d inverse grad code.
-                        {"" if use_bwd_reduce else "tv::array<float, 3>"} dL_dcov2d = {{
-                            -0.5f * gdx * dist[0] * dL_dG,
-                            -gdx * dist[1] * dL_dG,
-                            -0.5f * gdy * dist[1] * dL_dG,
-                        }};
-                        {"" if use_bwd_reduce else "float"} dL_dopacity = dL_dalpha * G;
-                        """)
+                        else:
+                            code_rasterize.raw(f"""
+
+                            const float dL_dG = conic_opacity_vec.w * dL_dalpha;
+                            const float gdx = G * dist[0];
+                            const float gdy = G * dist[1];
+                            // in original code, the proj matrix map point to ndc,
+                            // so their gradient contains 0.5 * W/H.
+                            // we don't do this, so that grad is removed.
+                            const float dG_du = -gdx * conic_opacity_vec.x - gdy * conic_opacity_vec.y;
+                            const float dG_dv = -gdy * conic_opacity_vec.z - gdx * conic_opacity_vec.y;
+                            {"" if use_bwd_reduce else "tv::array<float, 2>"} dL_duv =  {{
+                                dL_dG * dG_du,
+                                dL_dG * dG_dv
+                            }};
+                            // in origin 3dgs code, this is -0.5f * gdx * d.y * dL_dG
+                            // this is actually sym grad, means dL_dcov2d is 2x2,
+                            // grad[0][1] == grad[1][0] == -0.5f * gdx * d.y * dL_dG
+                            // this make the input of grad of inverse (cov2d) is actually 2x2
+                            // here we remove the 0.5 and modify cov2d inverse grad code,
+                            // remove the 2 multipler in cov2d inverse grad code.
+                            {"" if use_bwd_reduce else "tv::array<float, 3>"} dL_dcov2d = {{
+                                -0.5f * gdx * dist[0] * dL_dG,
+                                -gdx * dist[1] * dL_dG,
+                                -0.5f * gdy * dist[1] * dL_dG,
+                            }};
+                            {"" if use_bwd_reduce else "float"} dL_dopacity = dL_dalpha * G;
+                            """)
                 if is_bwd:
                     reduce_if_ctx = nullcontext()
                     if bwd_reduce_method == "warp":
@@ -1789,6 +1809,14 @@ class GaussianSplatOp:
                     auto conic_grad = op::reinterpret_cast_array_nd<3>($dconic)[i_with_batch];
                     // auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i_with_batch];
                     """)
+                    if self._cfg.move_opacity_in_grad_to_prep:
+                        code_prep.raw(f"""
+                        auto _conic_w_tmp = $conic_opacity[i_with_batch * 4 + 3];
+                        uv_grad *= _conic_w_tmp;
+                        conic_grad[0] *= -0.5f * _conic_w_tmp;
+                        conic_grad[1] *= -_conic_w_tmp;
+                        conic_grad[2] *= -0.5f * _conic_w_tmp;
+                        """)
                     if is_cam_bundle:
                         # cam2world, focal and ppoint are tensor, load from gpu mem
                         code_prep.raw(f"""
@@ -2000,6 +2028,14 @@ class GaussianSplatOp:
                     auto conic_grad = op::reinterpret_cast_array_nd<3>($dconic)[i_with_batch];
                     // auto cov3d_vec = op::reinterpret_cast_array_nd<6>($cov3d_vecs)[i_with_batch];
                     """)
+                    if self._cfg.move_opacity_in_grad_to_prep:
+                        code_prep.raw(f"""
+                        auto _conic_w_tmp = $conic_opacity[i_with_batch * 4 + 3];
+                        uv_grad *= _conic_w_tmp;
+                        conic_grad[0] *= -0.5f * _conic_w_tmp;
+                        conic_grad[1] *= -_conic_w_tmp;
+                        conic_grad[2] *= -0.5f * _conic_w_tmp;
+                        """)
                     if is_cam_bundle:
                         # cam2world, focal and ppoint are tensor, load from gpu mem
                         code_prep.raw(f"""
