@@ -1,10 +1,38 @@
+import dataclasses
+import math
 import os
+import random
 import numpy as np
 from tqdm import tqdm
 from PIL import Image
 from d3sim.algos.d3gs.origin.data.scene.dataset_readers import getNerfppNorm
 from typing import NamedTuple
 from plyfile import PlyData, PlyElement
+import cv2 
+import kornia
+import torch 
+from torch.nn import functional as F
+from d3sim.algos.d3gs.origin.data.utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from d3sim.constants import D3SIM_DEFAULT_DEVICE
+def getProjectionMatrixCenterShift(znear, zfar, cx, cy, fx, fy, w, h):
+    top = cy / fy * znear
+    bottom = -(h-cy) / fy * znear
+    
+    left = -(w-cx) / fx * znear
+    right = cx / fx * znear
+
+    P = torch.zeros(4, 4)
+
+    z_sign = 1.0
+
+    P[0, 0] = 2.0 * znear / (right - left)
+    P[1, 1] = 2.0 * znear / (top - bottom)
+    P[0, 2] = (right + left) / (right - left)
+    P[1, 2] = (top + bottom) / (top - bottom)
+    P[3, 2] = z_sign
+    P[2, 2] = z_sign * zfar / (zfar - znear)
+    P[2, 3] = -(zfar * znear) / (zfar - znear)
+    return P
 
 class BasicPointCloud(NamedTuple):
     points : np.ndarray
@@ -84,7 +112,7 @@ def unpad_poses(p):
     return p[..., :3, :4]
 
 
-def transform_poses_pca(poses, fix_radius=0):
+def transform_poses_pca(poses, fix_radius: float=0):
     """Transforms poses so principal components lie on XYZ axes.
 
   Args:
@@ -129,8 +157,23 @@ def transform_poses_pca(poses, fix_radius=0):
 
     return poses_recentered, transform, scale_factor
 
+@dataclasses.dataclass
+class PVGArgs:
+    source_path: str
+    model_path: str
+    resolution_scales: list[float] = dataclasses.field(default_factory=lambda: [1, 2, 4, 8, 16])
+    cam_num: int = 3
+    num_pts: int = 600000
+    frame_interval: float = 0.02
+    time_duration: list = dataclasses.field(default_factory=lambda: [-0.5, 0.5])
+    fix_radius: float = 0.0
+    testhold: int = 4
+    eval: bool = False
+    debug_cuda: bool = False
+    resolution: int = -1
+    data_device: str = D3SIM_DEFAULT_DEVICE
 
-def readWaymoInfo(args):
+def readWaymoInfo(args: PVGArgs):
     cam_infos = []
     car_list = [f[:-4] for f in sorted(os.listdir(os.path.join(args.source_path, "calib"))) if f.endswith('.txt')]
     points = []
@@ -267,3 +310,246 @@ def readWaymoInfo(args):
                            time_duration=time_duration)
 
     return scene_info
+
+
+def fov2focal(fov, pixels):
+    return pixels / (2 * math.tan(fov / 2))
+
+class Camera(torch.nn.Module):
+    def __init__(self, colmap_id, R, T, FoVx=None, FoVy=None, cx=None, cy=None, fx=None, fy=None, 
+                 image=None,
+                 image_name=None, uid=0,
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda", timestamp=0.0, 
+                 resolution=None, image_path=None,
+                 pts_depth=None, sky_mask=None
+                 ):
+        super(Camera, self).__init__()
+
+        self.uid = uid
+        self.colmap_id = colmap_id
+        self.R = R
+        self.T = T
+        self.FoVx = FoVx
+        self.FoVy = FoVy
+        self.image_name = image_name
+        self.image = image
+        self.cx = cx
+        self.cy = cy
+        self.fx = fx
+        self.fy = fy
+        self.resolution = resolution
+        self.image_path = image_path
+
+        try:
+            self.data_device = torch.device(data_device)
+        except Exception as e:
+            print(e)
+            print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device")
+            self.data_device = torch.device("cuda")
+
+        self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
+        self.sky_mask = sky_mask.to(self.data_device) > 0 if sky_mask is not None else sky_mask
+        self.pts_depth = pts_depth.to(self.data_device) if pts_depth is not None else pts_depth
+
+        self.image_width = resolution[0]
+        self.image_height = resolution[1]
+
+        self.zfar = 1000.0
+        self.znear = 0.01
+
+        self.trans = trans
+        self.scale = scale
+
+        self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).to(D3SIM_DEFAULT_DEVICE)
+        if cx is not None:
+            self.FoVx = 2 * math.atan(0.5*self.image_width / fx)
+            self.FoVy = 2 * math.atan(0.5*self.image_height / fy)
+            self.projection_matrix = getProjectionMatrixCenterShift(self.znear, self.zfar, cx, cy, fx, fy,
+                                                                    self.image_width, self.image_height).transpose(0, 1).to(D3SIM_DEFAULT_DEVICE)
+        else:
+            self.cx = self.image_width / 2
+            self.cy = self.image_height / 2
+            self.fx = self.image_width / (2 * np.tan(self.FoVx * 0.5))
+            self.fy = self.image_height / (2 * np.tan(self.FoVy * 0.5))
+            self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx,
+                                                         fovY=self.FoVy).transpose(0, 1).to(D3SIM_DEFAULT_DEVICE)
+        self.full_proj_transform = (
+            self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
+        self.camera_center = self.world_view_transform.inverse()[3, :3]
+        self.c2w = self.world_view_transform.transpose(0, 1).inverse()
+        self.timestamp = timestamp
+        self.grid = kornia.utils.create_meshgrid(self.image_height, self.image_width, normalized_coordinates=False, device=D3SIM_DEFAULT_DEVICE)[0]
+
+    def get_world_directions(self, train=False):
+        u, v = self.grid.unbind(-1)
+        if train:
+            directions = torch.stack([(u-self.cx+torch.rand_like(u))/self.fx,
+                                        (v-self.cy+torch.rand_like(v))/self.fy,
+                                        torch.ones_like(u)], dim=0)
+        else:
+            directions = torch.stack([(u-self.cx+0.5)/self.fx,
+                                        (v-self.cy+0.5)/self.fy,
+                                        torch.ones_like(u)], dim=0)
+        directions = F.normalize(directions, dim=0)
+        directions = (self.c2w[:3, :3] @ directions.reshape(3, -1)).reshape(3, self.image_height, self.image_width)
+        return directions
+
+    def get_intrinsic(self):
+        res = np.eye(3, dtype=np.float32)
+        focal_x = fov2focal(self.FoVx, self.image_width)
+        focal_y = fov2focal(self.FoVy, self.image_height)
+        center_x = self.image_width / 2
+        center_y = self.image_height / 2
+        res[0, 0] = focal_x
+        res[1, 1] = focal_y
+        res[0, 2] = center_x
+        res[1, 2] = center_y
+        return res
+
+
+def loadCam(args: PVGArgs, id, cam_info: CameraInfo, resolution_scale):
+    orig_w, orig_h = cam_info.width, cam_info.height  # cam_info.image.size
+
+    if args.resolution in [1, 2, 3, 4, 8, 16, 32]:
+        resolution = round(orig_w / (resolution_scale * args.resolution)), round(
+            orig_h / (resolution_scale * args.resolution)
+        )
+        scale = resolution_scale * args.resolution
+    else:  # should be a type that converts to float
+        if args.resolution == -1:
+            global_down = 1
+        else:
+            global_down = orig_w / args.resolution
+
+        scale = float(global_down) * float(resolution_scale)
+        resolution = (int(orig_w / scale), int(orig_h / scale))
+
+    if cam_info.cx:
+        cx = cam_info.cx / scale
+        cy = cam_info.cy / scale
+        fy = cam_info.fy / scale
+        fx = cam_info.fx / scale
+    else:
+        cx = None
+        cy = None
+        fy = None
+        fx = None
+    
+    if cam_info.image.shape[:2] != resolution[::-1]:
+        image_rgb = cv2.resize(cam_info.image, resolution)
+    else:
+        image_rgb = cam_info.image
+    image_rgb = torch.from_numpy(image_rgb).float().permute(2, 0, 1)
+    gt_image = image_rgb[:3, ...]
+
+    if cam_info.sky_mask is not None:
+        if cam_info.sky_mask.shape[:2] != resolution[::-1]:
+            sky_mask = cv2.resize(cam_info.sky_mask, resolution)
+        else:
+            sky_mask = cam_info.sky_mask
+        if len(sky_mask.shape) == 2:
+            sky_mask = sky_mask[..., None]
+        sky_mask = torch.from_numpy(sky_mask).float().permute(2, 0, 1)
+    else:
+        sky_mask = None
+
+    if cam_info.pointcloud_camera is not None:
+        h, w = gt_image.shape[1:]
+        K = np.eye(3)
+        if cam_info.cx:
+            K[0, 0] = fx
+            K[1, 1] = fy
+            K[0, 2] = cx
+            K[1, 2] = cy
+        else:
+            K[0, 0] = fov2focal(cam_info.FovX, w)
+            K[1, 1] = fov2focal(cam_info.FovY, h)
+            K[0, 2] = cam_info.width / 2
+            K[1, 2] = cam_info.height / 2
+        pts_depth = np.zeros([1, h, w])
+        point_camera = cam_info.pointcloud_camera
+        uvz = point_camera[point_camera[:, 2] > 0]
+        uvz = uvz @ K.T
+        uvz[:, :2] /= uvz[:, 2:]
+        uvz = uvz[uvz[:, 1] >= 0]
+        uvz = uvz[uvz[:, 1] < h]
+        uvz = uvz[uvz[:, 0] >= 0]
+        uvz = uvz[uvz[:, 0] < w]
+        uv = uvz[:, :2]
+        uv = uv.astype(int)
+        # TODO: may need to consider overlap
+        pts_depth[0, uv[:, 1], uv[:, 0]] = uvz[:, 2]
+        pts_depth = torch.from_numpy(pts_depth).float()
+    else:
+        pts_depth = None
+
+    return Camera(
+        colmap_id=cam_info.uid,
+        uid=id,
+        R=cam_info.R,
+        T=cam_info.T,
+        FoVx=cam_info.FovX,
+        FoVy=cam_info.FovY,
+        cx=cx,
+        cy=cy,
+        fx=fx,
+        fy=fy,
+        image=gt_image,
+        image_name=cam_info.image_name,
+        data_device=args.data_device,
+        timestamp=cam_info.timestamp,
+        resolution=resolution,
+        image_path=cam_info.image_path,
+        pts_depth=pts_depth,
+        sky_mask=sky_mask,
+    )
+
+
+def cameraList_from_camInfos(cam_infos, resolution_scale, args):
+    camera_list = []
+
+    for id, c in enumerate(tqdm(cam_infos)):
+        camera_list.append(loadCam(args, id, c, resolution_scale))
+
+    return camera_list
+
+def cameraList_from_camInfos_gen(cam_infos, resolution_scale, args):
+    for id, c in enumerate(cam_infos):
+        yield loadCam(args, id, c, resolution_scale)
+
+class Scene:
+    def __init__(self, args: PVGArgs, shuffle=True):
+        self.model_path = args.model_path
+
+        self.train_cameras = {}
+        self.test_cameras = {}
+
+        scene_info = readWaymoInfo(args)
+        
+        self.time_interval = args.frame_interval
+        print("time duration: ", scene_info.time_duration)
+        print("frame interval: ", self.time_interval)
+
+        if shuffle:
+            random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
+            random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
+
+        self.cameras_extent = scene_info.nerf_normalization["radius"]
+        self.resolution_scales = args.resolution_scales
+        self.scale_index = len(self.resolution_scales) - 1
+        for resolution_scale in self.resolution_scales:
+            print("Loading Training Cameras")
+            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
+            print("Loading Test Cameras")
+            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
+            
+
+    def upScale(self):
+        self.scale_index = max(0, self.scale_index - 1)
+
+    def getTrainCameras(self):
+        return self.train_cameras[self.resolution_scales[self.scale_index]]
+    
+    def getTestCameras(self, scale=1.0):
+        return self.test_cameras[scale]
+
