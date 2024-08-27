@@ -7,6 +7,7 @@ import numpy as np
 import imagesize
 
 from d3sim.data.scene_def.frame import BasicFrame
+from d3sim.dev import load_secret_constants
 
 def load_example_scene(root: str):
     root_p = Path(root)
@@ -40,10 +41,8 @@ def load_example_scene(root: str):
 
 
 def _load_debug_scene():
-    if IsAppleSiliconMacOs:
-        return load_example_scene("/Users/yanyan/Downloads/example_dataset/inputs")
-    else:
-        raise NotImplementedError
+    path = load_secret_constants().h3dgs_example_dataset_path
+    return load_example_scene(path)
 
 if __name__ == "__main__":
     _load_debug_scene()

@@ -18,3 +18,5 @@ if IsAppleSiliconMacOs:
     D3SIM_DEFAULT_DEVICE = "mps"
 
 D3SIM_DISABLE_ARRAY_CHECK = os.getenv("D3SIM_DISABLE_ARRAY_CHECK", "0") == "1"
+
+D3SIM_DEV_SECRETS_PATH = os.getenv("D3SIM_DEV_SECRETS_PATH", str(PACKAGE_ROOT.parent / "secrets.yaml"))

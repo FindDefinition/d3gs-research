@@ -329,7 +329,7 @@ def __main():
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
-    ds = OriginDataset(path, "images_8" if IsAppleSiliconMacOs else "images_4", True, [1.0])
+    ds = OriginDataset(root=path, image_folder="images_8" if IsAppleSiliconMacOs else "images_4", shuffle=True, resolution_scales=[1.0])
     print(ds.extent)
     print("Load Dataset GPU Memory", get_used_gpu_mem_GB())
     if IsAppleSiliconMacOs:

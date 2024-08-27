@@ -1,11 +1,16 @@
 import abc
 from concurrent.futures import Executor
+from pathlib import Path
+import shutil
 import d3sim.core.dataclass_dispatch as dataclasses
 from typing import Any, Sequence, TypeAlias, TypeVar
 import importlib 
+from d3sim.core.inspecttools import get_qualname_of_type
 from d3sim.data.scene_def import Scene, BasicFrame, BasicPinholeCamera, BasicLidar
 from d3sim.data.scene_def.base import BaseFrame
 import numpy as np 
+import json 
+
 T = TypeVar("T")
 
 def get_module_id_of_type(klass: type) -> str:
@@ -260,3 +265,27 @@ class MultipleSceneDatasetBase(abc.ABC):
     def get_online_transformed_frame(self, global_frame_id: tuple[str, str]):
         frame = self.get_frame_by_id(global_frame_id[0], global_frame_id[1])
         return run_online_transforms_on_frame(frame, self.online_transforms)
+
+
+class SceneTransformOfflineDisk(abc.ABC):
+    """scene transform that save output to disk.
+    """
+    def create_work_dir(self, root: Path, file_key: str = "workdir"):
+        qname = get_qualname_of_type(type(self))
+        qname = qname.replace(".", "_")
+        work_dir = root / f"{qname}_{file_key}"
+        if work_dir.exists():
+            shutil.rmtree(work_dir)
+        work_dir.mkdir(exist_ok=True, parents=True, mode=0o755)
+        return work_dir
+
+    def file_flag_exists(self, root: Path, file_key: str = "done") -> bool:
+        qname = get_qualname_of_type(type(self))
+        qname = qname.replace(".", "_")
+        return (root / f"{qname}_{file_key}.json").exists()
+
+    def write_file_flag(self, root: Path, file_key: str = "done", **additional_fields):
+        qname = get_qualname_of_type(type(self))
+        qname = qname.replace(".", "_")
+        with open(root / f"{qname}_{file_key}.json", "w") as f:
+            json.dump(additional_fields, f)

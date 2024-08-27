@@ -33,6 +33,7 @@ def asdict(obj: Any):
 
 
 class ResourceLoader(abc.ABC):
+    """Currently resource loader can't have any argument in __init__."""
     def __init__(self):
         super().__init__()
         self._base_uri_data_cache: dict[str, Any] = {}
@@ -44,6 +45,10 @@ class ResourceLoader(abc.ABC):
 
     def parse(self, resource: "Resource", base_uri_data: Any) -> Any:
         return base_uri_data
+
+    def copy(self):
+        # assume no arguments.
+        return type(self)() 
 
     @abc.abstractmethod
     def read_base_uri(self, resource: "Resource") -> Any:
@@ -97,6 +102,13 @@ class Resource(Generic[T]):
     # if all resource share single uri file, use this to distinguish
     uid: Hashable = ""
 
+    def copy(self):
+        # resource copy must remove all caches
+        loader = None 
+        if self.loader is not None:
+            loader = self.loader.copy()
+        return dataclasses.replace(self, loader=loader, _cached_data=Undefined())
+
     @property 
     def is_loaded(self) -> bool:
         return not isinstance(self._cached_data, Undefined)
@@ -129,11 +141,24 @@ class Pose:
     velocity: np.ndarray = dataclasses.field(default_factory=lambda: np.zeros(3))
     acceleration: np.ndarray = dataclasses.field(default_factory=lambda: np.zeros(3))
     scale: float = 1.0
+
+    @property 
+    def is_empty(self) -> bool:
+        """Check if pose (`to_world` and `to_vehicle`) is identity matrix."""
+        return np.allclose(self.to_vehicle, np.eye(4)) and np.allclose(self.to_world, np.eye(4))
+
     @property 
     def vehicle_to_world(self):
         sensor_to_world = self.to_world
         sensor_to_vehicle = self.to_vehicle
         return sensor_to_world @ np.linalg.inv(sensor_to_vehicle)
+    
+    def copy(self):
+        return copy.deepcopy(self)
+
+    @classmethod 
+    def create_empty_pose(cls):
+        return cls()
 
     def apply_world_transform(self, world2new: np.ndarray):
         return dataclasses.replace(self, to_world=world2new @ self.to_world)
@@ -184,6 +209,9 @@ class ObjectBase:
             res[field.name] = field_data
         return res
 
+    def copy(self):
+        return copy.deepcopy(self)
+
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class Object3d(ObjectBase):
     pose: Pose
@@ -204,7 +232,7 @@ class Object3d(ObjectBase):
         self.size *= scale
         return self
 
-
+        
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class Object2d(ObjectBase):
     bbox_xywh: np.ndarray # f32
@@ -252,6 +280,9 @@ T_field_type = TypeVar("T_field_type", CameraFieldTypes, LidarFieldTypes)
 
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class Sensor(Generic[T_field_type]):
+    """User should only store Resources to fields or dataclass field directly,
+    you can't use container/nested dataclass to store resources.
+    """
     id: str 
     timestamp: int # ns
     pose: Pose
@@ -269,6 +300,17 @@ class Sensor(Generic[T_field_type]):
     def global_id(self):
         assert self._global_id is not None, "you must save frame in a scene to generate global id"
         return self._global_id
+
+    def copy(self):
+        new_pose = self.pose.copy()
+        new_fields = {k: v.copy() for k, v in self.fields.items()}
+        field_with_resources = {}
+        for field in dataclasses.fields(self):
+            field_data = getattr(self, field.name)
+            # only check direct field, not nested
+            if isinstance(field_data, Resource):
+                field_with_resources[field.name] = field_data.copy()
+        return self.replace_with_cache_cleared(pose=new_pose, fields=new_fields, **field_with_resources)
 
     @property 
     def frame_id(self):
@@ -386,6 +428,11 @@ class BaseFrame:
     _global_id: str | None = None
     scene_uri: str | None = None
     _user_datas: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def copy(self):
+        new_sensors = [s.copy() for s in self.sensors]
+        new_objects = [o.copy() for o in self.objects]
+        return dataclasses.replace(self, pose=self.pose.copy(), sensors=new_sensors, objects=new_objects, _user_datas={})
 
     @property 
     def global_id(self):
@@ -522,6 +569,16 @@ class BaseFrame:
     def replace_objects(self, objects: Sequence[Object3d]):
         return dataclasses.replace(self, objects=objects)
 
+    def remove_sensors_inplace(self, sensors: Sequence[Sensor]):
+        sensor_ids = set(s.id for s in sensors)
+        new_sensors = [s for s in self.sensors if s.id not in sensor_ids]
+        self.sensors = new_sensors
+
+    def remove_sensors(self, sensors: Sequence[Sensor]):
+        sensor_ids = set(s.id for s in sensors)
+        new_sensors = [s for s in self.sensors if s.id not in sensor_ids]
+        return dataclasses.replace(self, sensors=new_sensors)
+
 T_frame = TypeVar("T_frame", bound=BaseFrame)
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
@@ -546,14 +603,22 @@ class Scene(Generic[T_frame]):
         for frame in self.frames:
             self._frame_id_to_frame[frame.id] = frame
 
+    def copy(self):
+        new_frames = [f.copy() for f in self.frames]
+        new_fields = {k: v.copy() for k, v in self.fields.items()}
+        return dataclasses.replace(self, frames=new_frames, _frame_id_to_frame={}, _user_datas={}, pose=self.pose.copy(), fields=new_fields)
+
     def get_frame_by_id(self, frame_id: str) -> T_frame:
         return self._frame_id_to_frame[frame_id]
 
     def set_user_data(self, key: str, value: Any):
         self._user_datas[key] = value
 
+    def has_user_data(self, key: str) -> bool:
+        return key in self._user_datas
+
     def get_user_data_type_checked(self, key: str, expected_type: type[T]) -> T:
-        res = self._user_datas["key"]
+        res = self._user_datas[key]
         if not isinstance(res, expected_type):
             raise ValueError(f"User data {key} is not of type {expected_type}")
         return res
@@ -686,6 +751,19 @@ class Scene(Generic[T_frame]):
                     res[sensor.id] = []
                 res[sensor.id].append(sensor)
         return res
+
+    def get_global_id_to_sensor(self, sensor_type: type[T_sensor]) -> dict[str, T_sensor]:
+        res: dict[str, T_sensor] = {}
+        for frame in self.frames:
+            for sensor in frame.get_sensors_by_type(sensor_type):
+                res[sensor.global_id] = sensor
+        return res
+
+    def remove_sensors_inplace(self, sensors: Sequence[Sensor]):
+        for sensor in sensors:
+            frame_id = sensor.frame_id
+            frame = self.get_frame_by_id(frame_id)
+            frame.remove_sensors_inplace([sensor])
 
 class DistortType(enum.IntEnum):
     kNone = 0

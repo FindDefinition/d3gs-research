@@ -27,7 +27,9 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-
+"""Colmap Utils, include model IO and database IO.
+Copied from colmap repo.
+"""
 import os
 import collections
 import numpy as np
@@ -660,18 +662,12 @@ def pair_id_to_image_ids(pair_id):
     return image_id1, image_id2
 
 
-def array_to_blob(array):
-    if IS_PYTHON3:
-        return array.tostring()
-    else:
-        return np.getbuffer(array)
+def array_to_blob(array: np.ndarray):
+    return array.tobytes()
 
 
-def blob_to_array(blob, dtype, shape=(-1,)):
-    if IS_PYTHON3:
-        return np.fromstring(blob, dtype=dtype).reshape(*shape)
-    else:
-        return np.frombuffer(blob, dtype=dtype).reshape(*shape)
+def blob_to_array(blob: bytes, dtype, shape=(-1,)):
+    return np.frombuffer(blob, dtype=dtype).reshape(*shape)
 
 
 class COLMAPDatabase(sqlite3.Connection):

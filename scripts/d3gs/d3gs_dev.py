@@ -8,6 +8,7 @@ from d3sim.data.scene_def.camera import BasicPinholeCamera
 from d3sim.algos.d3gs.render import CameraBundle, GaussianSplatConfig, GaussianSplatOp, rasterize_gaussians
 from d3sim.algos.d3gs.origin.data.scene.dataset_readers import readColmapSceneInfo
 import numpy as np
+from d3sim.dev import load_secret_constants
 from d3sim.ops.points.projection import depth_map_to_jet_rgb 
 from d3sim.algos.d3gs.origin.data.load import load_model_and_2_cam, load_model_and_cam
 from torch.profiler import profile, record_function, ProfilerActivity
@@ -24,22 +25,16 @@ def sync():
         torch.cuda.synchronize()
 
 def _load_model_and_cam():
-    if IsAppleSiliconMacOs:
-        data_path = "/Users/yanyan/Downloads/360_v2/garden"
-        path = "/Users/yanyan/Downloads/models/garden/point_cloud/iteration_30000/point_cloud.ply"
-    else:
-        path = "/root/autodl-tmp/garden_model/garden/point_cloud/iteration_30000/point_cloud.ply"
-        data_path = "/root/autodl-tmp/garden_scene/garden"
+    secrets = load_secret_constants()
+    data_path = secrets.origin_3dgs_garden_dataset_path
+    path = secrets.origin_3dgs_model_path
 
     return load_model_and_cam(data_path, path)
 
 def _load_model_and_2cam():
-    if IsAppleSiliconMacOs:
-        data_path = "/Users/yanyan/Downloads/360_v2/garden"
-        path = "/Users/yanyan/Downloads/models/garden/point_cloud/iteration_30000/point_cloud.ply"
-    else:
-        path = "/root/autodl-tmp/garden_model/garden/point_cloud/iteration_30000/point_cloud.ply"
-        data_path = "/root/autodl-tmp/garden_scene/garden"
+    secrets = load_secret_constants()
+    data_path = secrets.origin_3dgs_garden_dataset_path
+    path = secrets.origin_3dgs_model_path
 
     return load_model_and_2_cam(data_path, path)
 
@@ -53,7 +48,7 @@ def _main_bwd():
     apple m3: 150ms
     cuda (RTX 4090): 16ms
 
-    TDP: 16W vs 425W
+    TDP: 16W vs 450W
 
     for forward, the bottleneck in m3 is sorting in 64bit. this may due to
     memory bandwidth. 4090 has 1000GB/s memory bandwidth, while m3 only
@@ -65,12 +60,9 @@ def _main_bwd():
     cfg = GaussianSplatConfig()
     fwd = GaussianSplatOp(cfg)
     mod.set_requires_grad(True)
-    if IsAppleSiliconMacOs:
-        grad_path = "/Users/yanyan/grads.pt"
-    else:
-        grad_path = "/root/Projects/3dgs/gaussian-splatting/grads.pt"
+    grad_path = load_secret_constants().origin_3dgs_grad_path
     # 
-    check_grad: bool = True
+    check_grad: bool = False
     if check_grad:
         grads = torch.load(grad_path, map_location=D3SIM_DEFAULT_DEVICE)
 
@@ -100,8 +92,9 @@ def _main_bwd():
         if not op.is_nchw:
             # to nchw
             out_color = out_color.permute(0, 3, 1, 2)
-        print(torch.linalg.norm(out_color[0, :3] - rendering))
-        print(torch.linalg.norm(res.radii.float() - radii.float()))
+        if check_grad:
+            print(torch.linalg.norm(out_color[0, :3] - rendering))
+            print(torch.linalg.norm(res.radii.float() - radii.float()))
 
 
         # torch.manual_seed(50051)
@@ -112,7 +105,11 @@ def _main_bwd():
         t = time.time()
         # if not op.is_nchw:
         #     dout = dout.permute(1, 2, 0)
-        out_color[0].backward(dout)
+        if not check_grad:
+            out_color.backward(dout)
+
+        else:
+            out_color[0].backward(dout)
         sync()
         print("BWD", time.time() - t)
         # assert not mod.act_applied
@@ -129,8 +126,8 @@ def _main_bwd():
             print(xyz_grads[1])
             print(torch.linalg.norm(mod.xyz.grad - xyz_grads))
             breakpoint()
-    breakpoint()
-    print("?")
+    # breakpoint()
+    # print("?")
 
 def _main():
     mod, cams = _load_model_and_2cam()
