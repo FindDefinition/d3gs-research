@@ -970,7 +970,7 @@ class GaussianSplatOp:
                 """)
         else:
             # for 16x16 tile, the warp shape is 16x2, we need to convert to 8x4
-            # slightly faster.
+            # slightly faster when use warp reduce.
             lane_matrix_shape = self._cfg.warp_size
             num_lane_matrix_shape = (self._cfg.tile_size[0] // lane_matrix_shape[0], self._cfg.tile_size[1] // lane_matrix_shape[1])
             assert self._cfg.tile_size[0] % lane_matrix_shape[0] == 0
@@ -1272,7 +1272,6 @@ class GaussianSplatOp:
 
                     else:
                         code_rasterize.raw(f"""
-                        // TODO if remove the 'f', this kernel runs 4x slower.
                         if (alpha < 1.0f / 255.0f){{
                             continue;
                         }}

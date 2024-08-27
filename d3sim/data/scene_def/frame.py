@@ -60,11 +60,12 @@ class BasicFrame(BaseFrame):
             lidar.data_coord if lidar.data_coord is not None else lidar.id,
             target_coord)
         xyz_th = np_to_torch_dev(xyz)
-        res = transform_xyz(xyz_th, mat)
+        res = transform_xyz(xyz_th, mat, lidar.pose.scale)
         return res
 
     def get_projected_pc_in_cam(self, lidar_id_or_pc: str | np.ndarray
                                 | torch.Tensor, cam_id: str):
+        # assume scaled points if you provide points directly.
         cam = self.get_camera_by_id(cam_id)
         if isinstance(lidar_id_or_pc, str):
             lidar = self.get_lidar_by_id(lidar_id_or_pc)

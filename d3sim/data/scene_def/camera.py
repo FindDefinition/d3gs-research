@@ -1,5 +1,6 @@
 import enum
 import math
+from pathlib import Path
 from typing import Annotated, Self
 import torch
 
@@ -7,7 +8,7 @@ from d3sim.core import arrcheck
 from d3sim.core.arrcheck.tensor import ArrayCheck
 from d3sim.core.thtools import np_to_torch_dev
 from d3sim.data.scene_def.base import CameraFieldTypes
-from .base import BaseCamera, DistortType, Object2d, Sensor, Resource, ALL_RESOURCE_LOADERS, ResourceLoader
+from .base import BaseCamera, DistortType, Object2d, Sensor, Resource, ALL_RESOURCE_LOADERS, ResourceLoader, SingleFileLoader
 import d3sim.core.dataclass_dispatch as dataclasses 
 import numpy as np 
 import abc 
@@ -17,13 +18,13 @@ import torchvision
 from torchvision.transforms import functional as Fv
 
 @ALL_RESOURCE_LOADERS.register_no_key
-class OpencvImageFileLoader(ResourceLoader):
-    def read(self, resource: Resource[np.ndarray]) -> np.ndarray:
+class OpencvImageFileLoader(SingleFileLoader):
+    def read_base_uri(self, resource: Resource[np.ndarray]) -> np.ndarray:
         return cv2.imread(resource.base_uri)
 
 @ALL_RESOURCE_LOADERS.register_no_key
-class PILImageFileLoader(ResourceLoader):
-    def read(self, resource: Resource[np.ndarray]) -> np.ndarray:
+class PILImageFileLoader(SingleFileLoader):
+    def read_base_uri(self, resource: Resource[np.ndarray]) -> np.ndarray:
         from PIL import Image
         return np.array(Image.open(resource.base_uri))
 
@@ -48,6 +49,8 @@ class UndistortParam:
     roi: list[int]
     distort_type: DistortType
 
+_ALL_IMAGE_FIELDS = set([CameraFieldTypes.IMAGE, CameraFieldTypes.SEGMENTATION, CameraFieldTypes.VALID_MASK, CameraFieldTypes.DEPTH])
+
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class BasicCamera(BaseCamera, abc.ABC):
     image_shape_wh: tuple[int, int]
@@ -57,11 +60,39 @@ class BasicCamera(BaseCamera, abc.ABC):
     distortion_type: DistortType = DistortType.kOpencvPinhole
     _lazy_image_transform: list[CropParam | ResizeParam | UndistortParam] = dataclasses.field(default_factory=list)
 
+    @staticmethod 
+    def get_opencv_img_resource(path: str | Path) -> Resource[np.ndarray]:
+        return Resource(base_uri=str(path), loader_type="OpencvImageFileLoader")
+
     def get_field_np(self, field: CameraFieldTypes | str) -> np.ndarray | None:
-        if field == CameraFieldTypes.IMAGE:
-            self.homogeneous_fields[CameraFieldTypes.IMAGE] = self.image_rc.data
-            return self.image_rc.data
+        if field in _ALL_IMAGE_FIELDS:
+            if field == CameraFieldTypes.IMAGE:
+                self.fields[CameraFieldTypes.IMAGE] = self.image_rc.data
+                res = self.image_rc.data
+            else:
+                res = super().get_field_np(field)
+            if res is None:
+                return None 
+            return self._apply_image_transform(res, field == CameraFieldTypes.SEGMENTATION)
         return super().get_field_np(field)
+
+    def get_image_field_torch_device_transform(self, field: CameraFieldTypes | str, device: torch.device | str | None = None) -> torch.Tensor | None:
+        if field in _ALL_IMAGE_FIELDS:
+            res = self.get_field_torch(field, device)
+            if res is None:
+                return None 
+            return self._apply_image_transform_torch(res, False, field == CameraFieldTypes.SEGMENTATION)
+        return super().get_field_torch(field, device)
+
+    def get_image_field_torch_device_transform_cached(self, field: CameraFieldTypes | str, device: torch.device | str | None = None) -> torch.Tensor | None:
+        if field in _ALL_IMAGE_FIELDS:
+            res = self.get_field_torch(field, device)
+            if res is None:
+                return None 
+            res = self._apply_image_transform_torch(res, False, field == CameraFieldTypes.SEGMENTATION)
+            self.set_field_torch(field, res)
+            return res
+        return super().get_field_torch_cached(field, device)
 
     def get_objects_by_source(self, source: str = "") -> list[Object2d]:
         res: list[Object2d] = []
@@ -96,7 +127,7 @@ class BasicCamera(BaseCamera, abc.ABC):
         assert x >= 0 and y >= 0 and x + w <= self.image_shape_wh[0] and y + h <= self.image_shape_wh[1]
         objects = self.get_objects_by_source()
         new_objs: list[Object2d] = self._crop_objects(objects, crop_xy, crop_wh)
-        return dataclasses.replace(self, image_shape_wh=(w, h),
+        return self.replace_with_cache_cleared(image_shape_wh=(w, h),
             intrinsic=self.get_cropped_intrinsic(crop_xy),
             objects=new_objs,
             _lazy_image_transform=self._lazy_image_transform + [CropParam(x, y, w, h)])
@@ -109,7 +140,7 @@ class BasicCamera(BaseCamera, abc.ABC):
         new_objs: list[Object2d] = []
         for i, obj in enumerate(objects):            
             new_objs.append(dataclasses.replace(obj, bbox_xywh=obj.bbox_xywh * scale))
-        return dataclasses.replace(self, image_shape_wh=target_size_wh, 
+        return self.replace_with_cache_cleared(image_shape_wh=target_size_wh, 
             intrinsic=self.get_resized_intrinsic(scale),
              objects=new_objs,
              _lazy_image_transform=self._lazy_image_transform + [ResizeParam(real_scale_wh, target_size_wh)])
@@ -130,7 +161,7 @@ class BasicCamera(BaseCamera, abc.ABC):
         distort = self.distortion.copy()
         distort[:] = 0
         # print(roi, new_cam_matrix)
-        return dataclasses.replace(self, objects=new_objs, distortion=distort, distortion_type=DistortType.kNone, image_shape_wh=crop_wh, intrinsic=new_intrinsic,  _lazy_image_transform=self._lazy_image_transform + [undistort_param])
+        return self.replace_with_cache_cleared(objects=new_objs, distortion=distort, distortion_type=DistortType.kNone, image_shape_wh=crop_wh, intrinsic=new_intrinsic,  _lazy_image_transform=self._lazy_image_transform + [undistort_param])
 
     def get_cropped_intrinsic(self, crop_xy: tuple[int, int]) -> np.ndarray:
         x, y = crop_xy
@@ -146,6 +177,10 @@ class BasicCamera(BaseCamera, abc.ABC):
         intrinsic[0, 2] *= scale
         intrinsic[1, 2] *= scale
         return intrinsic
+
+    @property 
+    def is_transform_empty(self) -> bool:
+        return len(self._lazy_image_transform) == 0
 
     @property 
     def focal_length(self) -> np.ndarray:
@@ -221,17 +256,15 @@ class BasicCamera(BaseCamera, abc.ABC):
 
     @property 
     def segmentation(self) -> np.ndarray | None:
-        data = self.get_field_np(CameraFieldTypes.SEGMENTATION)
-        if data is not None:
-            return self._apply_image_transform(data)
-        return None
+        return self.get_field_np(CameraFieldTypes.SEGMENTATION)
 
     @property 
     def mask(self) -> np.ndarray | None:
-        data = self.get_field_np(CameraFieldTypes.VALID_MASK)
-        if data is not None:
-            return self._apply_image_transform(data)
-        return None
+        return self.get_field_np(CameraFieldTypes.VALID_MASK)
+
+    @property 
+    def depth(self) -> np.ndarray | None:
+        return self.get_field_np(CameraFieldTypes.DEPTH)
 
     def get_bbox_xywh(self, source: str = ""):
         objects = self.get_objects_by_source(source)

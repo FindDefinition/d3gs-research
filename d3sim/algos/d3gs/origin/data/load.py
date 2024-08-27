@@ -119,7 +119,7 @@ def load_model_and_2_cam(data_path: str, model_path: str):
     return mod, [cam_first, cam_second]
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(kw_only=True)
 class OriginDataset(D3simDataset):
     root: str
     image_folder: str = "images_4"

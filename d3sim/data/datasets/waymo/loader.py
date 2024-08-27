@@ -173,7 +173,7 @@ class WaymoCamera(BasicPinholeCamera):
     def _load_seg(self):
         segs = self.seg_label_rc.data
         if segs is not None:
-            self.homogeneous_fields[CameraFieldTypes.SEGMENTATION] = segs
+            self.fields[CameraFieldTypes.SEGMENTATION] = segs
 
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class WaymoLidar(BasicLidar):
@@ -227,9 +227,9 @@ class WaymoLidar(BasicLidar):
             res_all = res.cpu().numpy(), inten, mask.cpu().numpy()
         # self._point_load_cache = res_all
 
-        self.homogeneous_fields[LidarFieldTypes.POINT_CLOUD] = res_all[0]
-        self.homogeneous_fields[LidarFieldTypes.INTENSITY] = res_all[1]
-        self.homogeneous_fields[LidarFieldTypes.VALID_MASK] = res_all[2]
+        self.fields[LidarFieldTypes.POINT_CLOUD] = res_all[0]
+        self.fields[LidarFieldTypes.INTENSITY] = res_all[1]
+        self.fields[LidarFieldTypes.VALID_MASK] = res_all[2]
         return
 
     def _load_seg(self):
@@ -239,7 +239,7 @@ class WaymoLidar(BasicLidar):
         seg_0 = segs[0].reshape(-1, 2)[:, 1]
         seg_1 = segs[1].reshape(-1, 2)[:, 1]
         seg = np.concatenate([seg_0, seg_1], axis=-1)
-        self.homogeneous_fields[LidarFieldTypes.SEGMENTATION] = seg
+        self.fields[LidarFieldTypes.SEGMENTATION] = seg
         return seg
 
 
@@ -690,6 +690,6 @@ def load_scene(scene_id: str, folder: str, cache_whole_in_memory: bool = True):
         cam.objects.append(obj_2d)
 
     frames = list(frame_id_to_frame.values())
-    scene: Scene[BasicFrame] = Scene(id=scene_id, frames=frames)
+    scene: Scene[BasicFrame] = Scene(id=scene_id, frames=frames, uri=str(Path(folder) / scene_id))
     return scene
 
