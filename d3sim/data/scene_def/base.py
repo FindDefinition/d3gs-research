@@ -346,8 +346,8 @@ class Sensor(Generic[T_field_type]):
     def has_field(self, field: T_field_type | str) -> bool:
         return field in self.fields
 
-    def set_field_np(self, field: T_field_type | str, data: np.ndarray):
-        assert isinstance(data, np.ndarray)
+    def set_field_np(self, field: T_field_type | str, data: np.ndarray | Resource[np.ndarray]):
+        assert isinstance(data, (np.ndarray, Resource))
         self.fields[field] = data
 
     def set_field_torch(self, field: T_field_type | str, data: torch.Tensor):
@@ -593,6 +593,7 @@ class Scene(Generic[T_frame]):
 
     _frame_id_to_frame: dict[str, T_frame] = dataclasses.field(default_factory=dict)
     # should only be used on transforms
+    # userdata is kept during copy.
     _user_datas: dict[str, Any] = dataclasses.field(default_factory=dict)
     def __post_init__(self):
         # create resource loaders
@@ -606,7 +607,7 @@ class Scene(Generic[T_frame]):
     def copy(self):
         new_frames = [f.copy() for f in self.frames]
         new_fields = {k: v.copy() for k, v in self.fields.items()}
-        return dataclasses.replace(self, frames=new_frames, _frame_id_to_frame={}, _user_datas={}, pose=self.pose.copy(), fields=new_fields)
+        return dataclasses.replace(self, frames=new_frames, _frame_id_to_frame={}, pose=self.pose.copy(), fields=new_fields)
 
     def get_frame_by_id(self, frame_id: str) -> T_frame:
         return self._frame_id_to_frame[frame_id]

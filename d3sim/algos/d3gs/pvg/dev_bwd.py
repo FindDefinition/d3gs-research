@@ -46,7 +46,7 @@ def main():
     intrinsic_4x4[:3, :3] = intrinsic
     timestamp = viewpoint_camera["timestamp"]
     cam = BasicPinholeCamera(id="", timestamp=0, pose=Pose(np.eye(4), c2w), 
-        image_rc=Resource(base_uri="", loader_type=""), intrinsic=intrinsic_4x4, distortion=np.zeros(4, np.float32),
+        intrinsic=intrinsic_4x4, distortion=np.zeros(4, np.float32),
         image_shape_wh=(width, height), objects=[])
     
     res = rasterize_gaussians_dynamic(model, cam, op, training=True, prep_input_tensors={

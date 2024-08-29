@@ -27,7 +27,9 @@ def load_example_scene(root: str):
             frame_id = img_path.stem
             img_rc = BasicPinholeCamera.get_opencv_img_resource(str(img_path))
             width, height = imagesize.get(str(img_path))
-            cam = BasicPinholeCamera(id=cam_name, timestamp=0, pose=Pose(), image_rc=img_rc, intrinsic=np.eye(4), distortion=np.zeros([4]), image_shape_wh=(int(width), int(height)), objects=[])
+            cam = BasicPinholeCamera(id=cam_name, timestamp=0, pose=Pose(), fields={
+                CameraFieldTypes.IMAGE: img_rc
+            }, intrinsic=np.eye(4), distortion=np.zeros([4]), image_shape_wh=(int(width), int(height)), objects=[])
             cam.fields[CameraFieldTypes.VALID_MASK] = BasicPinholeCamera.get_opencv_img_resource(mask_img_path)
             if frame_id not in frame_id_to_cam_dict:
                 frame_id_to_cam_dict[frame_id] = []
@@ -36,6 +38,9 @@ def load_example_scene(root: str):
     for frame_id, cam_list in frame_id_to_cam_dict.items():
         frame = BasicFrame(id=frame_id, timestamp=0, pose=Pose(), sensors=[*cam_list], objects=[])
         all_frames.append(frame)
+    # all_frames.sort(key=lambda x: x.id)
+    # for frame in all_frames:
+    #     print(frame.id)
     print(root_p)
     return Scene(id="example_dataset", frames=all_frames, uri=str(root_p))
 

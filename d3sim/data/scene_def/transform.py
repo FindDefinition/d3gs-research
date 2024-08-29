@@ -10,6 +10,7 @@ from d3sim.data.scene_def import Scene, BasicFrame, BasicPinholeCamera, BasicLid
 from d3sim.data.scene_def.base import BaseFrame
 import numpy as np 
 import json 
+import contextvars
 
 T = TypeVar("T")
 
@@ -37,25 +38,37 @@ def get_object_type_from_module_id(module_id: str):
 
 class SceneTransform(abc.ABC):
     @abc.abstractmethod
-    def __call__(self, scene: Scene) -> Scene:
+    def forward(self, scene: Scene) -> Scene:
         raise NotImplementedError
+
+    def __call__(self, scene: Scene) -> Scene:
+        return self.forward(scene)
 
 
 class FrameTransform(abc.ABC):
     @abc.abstractmethod
-    def __call__(self, frame: BasicFrame) -> BasicFrame:
+    def forward(self, frame: BasicFrame) -> BasicFrame:
         raise NotImplementedError
+
+    def __call__(self, frame: BasicFrame) -> BasicFrame:
+        return self.forward(frame)
 
 
 class CameraTransform(abc.ABC):
     @abc.abstractmethod
-    def __call__(self, camera: BasicPinholeCamera) -> BasicPinholeCamera:
+    def forward(self, camera: BasicPinholeCamera) -> BasicPinholeCamera:
         raise NotImplementedError
+
+    def __call__(self, camera: BasicPinholeCamera) -> BasicPinholeCamera:
+        return self.forward(camera)
 
 class LidarTransform(abc.ABC):
     @abc.abstractmethod
-    def __call__(self, camera: BasicLidar) -> BasicLidar:
+    def forward(self, lidar: BasicLidar) -> BasicLidar:
         raise NotImplementedError
+
+    def __call__(self, lidar: BasicLidar) -> BasicLidar:
+        return self.forward(lidar)
 
 class DynamicTransform:
     def __init__(self, module_id: str, config: dict[str, Any]):
@@ -69,7 +82,7 @@ class DynamicTransform:
         if isinstance(self._transform, type):
             return self._transform
         raise NotImplementedError
-
+    
     def __call__(self, obj: Any) -> Any:
         if isinstance(obj, Scene):
             assert isinstance(self._transform, SceneTransform)
@@ -267,25 +280,50 @@ class MultipleSceneDatasetBase(abc.ABC):
         return run_online_transforms_on_frame(frame, self.online_transforms)
 
 
-class SceneTransformOfflineDisk(abc.ABC):
+
+class SceneTransformOfflineDisk(SceneTransform):
     """scene transform that save output to disk.
     """
-    def create_work_dir(self, root: Path, file_key: str = "workdir"):
+    def get_unique_key(self) -> str:
+        return ""
+
+    def get_work_dir_path(self, root: Path) -> Path:
+        ukey = self.get_unique_key()
         qname = get_qualname_of_type(type(self))
         qname = qname.replace(".", "_")
-        work_dir = root / f"{qname}_{file_key}"
-        if work_dir.exists():
-            shutil.rmtree(work_dir)
+        if ukey != "":
+            qname = f"{qname}_{ukey}"
+        work_dir = root / f"{qname}"
+        return work_dir
+
+    def delete_and_create_work_dir(self, root: Path):
+        work_dir = self.get_work_dir_path(root)
+        # if work_dir.exists():
+        #     shutil.rmtree(work_dir)
         work_dir.mkdir(exist_ok=True, parents=True, mode=0o755)
         return work_dir
 
-    def file_flag_exists(self, root: Path, file_key: str = "done") -> bool:
+    def _get_file_flag_path(self, root: Path) -> Path:
+        ukey = self.get_unique_key()
         qname = get_qualname_of_type(type(self))
         qname = qname.replace(".", "_")
-        return (root / f"{qname}_{file_key}.json").exists()
+        if ukey != "":
+            qname = f"{qname}_{ukey}"
+        return root / f"{qname}_done.json"
 
-    def write_file_flag(self, root: Path, file_key: str = "done", **additional_fields):
-        qname = get_qualname_of_type(type(self))
-        qname = qname.replace(".", "_")
-        with open(root / f"{qname}_{file_key}.json", "w") as f:
+    def file_flag_exists(self, root: Path) -> bool:
+        return self._get_file_flag_path(root).exists()
+
+    def write_file_flag(self, root: Path, **additional_fields):
+        path = self._get_file_flag_path(root)
+        with open(path, "w") as f:
             json.dump(additional_fields, f)
+
+    # def __call__(self, scene: Scene) -> Scene:
+    #     meta_key = "__scene_offline_disk_transform_meta"
+    #     if scene.has_user_data(meta_key):
+    #         meta = scene.get_user_data_type_checked(meta_key, _SceneTransformMeta)
+    #         if meta.cache_not_hit:
+    #             shutil.rmtree()
+    #             return scene
+    #     return scene 

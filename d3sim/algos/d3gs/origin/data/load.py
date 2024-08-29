@@ -55,7 +55,7 @@ def load_scene_info_and_first_cam(data_path: str, image_folder: str = "images_4"
     intrinsic_4x4[:3, :3] = intrinsic
 
     cam = BasicPinholeCamera(id="", timestamp=0, pose=Pose(np.eye(4), np.linalg.inv(world2cam)), 
-        image_rc=Resource(base_uri="", loader_type=""), intrinsic=intrinsic_4x4, distortion=np.zeros(4, np.float32),
+        intrinsic=intrinsic_4x4, distortion=np.zeros(4, np.float32),
         image_shape_wh=image_shape_wh, objects=[])
 
     return scene_info, cam
@@ -70,7 +70,7 @@ def original_cam_to_d3sim_cam(cam: Camera):
     intrinsic_4x4[:3, :3] = intrinsic
 
     d3sim_cam = BasicPinholeCamera(id="", timestamp=0, pose=Pose(np.eye(4), np.linalg.inv(world2cam)), 
-        image_rc=Resource(base_uri="", loader_type=""), intrinsic=intrinsic_4x4, distortion=np.zeros(4, np.float32),
+        intrinsic=intrinsic_4x4, distortion=np.zeros(4, np.float32),
         image_shape_wh=image_shape_wh, objects=[])
     d3sim_cam.set_field_torch(CameraFieldTypes.IMAGE, cam.original_image)
     return d3sim_cam
@@ -99,7 +99,7 @@ def load_model_and_cam(data_path: str, model_path: str):
 
     mod = load_3dgs_origin_model(path, fused=True)
     cam = BasicPinholeCamera(id="", timestamp=0, pose=Pose(np.eye(4), np.linalg.inv(world2cam)), 
-        image_rc=Resource(base_uri="", loader_type=""), intrinsic=intrinsic_4x4, distortion=np.zeros(4, np.float32),
+        intrinsic=intrinsic_4x4, distortion=np.zeros(4, np.float32),
         image_shape_wh=image_shape_wh, objects=[])
 
     return mod, cam

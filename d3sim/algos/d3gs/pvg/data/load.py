@@ -18,7 +18,7 @@ def load_scene_info_and_first_cam(data_path: str, model_path: str):
     intrinsic_4x4[:3, :3] = intrinsic
 
     cam = BasicPinholeCamera(id="", timestamp=0, pose=Pose(np.eye(4), np.linalg.inv(world2cam)), 
-        image_rc=Resource(base_uri="", loader_type=""), intrinsic=intrinsic_4x4, distortion=np.zeros(4, np.float32),
+        intrinsic=intrinsic_4x4, distortion=np.zeros(4, np.float32),
         image_shape_wh=image_shape_wh, objects=[])
 
     return scene_info, cam

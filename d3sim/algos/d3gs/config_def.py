@@ -107,6 +107,8 @@ class GaussianSplatConfig:
 
     measure_atomic_add_count: bool = False
 
+    gaussian_early_filter: bool = True
+
     @property 
     def num_channels(self):
         if self.disable_builtin_rgb:

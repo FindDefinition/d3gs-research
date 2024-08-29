@@ -163,17 +163,17 @@ class WaymoLidarResource(Resource):
 
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class WaymoCamera(BasicPinholeCamera):
-    seg_label_rc: Resource[np.ndarray | None]
+    # seg_label_rc: Resource[np.ndarray | None]
 
     def get_field_np(self, field: CameraFieldTypes | str) -> np.ndarray | None:
-        if field == CameraFieldTypes.SEGMENTATION and not self.has_field(field):
-            self._load_seg()
+        # if field == CameraFieldTypes.SEGMENTATION and not self.has_field(field):
+        #     self._load_seg()
         return super().get_field_np(field)
 
-    def _load_seg(self):
-        segs = self.seg_label_rc.data
-        if segs is not None:
-            self.fields[CameraFieldTypes.SEGMENTATION] = segs
+    # def _load_seg(self):
+    #     segs = self.seg_label_rc.data
+    #     if segs is not None:
+    #         self.fields[CameraFieldTypes.SEGMENTATION] = segs
 
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class WaymoLidar(BasicLidar):
@@ -562,8 +562,12 @@ def load_scene(scene_id: str, folder: str, cache_whole_in_memory: bool = True):
                 image_shape_wh=(width, height),
                 intrinsic=intrinsic,
                 distortion=distortion,
-                image_rc=image_rc,
-                seg_label_rc=seg_rc,
+                # image_rc=image_rc,
+                # seg_label_rc=seg_rc,
+                fields={
+                    CameraFieldTypes.SEGMENTATION: seg_rc,
+                    CameraFieldTypes.IMAGE: image_rc,
+                },
                 distortion_type=DistortType.kOpencvPinholeWaymo
             ))
     for idx, row in lidar_metadata.iterrows():

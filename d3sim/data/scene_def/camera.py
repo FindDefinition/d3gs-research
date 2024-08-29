@@ -54,7 +54,7 @@ _ALL_IMAGE_FIELDS = set([CameraFieldTypes.IMAGE, CameraFieldTypes.SEGMENTATION, 
 @dataclasses.dataclass(kw_only=True, config=dataclasses.PyDanticConfigForAnyObject)
 class BasicCamera(BaseCamera, abc.ABC):
     image_shape_wh: tuple[int, int]
-    image_rc: Resource[np.ndarray]
+    # image_rc: Resource[np.ndarray]
     intrinsic: Annotated[np.ndarray, ArrayCheck([4, 4], arrcheck.Float32 | arrcheck.Float64)] = dataclasses.field(default_factory=lambda: np.eye(4))
     distortion: np.ndarray
     distortion_type: DistortType = DistortType.kOpencvPinhole
@@ -66,15 +66,14 @@ class BasicCamera(BaseCamera, abc.ABC):
 
     def get_field_np(self, field: CameraFieldTypes | str) -> np.ndarray | None:
         if field in _ALL_IMAGE_FIELDS:
-            if field == CameraFieldTypes.IMAGE:
-                self.fields[CameraFieldTypes.IMAGE] = self.image_rc.data
-                res = self.image_rc.data
-            else:
-                res = super().get_field_np(field)
+            res = super().get_field_np(field)
             if res is None:
                 return None 
             return self._apply_image_transform(res, field == CameraFieldTypes.SEGMENTATION)
         return super().get_field_np(field)
+
+    def has_lazy_image_transform(self) -> bool:
+        return len(self._lazy_image_transform) > 0
 
     def get_image_field_torch_device_transform(self, field: CameraFieldTypes | str, device: torch.device | str | None = None) -> torch.Tensor | None:
         if field in _ALL_IMAGE_FIELDS:

@@ -379,6 +379,14 @@ class GaussianSplatOp:
                     auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det(cov2d_vec, {lowpass_filter}f, $eps);
                     """)
                 code_prep.raw(f"""
+                auto opacity_val = $opacity[gaussian_idx];
+                opacity_val = tv::array<float, 1>{{opacity_val}}.op<op::{fused_opacity_act[0]}>()[0];
+                """)
+                if self._cfg.enable_anti_aliasing:
+                    code_prep.raw(f"""
+                    opacity_val = opacity_val * det_div_lowpass_sqrt_clamp;
+                    """)
+                code_prep.raw(f"""
                 auto cov2d_inv = std::get<0>(cov2d_inv_and_det);
                 auto det = std::get<1>(cov2d_inv_and_det);
                 auto radii_fp = math_op_t::ceil(Gaussian3D::get_gaussian_2d_ellipse(cov2d_vec, det, 
@@ -389,7 +397,7 @@ class GaussianSplatOp:
                 auto gaussian_rect_min = ((uv - radii_fp) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
                 auto gaussian_rect_max = ((uv + radii_fp + tile_size_xy_float - 1) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
                 int rect_area = (gaussian_rect_max[0] - gaussian_rect_min[0]) * (gaussian_rect_max[1] - gaussian_rect_min[1]);
-                bool is_empty = (det == 0 || z_in_cam < 0.2f) || rect_area == 0 || invalid;
+                bool is_empty = (det == 0 || z_in_cam < 0.2f) || rect_area == 0 || invalid || opacity_val <= 1.0f / 255.0f;
 
                 $tiles_touched[i] = is_empty ? 0 : rect_area;
                 $radii[i] = is_empty ? 0 : int(radii_fp);
@@ -399,20 +407,42 @@ class GaussianSplatOp:
                     return;
                 }}
                 $depths[i] = z_in_cam;
-
                 op::reinterpret_cast_array_nd<2>($uvs)[i] = uv;
-                auto opacity_val = $opacity[gaussian_idx];
-                opacity_val = tv::array<float, 1>{{opacity_val}}.op<op::{fused_opacity_act[0]}>()[0];
-                """)
-                if self._cfg.enable_anti_aliasing:
-                    code_prep.raw(f"""
-                    opacity_val = opacity_val * det_div_lowpass_sqrt_clamp;
-                    """)
-                code_prep.raw(f"""
                 tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], opacity_val}};
                 op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
-                
-                """)             
+                """)
+                if self._cfg.gaussian_early_filter:
+                    code_prep.raw(f"""
+                    int real_tile_touched = 0;
+                    float bound = 2.0f * math_op_t::log(1.0f / 255.0f / conic_opacity_vec[3]);
+                    auto bound_rect = Gaussian3D::get_gaussian_2d_ellipse_bound_aabb(cov2d_inv, bound);
+                    auto gaussian_rect_min_bound = ((uv - bound_rect) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
+                    auto gaussian_rect_max_bound = ((uv + bound_rect) / tile_size_xy_float).op<op::ceil>().cast<int>().op<op::clamp>(0, tile_num_xy);
+                    """)
+                    with code_prep.for_(
+                            "int y = gaussian_rect_min_bound[1]; y < gaussian_rect_max_bound[1]; ++y"
+                    ):
+                        with code_prep.for_(
+                                "int x = gaussian_rect_min_bound[0]; x < gaussian_rect_max_bound[0]; ++x"
+                        ):
+                            code_prep.raw(f"""
+                            float pixel_idx_x = x * {self._cfg.tile_size[0]};
+                            float pixel_idx_y = y * {self._cfg.tile_size[1]};
+                            float pixel_idx_x_max = pixel_idx_x + {self._cfg.tile_size[0]};
+                            float pixel_idx_y_max = pixel_idx_y + {self._cfg.tile_size[1]};
+                            // bool valid_tile = Gaussian3D::gs2d_ellipse_aabb_is_intersect(uv, conic_opacity_vec,
+                            //     {{pixel_idx_x, pixel_idx_y}}, {{pixel_idx_x_max, pixel_idx_y_max}}, bound);
+                            
+                            bool valid_tile = Gaussian3D::aabb_has_overlap_area(uv - bound_rect, uv + bound_rect, 
+                                {{pixel_idx_x, pixel_idx_y}}, {{pixel_idx_x_max, pixel_idx_y_max}});
+                            // tv::printf2_once<' ', 1>(uv[0], uv[1], bound_rect[0], bound_rect[1], pixel_idx_x, pixel_idx_y, pixel_idx_x_max, pixel_idx_y_max, valid_tile);
+                            
+                            valid_tile &= x >= gaussian_rect_min[0] && x < gaussian_rect_max[0] && y >= gaussian_rect_min[1] && y < gaussian_rect_max[1];
+                            real_tile_touched += valid_tile;
+                            """)
+                    code_prep.raw(f"""
+                    $tiles_touched[i] = real_tile_touched;
+                    """)
                 if not self._cfg.disable_builtin_rgb:
                     color_sh = model.color_sh
                     color_sh_base = model.color_sh_base
@@ -457,7 +487,7 @@ class GaussianSplatOp:
                         """)
 
                 self._inliner.kernel_1d(prep_kernel_name, batch_size * num, 0, code_prep)
-
+                raise NotImplementedError
             else:
                 proxy = model.create_proxy(code_prep, "gaussian_idx", "batch_idx" if batch_size > 1 else "0", batch_size)
                 prep_kernel_name += f"_{proxy.get_unique_id()}"
@@ -494,6 +524,11 @@ class GaussianSplatOp:
                     code_prep.raw(f"""
                     auto cov2d_inv_and_det = Gaussian3D::gaussian_2d_inverse_and_det(cov2d_vec, {lowpass_filter}f, $eps);
                     """)
+                proxy.read_field(GaussianCoreFields.OPACITY, "opacity_val")
+                if self._cfg.enable_anti_aliasing:
+                    code_prep.raw(f"""
+                    opacity_val = opacity_val * det_div_lowpass_sqrt_clamp;
+                    """)
                 code_prep.raw(f"""
                 auto cov2d_inv = std::get<0>(cov2d_inv_and_det);
                 auto det = std::get<1>(cov2d_inv_and_det);
@@ -502,10 +537,11 @@ class GaussianSplatOp:
                 constexpr auto tile_size_xy = tv::array<int, 2>{{{self._cfg.tile_size[0]}, {self._cfg.tile_size[1]}}};
                 auto tile_num_xy = tv::div_up(resolution_wh, tile_size_xy);
                 auto tile_size_xy_float = tile_size_xy.cast<float>();
+                // we don't use real bounding box here to keep it same as origin impl.
                 auto gaussian_rect_min = ((uv - radii_fp) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
                 auto gaussian_rect_max = ((uv + radii_fp + tile_size_xy_float - 1) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
                 int rect_area = (gaussian_rect_max[0] - gaussian_rect_min[0]) * (gaussian_rect_max[1] - gaussian_rect_min[1]);
-                bool is_empty = (det == 0 || z_in_cam < 0.2f) || rect_area == 0 || invalid;
+                bool is_empty = (det == 0 || z_in_cam < 0.2f) || rect_area == 0 || invalid || opacity_val <= 1.0f / 255.0f;
 
                 $tiles_touched[i] = is_empty ? 0 : rect_area;
                 $radii[i] = is_empty ? 0 : int(radii_fp);
@@ -518,16 +554,56 @@ class GaussianSplatOp:
 
                 op::reinterpret_cast_array_nd<2>($uvs)[i] = uv;
                 """)
-                proxy.read_field(GaussianCoreFields.OPACITY, "opacity_val")
-                if self._cfg.enable_anti_aliasing:
-                    code_prep.raw(f"""
-                    opacity_val = opacity_val * det_div_lowpass_sqrt_clamp;
-                    """)
                 code_prep.raw(f"""
                 tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], opacity_val}};
                 op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
                 auto normed_dir = (point - cam2world_center).op<op::normalize>();
                 """)
+                if self._cfg.gaussian_early_filter:
+                    code_prep.raw(f"""
+                    int real_tile_touched = 0;
+                    float bound = 2.0f * math_op_t::log(1.0f / 255.0f / conic_opacity_vec[3]);
+                    auto bound_rect = Gaussian3D::get_gaussian_2d_ellipse_bound_aabb(cov2d_inv, bound);
+                    auto gaussian_rect_min_bound = ((uv - bound_rect) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
+                    auto gaussian_rect_max_bound = ((uv + bound_rect) / tile_size_xy_float).op<op::ceil>().cast<int>().op<op::clamp>(0, tile_num_xy);
+                    """)
+                    with code_prep.for_(
+                            "int y = gaussian_rect_min_bound[1]; y < gaussian_rect_max_bound[1]; ++y"
+                    ):
+                        with code_prep.for_(
+                                "int x = gaussian_rect_min_bound[0]; x < gaussian_rect_max_bound[0]; ++x"
+                        ):
+                            code_prep.raw(f"""
+                            float pixel_idx_x = x * {self._cfg.tile_size[0]};
+                            float pixel_idx_y = y * {self._cfg.tile_size[1]};
+                            float pixel_idx_x_max = pixel_idx_x + {self._cfg.tile_size[0]};
+                            float pixel_idx_y_max = pixel_idx_y + {self._cfg.tile_size[1]};
+                            // this function can filter more unnecessary gaussians, but it's very slow.
+                            // bool valid_tile = Gaussian3D::gs2d_ellipse_aabb_is_intersect(uv, conic_opacity_vec,
+                            //     {{pixel_idx_x, pixel_idx_y}}, {{pixel_idx_x_max, pixel_idx_y_max}}, bound);
+                            
+                            bool valid_tile = Gaussian3D::aabb_has_overlap_area(uv - bound_rect, uv + bound_rect, 
+                                {{pixel_idx_x, pixel_idx_y}}, {{pixel_idx_x_max, pixel_idx_y_max}});
+                            
+                            valid_tile &= x >= gaussian_rect_min[0] && x < gaussian_rect_max[0] && y >= gaussian_rect_min[1] && y < gaussian_rect_max[1];
+                            real_tile_touched += valid_tile;
+                            """)
+                            """
+                            if ((x < gaussian_rect_min_bound[0] || x >= gaussian_rect_max_bound[0] || y < gaussian_rect_min_bound[1] || y >= gaussian_rect_max_bound[1]) && valid_tile){{
+                                tv::printf2(uv[0] - bound_rect[0], uv[1] - bound_rect[1], 
+                                    uv[0] + bound_rect[0], uv[1] + bound_rect[1], 
+                                    uv[0], uv[1], "|",
+                                    bound_rect[0], bound_rect[1],
+                                    pixel_idx_x, pixel_idx_y,
+                                    gaussian_rect_min_bound[0], gaussian_rect_min_bound[1], 
+                                    gaussian_rect_max_bound[0], gaussian_rect_max_bound[1], 
+                                    x, y);
+                            }}
+                            """
+                    code_prep.raw(f"""
+                    $tiles_touched[i] = real_tile_touched;
+                    """)
+
                 if not self._cfg.disable_builtin_rgb:
                     proxy.read_field(GaussianCoreFields.RGB, "rgb", "normed_dir")
                     if (training):
@@ -561,8 +637,13 @@ class GaussianSplatOp:
             #     print(torch.linalg.norm(rgb_gaussian.float().reshape(-1, num,3)[0] - rgb_gaussian.float().reshape(-1, num, 3)[1]))
             # print(INLINER.get_nvrtc_module(prep_kernel_name).params.debug_code)
         with measure_and_print_torch("cumsum", enable=enable_verbose):
+            # print("tiles_touched mean", tiles_touched[tiles_touched > 0].float().mean())
+            # print(tiles_touched)
+            # breakpoint()
             tiles_touched.cumsum_(0)
             num_rendered = int(tiles_touched[-1].item())
+        # print("num_rendered", num_rendered)
+        # raise NotImplementedError
         out_img_shape = [
             batch_size, self._cfg.num_channels, height, width
         ] if self._cfg.use_nchw else [batch_size, height, width, self._cfg.num_channels]
@@ -624,15 +705,32 @@ class GaussianSplatOp:
                     """)
                 code.raw(f"""
                 auto offset = i == 0 ? 0 : $tiles_touched[i - 1];
-                auto uv = op::reinterpret_cast_alignedarray<2>($uvs)[i];
+                auto uv = op::reinterpret_cast_array_nd<2>($uvs)[i];
                 auto gaussian_rect_min = ((uv - radii_fp) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
                 auto gaussian_rect_max = ((uv + radii_fp + tile_size_xy_float - 1) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
+                
                 """)
+                if self._cfg.gaussian_early_filter:
+                    code.raw(f"""
+                    auto conic_opacity_vec = op::reinterpret_cast_array_nd<4>($conic_opacity)[i];
+                    float bound = 2.0f * math_op_t::log(1.0f / 255.0f / conic_opacity_vec[3]);
+                    auto bound_rect = Gaussian3D::get_gaussian_2d_ellipse_bound_aabb(op::slice<0, 3>(conic_opacity_vec), bound);
+                    // auto gaussian_rect_min = ((uv - bound_rect) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
+                    // auto gaussian_rect_max = ((uv + bound_rect + tile_size_xy_float - 1) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
+                    auto gaussian_rect_min_bound = ((uv - bound_rect) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
+                    auto gaussian_rect_max_bound = ((uv + bound_rect) / tile_size_xy_float).op<op::ceil>().cast<int>().op<op::clamp>(0, tile_num_xy);
+                    """)
+                else:
+                    code.raw(f"""
+                    auto gaussian_rect_min_bound = gaussian_rect_min;
+                    auto gaussian_rect_max_bound = gaussian_rect_max;
+                    """)
+
                 with code.for_(
-                        "int y = gaussian_rect_min[1]; y < gaussian_rect_max[1]; ++y"
+                        "int y = gaussian_rect_min_bound[1]; y < gaussian_rect_max_bound[1]; ++y"
                 ):
                     with code.for_(
-                            "int x = gaussian_rect_min[0]; x < gaussian_rect_max[0]; ++x"
+                            "int x = gaussian_rect_min_bound[0]; x < gaussian_rect_max_bound[0]; ++x"
                     ):
                         shift_bits = 32 if not enable_32bit_sort else 18
                         key_real_dtype = "uint64_t" if not enable_32bit_sort else "uint32_t"
@@ -666,13 +764,36 @@ class GaussianSplatOp:
                             code.raw(f"""
                             assert(offset < $num_rendered);
                             """)
-                        code.raw(f"""
-                        key <<= {shift_bits};
-                        key |= depth_uint; // assume depth always > 0
-                        reinterpret_cast<TV_METAL_DEVICE {key_real_dtype}*>($keys_tile_idx_depth)[offset] = key;
-                        $gaussian_idx[offset] = i;
-                        ++offset;
-                        """)
+                        if self._cfg.gaussian_early_filter:
+                            code.raw(f"""
+                            float pixel_idx_x = x * {self._cfg.tile_size[0]};
+                            float pixel_idx_y = y * {self._cfg.tile_size[1]};
+                            float pixel_idx_x_max = pixel_idx_x + {self._cfg.tile_size[0]};
+                            float pixel_idx_y_max = pixel_idx_y + {self._cfg.tile_size[1]};
+                            // bool valid_tile = Gaussian3D::gs2d_ellipse_aabb_is_intersect(uv, conic_opacity_vec,
+                            //     {{pixel_idx_x, pixel_idx_y}}, {{pixel_idx_x_max, pixel_idx_y_max}}, bound);
+                            
+                            bool valid_tile = Gaussian3D::aabb_has_overlap_area(uv - bound_rect, uv + bound_rect, 
+                                {{pixel_idx_x, pixel_idx_y}}, {{pixel_idx_x_max, pixel_idx_y_max}});
+
+                            valid_tile &= x >= gaussian_rect_min[0] && x < gaussian_rect_max[0] && y >= gaussian_rect_min[1] && y < gaussian_rect_max[1];
+
+                            if (valid_tile){{
+                                key <<= {shift_bits};
+                                key |= depth_uint; // assume depth always > 0
+                                reinterpret_cast<TV_METAL_DEVICE {key_real_dtype}*>($keys_tile_idx_depth)[offset] = key;
+                                $gaussian_idx[offset] = i;
+                                ++offset;
+                            }}
+                            """)
+                        else:
+                            code.raw(f"""
+                            key <<= {shift_bits};
+                            key |= depth_uint; // assume depth always > 0
+                            reinterpret_cast<TV_METAL_DEVICE {key_real_dtype}*>($keys_tile_idx_depth)[offset] = key;
+                            $gaussian_idx[offset] = i;
+                            ++offset;
+                            """)
 
             self._inliner.kernel_1d(f"prepare_sort_data_{enable_32bit_sort}",
                                     batch_size * num, 0, code)
@@ -1237,7 +1358,9 @@ class GaussianSplatOp:
                                         conic_opacity_vec.y * dist[0] * dist[1]);
                 float G = math_op_t::fast_exp(power); // used in backward
                 float alpha = math_op_t::min(0.99f, conic_opacity_vec.w * G);
-                
+                // alpha >= eps => conic_opacity_vec.w * G >= eps
+                // when G is maximum (1), then conic_opacity_vec.w >= eps
+                // we can filter this in prep.
                 """)
                 if is_bwd and use_bwd_reduce:
                     code_rasterize.raw(f"""

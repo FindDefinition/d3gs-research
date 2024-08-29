@@ -32,6 +32,29 @@ class Cov2dInvWithCompOp(VectorSymOperator):
             "comp": comp
         }
 
+class GaussianEllipseOp(VectorSymOperator):
+    def forward(self, x, y, u, v, cx, cy, cz, bound) -> dict[str, VectorExpr | sympy.Expr]:
+        """ellipse: -conic_opacity_vec[0] * (center[0] - x[0]) ^ 2 + 
+                    -conic_opacity_vec[2] * (center[1] - x[1]) ^ 2 -
+                    2 * conic_opacity_vec[1] * (center[0] - x[0]) * (center[1] - x[1])
+                    = 2 * log(1 / (255 * conic_opacity_vec[3]))
+        calc interacts with aabb
+        """
+
+        res = -cx * (u - x) ** 2 - cz * (v - y) ** 2 - 2 * cy * (u - x) * (v - y) - bound
+        return {
+            "res": res
+        }
+
+class EllipseBoundOp(VectorSymOperator):
+    def forward(self, x, y, u, v, cx, cy, cz, bound) -> dict[str, VectorExpr | sympy.Expr]:
+        res_x = -bound * cz - cx * cz * u * u + 2 * cx * cz * u * x - cx * cz * x * x + cy * cy * u * u - 2 * cy * cy * u * x + cy * cy * x * x
+        res_y = -bound * cx - cx * cz * v * v + 2 * cx * cz * v * y - cx * cz * y * y + cy * cy * v * v - 2 * cy * cy * v * y + cy * cy * y * y
+        return {
+            "res_x": res_x,
+            "res_y": res_y
+        }
+
 _COV2D_INV_OP = Cov2dInvWithCompOp().build()
 
 class SHConstants:
@@ -719,3 +742,192 @@ class Gaussian3D(pccm.Class):
         """)
         return code.ret("T")
 
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def get_gaussian_2d_ellipse_bound_aabb(self):
+        """
+        https://math.stackexchange.com/questions/1173868/show-that-a-2x2-matrix-a-is-symmetric-positive-definite-if-and-only-if-a-is-symm
+        {u - sqrt(-bound*cz*(cx*cz - cy**2))/(-cx*cz + cy**2), u + sqrt(-bound*cz*(cx*cz - cy**2))/(-cx*cz + cy**2)}
+        {v - sqrt(-bound*cx*(cx*cz - cy**2))/(-cx*cz + cy**2), v + sqrt(-bound*cx*(cx*cz - cy**2))/(-cx*cz + cy**2)}
+        
+        """
+        code = pccm.code()
+        code.targ("T")
+        code.arg("cov2d_inv_vec", "tv::array<T, 3>")
+        code.arg("bound", "T")
+
+        code.raw(f"""
+        namespace op = tv::arrayops;
+        using math_op_t = tv::arrayops::MathScalarOp<T>;
+        // from sympy, check __main in this file to get more info.
+
+        T det = cov2d_inv_vec[0] * cov2d_inv_vec[2] - cov2d_inv_vec[1] * cov2d_inv_vec[1];
+        T value_to_sqrt_x = -bound * cov2d_inv_vec[2] * det;
+        T value_to_sqrt_y = -bound * cov2d_inv_vec[0] * det;
+        T value_sqrted_x = math_op_t::sqrt(math_op_t::max(T(0), value_to_sqrt_x)) / det;
+        T value_sqrted_y = math_op_t::sqrt(math_op_t::max(T(0), value_to_sqrt_y)) / det;
+        value_sqrted_x = value_to_sqrt_x > 0 ? value_sqrted_x : 0;
+        value_sqrted_y = value_to_sqrt_y > 0 ? value_sqrted_y : 0;
+
+        return {{math_op_t::abs(value_sqrted_x), math_op_t::abs(value_sqrted_y)}};
+        """)
+        return code.ret("tv::array<T, 2>")
+
+
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def gs2d_get_alpha(self):
+        code = pccm.code()
+        code.targ("T")
+        code.arg("x, center", "tv::array<T, 2>")
+        code.arg("conic_opacity_vec", "tv::array<T, 4>")
+        code.arg("alpha_max", "T", "0.99")
+        code.raw(f"""
+        namespace op = tv::arrayops;
+        using math_op_t = tv::arrayops::MathScalarOp<T>;
+        tv::array<T, 2> dist{{center[0] - x[0], center[1] - x[1]}};
+        T power = (T(-0.5) * (conic_opacity_vec[0] * dist[0] * dist[0] + 
+                                conic_opacity_vec[2] * dist[1] * dist[1]) - 
+                                conic_opacity_vec[1] * dist[0] * dist[1]);
+        T G = math_op_t::fast_exp(power); 
+        T alpha = math_op_t::min(alpha_max, conic_opacity_vec[3] * G);
+        // alpha >= 1/ 255. so G >= 1 / (255 * conic_opacity_vec[3]),
+        // power >= log(alpha_eps / conic_opacity_vec[3])
+        return {{alpha, power}};
+        """)
+        return code.ret("tv::array<T, 2>")
+
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def gs2d_ellipse_aabb_is_intersect(self):
+        """ellipse: -0.5 * conic_opacity_vec[0] * (center[0] - x[0]) ^ 2 + 
+                    -0.5 * conic_opacity_vec[2] * (center[1] - x[1]) ^ 2 -
+                    conic_opacity_vec[1] * (center[0] - x[0]) * (center[1] - x[1])
+                    = bound
+        bound: log(alpha_eps / conic_opacity_vec[3])
+        calc interacts with aabb
+        """
+        code = pccm.code()
+        code.targ("T")
+        code.arg("center", "tv::array<T, 2>")
+        code.arg("conic_opacity_vec", "tv::array<T, 4>")
+        code.arg("aabb_min, aabb_max", "tv::array<T, 2>")
+        code.arg("log_power_thresh", "T") # 2 * log(1 / (255 * conic_opacity_vec[3]))
+        # 
+        code.raw(f"""
+        namespace op = tv::arrayops;
+        using math_op_t = tv::arrayops::MathScalarOp<T>;
+
+        auto int_x0 = solve_ellipse_x_constant(aabb_min[0], center, conic_opacity_vec, log_power_thresh);
+        auto int_x1 = solve_ellipse_x_constant(aabb_max[0], center, conic_opacity_vec, log_power_thresh);
+        auto int_y0 = solve_ellipse_y_constant(aabb_min[1], center, conic_opacity_vec, log_power_thresh);
+        auto int_y1 = solve_ellipse_y_constant(aabb_max[1], center, conic_opacity_vec, log_power_thresh);
+        bool valid = (std::get<1>(int_x0) >= aabb_min[1] && std::get<1>(int_x0) <= aabb_max[1]) || 
+                     (std::get<2>(int_x0) >= aabb_min[1] && std::get<2>(int_x0) <= aabb_max[1]);
+        valid |= (std::get<1>(int_x1) >= aabb_min[1] && std::get<1>(int_x1) <= aabb_max[1]) ||
+                 (std::get<2>(int_x1) >= aabb_min[1] && std::get<2>(int_x1) <= aabb_max[1]);
+        valid |= (std::get<1>(int_y0) >= aabb_min[0] && std::get<1>(int_y0) <= aabb_max[0]) ||
+                    (std::get<2>(int_y0) >= aabb_min[0] && std::get<2>(int_y0) <= aabb_max[0]);
+        valid |= (std::get<1>(int_y1) >= aabb_min[0] && std::get<1>(int_y1) <= aabb_max[0]) ||
+                    (std::get<2>(int_y1) >= aabb_min[0] && std::get<2>(int_y1) <= aabb_max[0]);
+        
+        bool ellipse_cover_whole_aabb = std::get<1>(int_x0) <= aabb_min[1] && std::get<2>(int_x0) >= aabb_max[1];
+        ellipse_cover_whole_aabb &= std::get<1>(int_x1) <= aabb_min[1] && std::get<2>(int_x1) >= aabb_max[1];
+        ellipse_cover_whole_aabb &= std::get<1>(int_y0) <= aabb_min[0] && std::get<2>(int_y0) >= aabb_max[0];
+        ellipse_cover_whole_aabb &= std::get<1>(int_y1) <= aabb_min[0] && std::get<2>(int_y1) >= aabb_max[0];
+        
+        bool aabb_cover_whole_ellipse = aabb_min[0] <= center[0] && aabb_max[0] >= center[0] && aabb_min[1] <= center[1] && aabb_max[1] >= center[1];
+        return valid || ellipse_cover_whole_aabb || aabb_cover_whole_ellipse;
+        """)
+        return code.ret("bool")
+
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def solve_ellipse_y_constant(self):
+        code = pccm.code()
+        code.targ("T")
+        code.arg("y", "T")
+        code.arg("center", "tv::array<T, 2>")
+        code.arg("conic_opacity_vec", "tv::array<T, 4>")
+        code.arg("bound", "T") # 2 * log(1 / (255 * conic_opacity_vec[3]))
+        # 
+        code.raw(f"""
+        namespace op = tv::arrayops;
+        using math_op_t = tv::arrayops::MathScalarOp<T>;
+        auto cx = conic_opacity_vec[0];
+        auto cy = conic_opacity_vec[1];
+        auto cz = conic_opacity_vec[2];
+        auto u = center[0];
+        auto v = center[1];
+        // from sympy, check __main in this file to get more info.
+        // val_to_sqrt = -bound*cx - cx*cz*v**2 + 2*cx*cz*v*y - cx*cz*y**2 + cy**2*v**2 - 2*cy**2*v*y + cy**2*y**2
+        auto val_to_sqrt =  -bound * cx - cx * cz * v * v + T(2) * cx * cz * v * y - cx * cz * y * y + cy * cy * v * v - T(2) * cy * cy * v * y + cy * cy * y * y;
+        bool is_intersect = val_to_sqrt >= T(0);
+        auto val_sqrted = math_op_t::fast_sqrt(math_op_t::max(T(0), val_to_sqrt));
+        auto res_x = is_intersect ? (cx*u + cy*v - cy*y - val_sqrted) / cx : T(-1);
+        auto res_y = is_intersect ? (cx*u + cy*v - cy*y + val_sqrted) / cx : T(-1);
+
+        return std::make_tuple(is_intersect, res_x, res_y);
+        """)
+        return code.ret("std::tuple<bool, T, T>")
+
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def solve_ellipse_x_constant(self):
+        code = pccm.code()
+        code.targ("T")
+        code.arg("x", "T")
+        code.arg("center", "tv::array<T, 2>")
+        code.arg("conic_opacity_vec", "tv::array<T, 4>")
+        code.arg("bound", "T") # 2 * log(1 / (255 * conic_opacity_vec[3]))
+        # 
+        code.raw(f"""
+        namespace op = tv::arrayops;
+        using math_op_t = tv::arrayops::MathScalarOp<T>;
+        auto cx = conic_opacity_vec[0];
+        auto cy = conic_opacity_vec[1];
+        auto cz = conic_opacity_vec[2];
+        auto u = center[0];
+        auto v = center[1];
+        // from sympy, check __main in this file to get more info.
+        // val_to_sqrt = -bound*cz - cx*cz*u**2 + 2*cx*cz*u*x - cx*cz*x**2 + cy**2*u**2 - 2*cy**2*u*x + cy**2*x**2
+        auto val_to_sqrt = -bound * cz - cx * cz * u * u + T(2) * cx * cz * u * x - cx * cz * x * x + cy * cy * u * u - T(2) * cy * cy * u * x + cy * cy * x * x;
+        bool is_intersect = val_to_sqrt >= T(0);
+        auto val_sqrted = math_op_t::fast_sqrt(math_op_t::max(T(0), val_to_sqrt));
+        auto res_x = is_intersect ? (cy*u - cy*x + cz*v - val_sqrted) / cz : T(-1);
+        auto res_y = is_intersect ? (cy*u - cy*x + cz*v + val_sqrted) / cz : T(-1);
+
+        return std::make_tuple(is_intersect, res_x, res_y);
+        """)
+        return code.ret("std::tuple<bool, T, T>")
+
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def aabb_has_overlap_area(self):
+        code = pccm.code()
+        code.targ("T")
+        code.arg("aabb_min1, aabb_max1, aabb_min2, aabb_max2", "tv::array<T, 2>")
+        # 
+        code.raw(f"""
+        namespace op = tv::arrayops;
+        using math_op_t = tv::arrayops::MathScalarOp<T>;
+        bool x_overlap = aabb_min1[0] <= aabb_max2[0] && aabb_max1[0] >= aabb_min2[0];
+        bool y_overlap = aabb_min1[1] <= aabb_max2[1] && aabb_max1[1] >= aabb_min2[1];
+        return x_overlap && y_overlap;
+        """)
+        return code.ret("bool")
+
+
+def __main():
+
+    op = GaussianEllipseOp().build()
+
+    res = op.name_to_res_sym["res"]
+    print(res.sym)
+    print(sympy.simplify(sympy.solveset(sympy.Eq(res.sym, 0), op.name_to_sym["y"].sym)))
+    
+    op_bound = EllipseBoundOp().build()
+    res_x = op_bound.name_to_res_sym["res_x"]
+    res_y = op_bound.name_to_res_sym["res_y"]
+
+    print(sympy.solveset(sympy.Eq(res_x.sym, 0), op_bound.name_to_sym["x"].sym))
+    print(sympy.solveset(sympy.Eq(res_y.sym, 0), op_bound.name_to_sym["y"].sym))
+
+    pass 
+
+if __name__ == "__main__":
+    __main()
