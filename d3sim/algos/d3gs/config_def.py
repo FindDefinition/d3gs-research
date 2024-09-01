@@ -130,7 +130,7 @@ class GaussianSplatConfig:
     # this can increase performance without any loss.
     # forward 30%, backward 5% in garden scene
     # TODO completely remove original 3-sigma ellipse in the future.
-    early_filter_algo: EarlyFilterAlgo = EarlyFilterAlgo.AABB
+    early_filter_algo: EarlyFilterAlgo = EarlyFilterAlgo.OBB_DFVT
 
     @property 
     def num_channels(self):
