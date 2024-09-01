@@ -1,3 +1,4 @@
+import enum
 from typing import Literal
 import numpy as np
 import torch 
@@ -55,6 +56,19 @@ class Train:
         self.optim.rescale_steps_by_batch_size(batch_size)
         self.strategy.rescale_steps_by_batch_size(batch_size)
 
+class EarlyFilterAlgo(enum.IntEnum):
+    NONE = 0
+    # use aabb overlap. fastest in most cases.
+    AABB = 1
+    # Ellipse: reference filter, use ellipse-aabb overlap, very slow, only for evaluation.
+    ELLIPSE = 2
+    # OBB: use OBB-aabb overlap. number of filterd close to ellipse overlap, 
+    # slightly slower than aabb solution
+    OBB = 3
+    # dual fast voxel traversal to find obb-grid overlap in O(1) space and O(M + N) time, 
+    # best for large scene 
+    OBB_DFVT = 4
+
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatConfig:
     tile_size: tuple[int, int] = (16, 16)
@@ -107,7 +121,16 @@ class GaussianSplatConfig:
 
     measure_atomic_add_count: bool = False
 
-    gaussian_early_filter: bool = True
+    # filter gaussians in prep by more precise method
+    # this will use gaussian 2d sample formula and 
+    # alpha_eps (1 / 255) in rasterize kernel to construct a 
+    # precise ellipse instead of original coarse 3-sigma ellipse in prep,
+    # then use bounding box of that ellipse to do filter.
+
+    # this can increase performance without any loss.
+    # forward 30%, backward 5% in garden scene
+    # TODO completely remove original 3-sigma ellipse in the future.
+    early_filter_algo: EarlyFilterAlgo = EarlyFilterAlgo.AABB
 
     @property 
     def num_channels(self):
