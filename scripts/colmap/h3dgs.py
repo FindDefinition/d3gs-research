@@ -2,7 +2,7 @@ import hashlib
 from d3sim.algos.d3gs.hd3gs.data.chunks import ColmapSceneSplitChunks
 from d3sim.data.scene_def import Scene 
 from pathlib import Path 
-from d3sim.data.transforms.colmap import ColmapFetchResult, ColmapMetaHandleBase, ColmapToRefUnrectifiedResult, ColmapWorkDirs, ColmapFeatureExtract, ColmapCustomMatchGen, ColmapCustomMatch, ColmapMapper, ColmapUndistort, ColmapFilterFloatingAndNoSFM, ColmapRefineRotAndScale, ColmapFromRefUnrectifiedResult
+from d3sim.data.transforms.colmap import ColmapCopySubsetImageFromModel, ColmapCreatePriorFromModel, ColmapFetchResult, ColmapMetaHandleBase, ColmapPriorModelCustomMatchKNN, ColmapToRefUnrectifiedResult, ColmapWorkDirs, ColmapFeatureExtract, ColmapCustomMatchGen, ColmapCustomMatch, ColmapMapper, ColmapUndistort, ColmapFilterFloatingAndNoSFM, ColmapRefineRotAndScale, ColmapFromRefUnrectifiedResult
 
 
 def __main_test_simpify():
@@ -116,11 +116,20 @@ def __test_make_chunk():
     ref_img_root = ref_calib_root / "rectified" / "images"
     ref_model = Path(ref_calib_root) / "aligned" / "sparse/0"
     fake_scene = Scene("wtf", [])
-    fake_scene.uri = str(ref_img_root)
+    fake_scene.uri = str(ref_calib_root / "dev")
     ColmapMetaHandleBase.store_colmap_model_path(fake_scene, str(ref_model))
     ColmapMetaHandleBase.store_colmap_image_root(fake_scene, str(ref_img_root))
 
-    res = ColmapSceneSplitChunks()(fake_scene)
+    res = ColmapSceneSplitChunks(debug=False)(fake_scene)
+    for s in res:
+        print(s.uri)
+    create_db = ColmapCreatePriorFromModel()
+    create_knn_match = ColmapPriorModelCustomMatchKNN(k=200)
+    copy_img = ColmapCopySubsetImageFromModel()
+    for s in res:
+        s = create_db(s)
+        s = create_knn_match(s)
+        s = copy_img(s)
 
 
 def __main():

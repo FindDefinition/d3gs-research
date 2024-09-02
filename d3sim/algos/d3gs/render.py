@@ -415,43 +415,17 @@ class GaussianSplatOp:
                 op::reinterpret_cast_array_nd<2>($uvs)[i] = uv;
                 tv::array<float, 4> conic_opacity_vec{{cov2d_inv[0], cov2d_inv[1], cov2d_inv[2], opacity_val}};
                 op::reinterpret_cast_array_nd<4>($conic_opacity)[i] = conic_opacity_vec;
+                int real_tile_touched = 0;
                 """)
+                def inner_func(code: pccm.FunctionCode):
+                    if self._cfg.early_filter_algo != EarlyFilterAlgo.NONE:
+                        code.raw(f"""
+                        valid_tile &= x >= gaussian_rect_min[0] && x < gaussian_rect_max[0] && y >= gaussian_rect_min[1] && y < gaussian_rect_max[1];
+                        real_tile_touched += valid_tile;
+                        """)
+
+                self.early_filter_code_context(code_prep, inner_func, is_prep=True)
                 if self._cfg.early_filter_algo != EarlyFilterAlgo.NONE:
-                    code_prep.raw(f"""
-                    int real_tile_touched = 0;
-                    float bound = 2.0f * math_op_t::log({self._cfg.alpha_eps}f / conic_opacity_vec[3]);
-                    auto bound_rect = Gaussian3D::get_gaussian_2d_ellipse_bound_aabb(cov2d_inv, bound);
-                    auto gaussian_rect_min_bound = ((uv - bound_rect) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
-                    auto gaussian_rect_max_bound = ((uv + bound_rect) / tile_size_xy_float).op<op::ceil>().cast<int>().op<op::clamp>(0, tile_num_xy);
-                    """)
-                    with code_prep.for_(
-                            "int y = gaussian_rect_min_bound[1]; y < gaussian_rect_max_bound[1]; ++y"
-                    ):
-                        with code_prep.for_(
-                                "int x = gaussian_rect_min_bound[0]; x < gaussian_rect_max_bound[0]; ++x"
-                        ):
-                            code_prep.raw(f"""
-                            float pixel_idx_x = x * {self._cfg.tile_size[0]};
-                            float pixel_idx_y = y * {self._cfg.tile_size[1]};
-                            float pixel_idx_x_max = pixel_idx_x + {self._cfg.tile_size[0]};
-                            float pixel_idx_y_max = pixel_idx_y + {self._cfg.tile_size[1]};
-                            // bool valid_tile = Gaussian3D::gs2d_ellipse_aabb_is_overlap(uv, conic_opacity_vec,
-                            //     {{pixel_idx_x, pixel_idx_y}}, {{pixel_idx_x_max, pixel_idx_y_max}}, bound);
-                            """)
-                            if self._cfg.gaussian_early_use_ellipse_overlap:
-                                code_prep.raw(f"""
-                                bool valid_tile = Gaussian3D::gs2d_ellipse_aabb_is_overlap(uv, conic_opacity_vec,
-                                    {{pixel_idx_x, pixel_idx_y}}, {{pixel_idx_x_max, pixel_idx_y_max}}, bound);
-                                """)
-                            else:
-                                code_prep.raw(f"""
-                                bool valid_tile = Gaussian3D::aabb_has_overlap_area(uv - bound_rect, uv + bound_rect, 
-                                    {{pixel_idx_x, pixel_idx_y}}, {{pixel_idx_x_max, pixel_idx_y_max}});
-                                """)
-                            code_prep.raw(f"""
-                            valid_tile &= x >= gaussian_rect_min[0] && x < gaussian_rect_max[0] && y >= gaussian_rect_min[1] && y < gaussian_rect_max[1];
-                            real_tile_touched += valid_tile;
-                            """)
                     code_prep.raw(f"""
                     $tiles_touched[i] = real_tile_touched;
                     """)
@@ -553,7 +527,7 @@ class GaussianSplatOp:
                 auto gaussian_rect_min = ((uv - radii_fp) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
                 auto gaussian_rect_max = ((uv + radii_fp + tile_size_xy_float - 1) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
                 int rect_area = (gaussian_rect_max[0] - gaussian_rect_min[0]) * (gaussian_rect_max[1] - gaussian_rect_min[1]);
-                bool is_empty = (det == 0 || z_in_cam < 0.2f) || rect_area == 0 || invalid || opacity_val <= {self._cfg.alpha_eps}f;
+                bool is_empty = (det <= 0 || z_in_cam < 0.2f) || rect_area == 0 || invalid || opacity_val <= {self._cfg.alpha_eps}f;
 
                 $tiles_touched[i] = is_empty ? 0 : rect_area;
                 $radii[i] = is_empty ? 0 : int(radii_fp);
@@ -575,6 +549,7 @@ class GaussianSplatOp:
                 def inner_func(code: pccm.FunctionCode):
                     if self._cfg.early_filter_algo != EarlyFilterAlgo.NONE:
                         code.raw(f"""
+                        // keep results same between our result and coarse 3-sigma filter.
                         valid_tile &= x >= gaussian_rect_min[0] && x < gaussian_rect_max[0] && y >= gaussian_rect_min[1] && y < gaussian_rect_max[1];
                         real_tile_touched += valid_tile;
                         """)
@@ -584,132 +559,6 @@ class GaussianSplatOp:
                     code_prep.raw(f"""
                     $tiles_touched[i] = real_tile_touched;
                     """)
-                # if self._cfg.early_filter_algo != EarlyFilterAlgo.NONE:
-                #     code_prep.raw(f"""
-                #     int real_tile_touched = 0;
-                #     float bound = 2.0f * math_op_t::log({self._cfg.alpha_eps}f / conic_opacity_vec[3]);
-                #     auto bound_rect = Gaussian3D::get_gaussian_2d_ellipse_bound_aabb(cov2d_inv, bound);
-                #     auto gaussian_rect_min_bound = ((uv - bound_rect) / tile_size_xy_float).cast<int>().op<op::clamp>(0, tile_num_xy);
-                #     auto gaussian_rect_max_bound = ((uv + bound_rect) / tile_size_xy_float).op<op::ceil>().cast<int>().op<op::clamp>(0, tile_num_xy);
-                #     auto mn = gaussian_rect_max_bound - gaussian_rect_min_bound;
-
-                #     auto uv_offset = uv - gaussian_rect_min_bound.cast<float>() * tile_size_xy_float;
-                #     auto obb_whsc = Gaussian3D::get_gaussian_2d_ellipse_bound_obb(cov2d_inv, bound);
-                #     // if (i == DEBUG_INDEX){{
-                #     //     tv::printf2("WTF bound", bound_rect[0], bound_rect[1], mn[0], mn[1]);
-
-                #     // }}
-
-                #     """)
-                #     # with code_prep.if_(f"{pccm.boolean(self._cfg.gaussian_early_use_ellipse_overlap)} && m_plus_n <= 16"):
-                #     #     code_prep.raw(f"""
-                #     #     tv::array_nd<int, 16, 2> m_plus_n_intersects;
-                #     #     """) 
-                #     # with code_prep.else_():
-                #     solve_suffix = "_v2"
-                #     # align xy to zero to avoid float precision problem when pixel value is large.
-                #     if self._cfg.early_filter_algo == EarlyFilterAlgo.OBB_DFVT:
-                #         with code_prep.if_("op::slice<2, 4>(obb_whsc).op<op::abs>().op<op::reduce_min>() >= 0.01f"):
-                #             code_prep.raw(f"""
-                #             auto ellipse_bound_corners_and_major = Gaussian3D::get_gaussian_2d_ellipse_bound_rect_corners_and_major_vec(cov2d_inv, bound);
-                #             auto ellipse_bound_corners = (std::get<0>(ellipse_bound_corners_and_major) + op::reshape<1, 2>(uv_offset)) / 16;
-                #             auto ellipse_major_vec = std::get<1>(ellipse_bound_corners_and_major);
-                #             tv::geometry::OBBCornersGridOverlap<float> obb_corners_grid_overlap(ellipse_bound_corners, ellipse_major_vec, mn);
-                #             for (int y = 0; y < mn[1]; ++y){{
-                #                 auto test_res = obb_corners_grid_overlap.inc_step(y);
-                #                 for (int x = test_res[0]; x <= test_res[1]; ++x){{
-                #                     bool valid_tile = (x + gaussian_rect_min_bound[0]) >= gaussian_rect_min[0] && 
-                #                                     (x + gaussian_rect_min_bound[0]) < gaussian_rect_max[0] && 
-                #                                     (y + gaussian_rect_min_bound[1]) >= gaussian_rect_min[1] &&
-                #                                     (y + gaussian_rect_min_bound[1]) < gaussian_rect_max[1];
-                #                     real_tile_touched += valid_tile;
-                #                 }}
-                #             }}
-                #             """)
-                #         with code_prep.else_():
-                #             with code_prep.for_(
-                #                     "int y = gaussian_rect_min_bound[1]; y < gaussian_rect_max_bound[1]; ++y"
-                #             ):
-                #                 code_prep.raw(f"""
-                #                 float pixel_idx_y = (y - gaussian_rect_min_bound[1]) * {self._cfg.tile_size[1]};
-                #                 float pixel_idx_y_max = pixel_idx_y + {self._cfg.tile_size[1]};
-                #                 """)
-                #                 with code_prep.for_(
-                #                         "int x = gaussian_rect_min_bound[0]; x < gaussian_rect_max_bound[0]; ++x"
-                #                 ):
-                #                     code_prep.raw(f"""
-                #                     float pixel_idx_x = (x - gaussian_rect_min_bound[0]) * {self._cfg.tile_size[0]};
-                #                     float pixel_idx_x_max = pixel_idx_x + {self._cfg.tile_size[0]};
-                #                     // bool valid_tile = Gaussian3D::aabb_has_overlap_area(uv_offset - bound_rect, uv_offset + bound_rect, 
-                #                     //     {{pixel_idx_x, pixel_idx_y}}, {{pixel_idx_x_max, pixel_idx_y_max}});
-                #                     bool valid_tile = Gaussian3D::aabb_overlap_obb(
-                #                         {{pixel_idx_x, pixel_idx_y}}, {{pixel_idx_x_max, pixel_idx_y_max}}, 
-                #                         obb_whsc, uv_offset);
-
-                #                     valid_tile &= x >= gaussian_rect_min[0] && 
-                #                                 x < gaussian_rect_max[0] && 
-                #                                 y >= gaussian_rect_min[1] &&
-                #                                 y < gaussian_rect_max[1];
-                #                     real_tile_touched += valid_tile;
-                #                     """)
-                #     else:
-                #         with code_prep.for_(
-                #                 "int y = gaussian_rect_min_bound[1]; y < gaussian_rect_max_bound[1]; ++y"
-                #         ):
-                #             code_prep.raw(f"""
-                #             float pixel_idx_y = (y - gaussian_rect_min_bound[1]) * {self._cfg.tile_size[1]};
-                #             float pixel_idx_y_max = pixel_idx_y + {self._cfg.tile_size[1]};
-                #             """)
-                #             if self._cfg.early_filter_algo == EarlyFilterAlgo.ELLIPSE:
-                #                 code_prep.raw(f"""
-                #                 auto int_y0 = Gaussian3D::solve_ellipse_y_constant{solve_suffix}(pixel_idx_y, uv_offset, conic_opacity_vec, bound);
-                #                 auto int_y1 = Gaussian3D::solve_ellipse_y_constant{solve_suffix}(pixel_idx_y_max, uv_offset, conic_opacity_vec, bound);
-                #                 """)
-                #             with code_prep.for_(
-                #                     "int x = gaussian_rect_min_bound[0]; x < gaussian_rect_max_bound[0]; ++x"
-                #             ):
-                #                 code_prep.raw(f"""
-                #                 float pixel_idx_x = (x - gaussian_rect_min_bound[0]) * {self._cfg.tile_size[0]};
-                #                 float pixel_idx_x_max = pixel_idx_x + {self._cfg.tile_size[0]};
-                                
-                #                 bool valid_tile;
-                #                 """)
-                #                 if self._cfg.early_filter_algo == EarlyFilterAlgo.ELLIPSE:
-                #                     code_prep.raw(f"""
-                #                     auto int_x0 = Gaussian3D::solve_ellipse_x_constant{solve_suffix}(pixel_idx_x, uv_offset, conic_opacity_vec, bound);
-                #                     auto int_x1 = Gaussian3D::solve_ellipse_x_constant{solve_suffix}(pixel_idx_x_max, uv_offset, conic_opacity_vec, bound);
-                #                     // this function can filter more unnecessary gaussians, but it's very slow.
-                #                     valid_tile = Gaussian3D::gs2d_ellipse_aabb_is_overlap_external_inter(int_x0, int_x1, int_y0, int_y1, uv_offset,
-                #                         {{pixel_idx_x, pixel_idx_y}}, {{pixel_idx_x_max, pixel_idx_y_max}}, bound);
-
-                #                     """)
-                #                 elif self._cfg.early_filter_algo == EarlyFilterAlgo.OBB:
-                #                     code_prep.raw(f"""
-                #                     valid_tile = Gaussian3D::aabb_overlap_obb(
-                #                         {{pixel_idx_x, pixel_idx_y}}, {{pixel_idx_x_max, pixel_idx_y_max}}, 
-                #                         obb_whsc, uv_offset);
-                #                     """)
-
-                #                 else:
-                #                     code_prep.raw(f"""
-                #                     valid_tile = Gaussian3D::aabb_has_overlap_area(uv_offset - bound_rect, uv_offset + bound_rect, 
-                #                         {{pixel_idx_x, pixel_idx_y}}, {{pixel_idx_x_max, pixel_idx_y_max}});
-                #                     """)
-
-                #                 code_prep.raw(f"""
-                #                 valid_tile &= x >= gaussian_rect_min[0] && 
-                #                             x < gaussian_rect_max[0] && 
-                #                             y >= gaussian_rect_min[1] &&
-                #                             y < gaussian_rect_max[1];
-                #                 real_tile_touched += valid_tile;
-                #                 """)
-                #     code_prep.raw(f"""
-                #     if (i == DEBUG_INDEX){{
-                #         // should be 2120
-                #         tv::printf2("real_tile_touched", i, real_tile_touched);
-                #     }}
-                #     $tiles_touched[i] = real_tile_touched;
-                #     """)
 
                 if not self._cfg.disable_builtin_rgb:
                     proxy.read_field(GaussianCoreFields.RGB, "rgb", "normed_dir")

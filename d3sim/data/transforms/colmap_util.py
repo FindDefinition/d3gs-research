@@ -30,6 +30,8 @@
 """Colmap Utils, include model IO and database IO.
 Copied from colmap repo.
 """
+from contextlib import nullcontext
+import io
 import os
 import collections
 import numpy as np
@@ -199,7 +201,12 @@ def write_cameras_binary(cameras, path_to_model_file):
         void Reconstruction::WriteCamerasBinary(const std::string& path)
         void Reconstruction::ReadCamerasBinary(const std::string& path)
     """
-    with open(path_to_model_file, "wb") as fid:
+    if isinstance(path_to_model_file, io.BytesIO):
+        fid = path_to_model_file
+        ctx = nullcontext(fid)
+    else:
+        ctx = open(path_to_model_file, "wb")
+    with ctx as fid:
         write_next_bytes(fid, len(cameras), "Q")
         for _, cam in cameras.items():
             model_id = CAMERA_MODEL_NAMES[cam.model].model_id
@@ -346,7 +353,12 @@ def write_images_binary(images, path_to_model_file):
         void Reconstruction::ReadImagesBinary(const std::string& path)
         void Reconstruction::WriteImagesBinary(const std::string& path)
     """
-    with open(path_to_model_file, "wb") as fid:
+    if isinstance(path_to_model_file, io.BytesIO):
+        fid = path_to_model_file
+        ctx = nullcontext(fid)
+    else:
+        ctx = open(path_to_model_file, "wb")
+    with ctx as fid:
         write_next_bytes(fid, len(images), "Q")
         for _, img in images.items():
             write_next_bytes(fid, img.id, "i")
@@ -468,7 +480,12 @@ def write_points3D_binary(points3D, path_to_model_file):
         void Reconstruction::ReadPoints3DBinary(const std::string& path)
         void Reconstruction::WritePoints3DBinary(const std::string& path)
     """
-    with open(path_to_model_file, "wb") as fid:
+    if isinstance(path_to_model_file, io.BytesIO):
+        fid = path_to_model_file
+        ctx = nullcontext(fid)
+    else:
+        ctx = open(path_to_model_file, "wb")
+    with ctx as fid:
         write_next_bytes(fid, len(points3D), "Q")
         for _, pt in points3D.items():
             write_next_bytes(fid, pt.id, "Q")

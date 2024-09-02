@@ -58,7 +58,7 @@ class Train:
 
 class EarlyFilterAlgo(enum.IntEnum):
     NONE = 0
-    # use aabb overlap. fastest in most cases.
+    # use aabb overlap. fast enough in most cases.
     AABB = 1
     # Ellipse: reference filter, use ellipse-aabb overlap, very slow, only for evaluation.
     ELLIPSE = 2
@@ -121,14 +121,15 @@ class GaussianSplatConfig:
 
     measure_atomic_add_count: bool = False
 
-    # filter gaussians in prep by more precise method
+    # lossless gaussian filter in prep by more precise method
     # this will use gaussian 2d sample formula and 
     # alpha_eps (1 / 255) in rasterize kernel to construct a 
     # precise ellipse instead of original coarse 3-sigma ellipse in prep,
-    # then use bounding box of that ellipse to do filter.
+    # then use bounding box (aabb or obb) of that ellipse to do filter.
 
-    # this can increase performance without any loss.
-    # forward 30%, backward 5% in garden scene
+    # this can increase performance of sort and rasterize.
+    # forward 30%, backward 5% in garden scene.
+    # up to 500% performance increase in large scene.
     # TODO completely remove original 3-sigma ellipse in the future.
     early_filter_algo: EarlyFilterAlgo = EarlyFilterAlgo.OBB_DFVT
 

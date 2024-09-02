@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 from typing import Literal
+from d3sim import data
 from d3sim.constants import IsAppleSiliconMacOs
 from d3sim.core.unique_tree_id import UniqueTreeId
 from d3sim.data.scene_def import Scene
@@ -24,6 +25,9 @@ import os
 class ColmapConstants:
     Meta = "__colmap_transform_meta"
 
+def _run_colmap_subprocess(colmap_args: list[str]):
+    print("[COLMAP]", " ".join(colmap_args))
+    subprocess.run(colmap_args, check=True)
 
 # disable colmap info logging
 # os.environ["GLOG_minloglevel"] = "2"
@@ -32,13 +36,28 @@ class _SceneTransformMeta:
     colmap_model_path: str 
     colmap_image_root: str | None
     colmap_mask_root: str | None
+    colmap_match_txt_path: str | None
+    colmap_workdir_prefix: str = "__colmap" 
 
 class ColmapMetaHandleBase:
+    @staticmethod
+    def get_colmap_workdir_root_from_scene(scene: Scene) -> Path:
+        assert scene.uri is not None 
+        meta = ColmapMetaHandleBase.get_colmap_meta_from_scene(scene)
+        if meta is None:
+            return Path(scene.uri) / "__colmap"
+        else:
+            return Path(scene.uri) / meta.colmap_workdir_prefix
+
     @staticmethod
     def get_colmap_meta_from_scene(scene: Scene) -> _SceneTransformMeta | None:
         if scene.has_user_data(ColmapConstants.Meta):
             return scene.get_user_data_type_checked(ColmapConstants.Meta, _SceneTransformMeta)
         return None
+
+    @staticmethod
+    def set_scene_meta(scene: Scene, meta: _SceneTransformMeta):
+        return scene.set_user_data(ColmapConstants.Meta, meta)
 
     @staticmethod
     def get_colmap_meta_from_scene_required(scene: Scene) -> _SceneTransformMeta:
@@ -49,30 +68,45 @@ class ColmapMetaHandleBase:
     @staticmethod
     def store_colmap_model_path(scene: Scene, model_path: str):
         if not scene.has_user_data(ColmapConstants.Meta):
-            scene.set_user_data(ColmapConstants.Meta, _SceneTransformMeta(model_path, None, None))
+            scene.set_user_data(ColmapConstants.Meta, _SceneTransformMeta(model_path, None, None, None))
         else:
             meta = scene.get_user_data_type_checked(ColmapConstants.Meta, _SceneTransformMeta)
-            meta.colmap_model_path = model_path
+            meta = dataclasses.replace(meta, colmap_model_path=model_path)
+            scene.set_user_data(ColmapConstants.Meta, meta)
         return scene
 
     @staticmethod
     def store_colmap_image_root(scene: Scene, image_root: str):
         if not scene.has_user_data(ColmapConstants.Meta):
-            scene.set_user_data(ColmapConstants.Meta, _SceneTransformMeta("", image_root, None))
+            scene.set_user_data(ColmapConstants.Meta, _SceneTransformMeta("", image_root, None, None))
         else:
             meta = scene.get_user_data_type_checked(ColmapConstants.Meta, _SceneTransformMeta)
-            meta.colmap_image_root = image_root
+            meta = dataclasses.replace(meta, colmap_image_root=image_root)
+            scene.set_user_data(ColmapConstants.Meta, meta)
+
         return scene
 
     @staticmethod
     def store_colmap_mask_root(scene: Scene, mask_root: str):
         if not scene.has_user_data(ColmapConstants.Meta):
-            scene.set_user_data(ColmapConstants.Meta, _SceneTransformMeta("", None, mask_root))
+            scene.set_user_data(ColmapConstants.Meta, _SceneTransformMeta("", None, mask_root, None))
         else:
             meta = scene.get_user_data_type_checked(ColmapConstants.Meta, _SceneTransformMeta)
-            meta.colmap_mask_root = mask_root
-        return scene
+            meta = dataclasses.replace(meta, colmap_mask_root=mask_root)
+            scene.set_user_data(ColmapConstants.Meta, meta)
 
+        return scene
+    
+    @staticmethod
+    def store_colmap_match_txt_path(scene: Scene, match_txt_path: str):
+        if not scene.has_user_data(ColmapConstants.Meta):
+            scene.set_user_data(ColmapConstants.Meta, _SceneTransformMeta("", None, None, match_txt_path))
+        else:
+            meta = scene.get_user_data_type_checked(ColmapConstants.Meta, _SceneTransformMeta)
+            meta = dataclasses.replace(meta, colmap_match_txt_path=match_txt_path)
+            scene.set_user_data(ColmapConstants.Meta, meta)
+
+        return scene
 
 class ColmapSceneTransformOfflineDisk(ColmapMetaHandleBase, SceneTransformOfflineDisk):
     def __call__(self, scene: Scene) -> Scene:
@@ -98,8 +132,6 @@ class ColmapWorkDirs:
     cameras_root: Path = Path()
     masks_root: Path = Path()
     sfm_out_root: Path = Path()
-    sfm_prior_root: Path = Path()
-    sfm_tri_root: Path = Path()
 
     undistorted_img_root: Path = Path() 
 
@@ -114,27 +146,8 @@ class ColmapWorkDirs:
         self.cameras_root = self.colmap_dir / "cameras"
         self.masks_root = self.colmap_dir / "masks"
         self.sfm_out_root = self.colmap_dir / "cam_calib/unrectified/sparse"
-        self.sfm_prior_root = self.colmap_dir / "cam_calib/manually/sparse"
-        self.sfm_tri_root = self.colmap_dir / "cam_calib/triangulated/sparse"
         self.undistorted_img_root = self.colmap_dir / "cam_calib/undistorted"
         self.undistorted_mask_root = self.colmap_dir / "cam_calib/undistorted_mask"
-
-        # if self.create:
-        #     self.cameras_root.mkdir(exist_ok=True, parents=True, mode=0o755)
-        #     self.masks_root.mkdir(exist_ok=True, parents=True, mode=0o755)
-        #     self.sfm_out_root.mkdir(exist_ok=True, parents=True, mode=0o755)
-        #     self.sfm_prior_root.mkdir(exist_ok=True, parents=True, mode=0o755)
-        #     self.sfm_tri_root.mkdir(exist_ok=True, parents=True, mode=0o755)
-        #     self.undistorted_img_root.mkdir(exist_ok=True, parents=True, mode=0o755)
-        #     self.undistorted_mask_root.mkdir(exist_ok=True, parents=True, mode=0o755)
-        # else:
-        #     assert self.cameras_root.exists(), "cameras root must exist"
-        #     assert self.masks_root.exists(), "masks root must exist"
-        #     assert self.sfm_out_root.exists(), "sfm out root must exist"
-        #     assert self.sfm_prior_root.exists(), "sfm prior root must exist"
-        #     assert self.sfm_tri_root.exists(), "sfm tri root must exist"
-        #     assert self.undistorted_img_root.exists(), "undistorted img root must exist"
-        #     assert self.undistorted_mask_root.exists(), "undistorted mask root must exist"
         self.database_path = self.colmap_dir / "database.db"
         self.match_list_path = self.colmap_dir / "matches.txt"
 
@@ -201,13 +214,14 @@ class ColmapFeatureExtract(ColmapSceneTransformOfflineDisk):
     colmap_path: str = "colmap"
     default_focal_length_factor: float | None = None
     use_mask_during_feature_extraction: bool = False
+    from_existing_model: bool = False
     use_gpu: bool | None = None
     def get_unique_key(self) -> str:
         return f"{self.default_focal_length_factor}_{self.use_mask_during_feature_extraction}"
 
     def forward(self, scene: Scene[BasicFrame]):
         assert scene.uri is not None 
-        colmap_dir = Path(scene.uri) / "__colmap"
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
         # if colmap_dir.exists():
         #     shutil.rmtree(colmap_dir)
         workdirs = ColmapWorkDirs(colmap_dir, create=True)
@@ -226,9 +240,19 @@ class ColmapFeatureExtract(ColmapSceneTransformOfflineDisk):
             self.colmap_path, "feature_extractor",
                 "--database_path", f"{workdirs.database_path}",
                 "--image_path", f"{workdirs.cameras_root}",
+            ]
+        if self.from_existing_model:
+            assert workdirs.database_path.exists()
+            meta = self.get_colmap_meta_from_scene_required(scene)
+            assert Path(meta.colmap_model_path).exists()
+            # assume cameras and intrinsics are already added to database.
+            colmap_feature_extractor_args.append("--ImageReader.existing_camera_id")
+            colmap_feature_extractor_args.append("1")
+        else:
+            colmap_feature_extractor_args.extend([
                 "--ImageReader.single_camera_per_folder", "1",
                 "--ImageReader.camera_model", "OPENCV",
-            ]
+            ])
         if self.use_mask_during_feature_extraction:
             colmap_feature_extractor_args.append("--mask_path")
             colmap_feature_extractor_args.append(str(workdirs.masks_root))
@@ -242,7 +266,7 @@ class ColmapFeatureExtract(ColmapSceneTransformOfflineDisk):
         #     assert not IsAppleSiliconMacOs, "gpu is not supported on apple silicon"
         #     colmap_feature_extractor_args.append("--SiftExtraction.use_gpu")
         #     colmap_feature_extractor_args.append("1")
-        subprocess.run(colmap_feature_extractor_args, check=True)
+        _run_colmap_subprocess(colmap_feature_extractor_args)
         # self.write_file_flag(colmap_dir)
         self.store_colmap_image_root(scene, str(workdirs.cameras_root))
         self.store_colmap_mask_root(scene, str(workdirs.masks_root))
@@ -258,7 +282,7 @@ class ColmapCreatePoseAndIntrinsicPrior(ColmapSceneTransformOfflineDisk):
     prior_focal_length: bool = True
     def forward(self, scene: Scene[BasicFrame]):
         assert scene.uri is not None 
-        colmap_dir = Path(scene.uri) / "__colmap"
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
         # if self.file_flag_exists(colmap_dir):
         #     return scene
         workdirs = ColmapWorkDirs(colmap_dir, create=False)
@@ -270,8 +294,8 @@ class ColmapCreatePoseAndIntrinsicPrior(ColmapSceneTransformOfflineDisk):
             (image_id, cam_file_name, camera_id) = row
             cam_global_id = Path(cam_file_name).stem
             cam_global_id_to_colmap_id[cam_global_id] = (image_id, camera_id, cam_file_name)
-        prior_dir = workdirs.sfm_prior_root
-        workdirs.create_dir(prior_dir)
+        this_work_dir = self.delete_and_create_work_dir(colmap_dir)
+
         # camera_id, model, width, height, params, prior = next(rows)
         # params = blob_to_array(params, np.float64)
 
@@ -302,11 +326,55 @@ class ColmapCreatePoseAndIntrinsicPrior(ColmapSceneTransformOfflineDisk):
                     res_colmap_images[colmap_img_id] = cmu_img
         if self.add_intrinsic_prior:
             db.commit()
-        with open(prior_dir / "points3D.txt", "w") as f:
+        with open(this_work_dir / "points3D.txt", "w") as f:
             f.write("")
-        cmu.write_cameras_text(res_colmap_cams, str(prior_dir / "cameras.txt"))
-        cmu.write_images_text(res_colmap_images, str(prior_dir / "images.txt"))
+        cmu.write_cameras_text(res_colmap_cams, str(this_work_dir / "cameras.txt"))
+        cmu.write_images_text(res_colmap_images, str(this_work_dir / "images.txt"))
+        self.store_colmap_model_path(scene, str(this_work_dir))
         self.write_file_flag(colmap_dir)
+        return scene 
+
+@dataclasses.dataclass
+class ColmapCreatePriorFromModel(ColmapSceneTransformOfflineDisk):
+    """Add priors from previous colmap model.
+    """
+    # let colmap use the prior focal length
+    prior_focal_length: bool = False
+    def forward(self, scene: Scene[BasicFrame]):
+        assert scene.uri is not None 
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
+        if not colmap_dir.exists():
+            colmap_dir.mkdir(exist_ok=True, parents=True, mode=0o755)
+        model_dir = colmap_dir / "prior_model"
+        model_dir.mkdir(exist_ok=True, parents=True, mode=0o755)
+        if (colmap_dir / "database.db").exists() and (model_dir / "images.bin").exists():
+            return scene
+        # database must be removed before we can add new cameras
+        (colmap_dir / "database.db").unlink(missing_ok=True)
+        model_output = Path(self.get_colmap_meta_from_scene_required(scene).colmap_model_path)
+        print("???", colmap_dir, model_output)
+
+        cam_intrinsics = cmu.read_cameras_binary(model_output / "cameras.bin")
+        images_metas = cmu.read_images_binary(model_output / "images.bin")
+        db = cmu.COLMAPDatabase.connect(str(colmap_dir / "database.db"))
+        db.create_tables()
+
+        for key in cam_intrinsics:
+            cam = cam_intrinsics[key]
+            db.add_camera(cmu.CAMERA_MODEL_NAMES[cam.model].model_id, cam.width, cam.height, cam.params, camera_id=key, prior_focal_length=self.prior_focal_length)
+        new_img_metas = {}
+        for key in images_metas:
+            image_meta = images_metas[key]
+            db.add_image(image_meta.name, image_meta.camera_id, image_id=key)
+            # clear sfm point metas
+            image_meta = image_meta._replace(point3D_ids=[])
+            image_meta = image_meta._replace(xys=[])
+            new_img_metas[key] = image_meta
+        db.commit()
+        shutil.copy(model_output / "cameras.bin", model_dir / "cameras.bin")
+        cmu.write_images_binary(new_img_metas, str(model_dir / "images.bin"))
+        cmu.write_points3D_binary({}, str(model_dir / "points3D.bin"))
+        self.store_colmap_model_path(scene, str(model_dir))
         return scene 
 
 @dataclasses.dataclass
@@ -318,7 +386,7 @@ class ColmapCustomMatchGen(ColmapSceneTransformOfflineDisk):
 
     def forward(self, scene: Scene[BasicFrame]):
         assert scene.uri is not None 
-        colmap_dir = Path(scene.uri) / "__colmap"
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
         # if self.file_flag_exists(colmap_dir):
         #     return scene
         workdirs = ColmapWorkDirs(colmap_dir, create=False)
@@ -362,10 +430,74 @@ class ColmapCustomMatchGen(ColmapSceneTransformOfflineDisk):
         all_matchs_reversed_set = set(all_matchs_reversed)
         all_matchs = list(filter(lambda x: x not in all_matchs_reversed_set, all_matchs))
         assert colmap_dir.exists(), "feature extract transform must be run first"
-        with open(workdirs.match_list_path, "w") as f:
+        match_list_path = workdirs.match_list_path
+        self.store_colmap_match_txt_path(scene, str(match_list_path))
+        with open(match_list_path, "w") as f:
             for pair in all_matchs:
                 f.write(f"{pair[0]} {pair[1]}\n")
         self.write_file_flag(colmap_dir)
+        return scene 
+
+
+@dataclasses.dataclass
+class ColmapPriorModelCustomMatchKNN(ColmapSceneTransformOfflineDisk):
+    k: int = 200
+    def get_unique_key(self) -> str:
+        return f"{self.k}"
+
+    def forward(self, scene: Scene[BasicFrame]):
+        assert scene.uri is not None 
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
+        # if self.file_flag_exists(colmap_dir):
+        #     return scene
+        model_input = Path(self.get_colmap_meta_from_scene_required(scene).colmap_model_path)
+        images_metas = cmu.read_images_binary(f"{model_input}/images.bin")
+
+        cam_centers = np.array([
+            -cmu.qvec2rotmat(images_metas[key].qvec).astype(np.float32).T @ images_metas[key].tvec.astype(np.float32) 
+            for key in images_metas
+        ])
+        n_neighbours = min(self.k, len(cam_centers))
+        cam_nbrs = NearestNeighbors(n_neighbors=n_neighbours).fit(cam_centers)
+        all_matchs: list[tuple[str, str]] = []
+        keys = list(images_metas.keys())
+        for key, cam_center in zip(images_metas, cam_centers):
+            _, indices = cam_nbrs.kneighbors(cam_center[None])
+            for idx in indices[0, 1:]:
+                all_matchs.append((images_metas[key].name, images_metas[keys[idx]].name))
+        this_work_dir = self.delete_and_create_work_dir(colmap_dir)
+
+        match_list_path = this_work_dir / "matches.txt"
+        with open(match_list_path, "w") as f:
+            for pair in all_matchs:
+                f.write(f"{pair[0]} {pair[1]}\n")
+        self.store_colmap_match_txt_path(scene, str(match_list_path))
+        return scene 
+
+@dataclasses.dataclass
+class ColmapCopySubsetImageFromModel(ColmapSceneTransformOfflineDisk):
+    def forward(self, scene: Scene[BasicFrame]):
+        assert scene.uri is not None 
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
+        workdirs = ColmapWorkDirs(colmap_dir, create=False)
+        workdirs_img_root = workdirs.cameras_root
+        print(workdirs_img_root, "workdirs_img_root")
+        workdirs.create_dir(workdirs_img_root)
+        # if self.file_flag_exists(colmap_dir):
+        #     return scene
+        model_input = Path(self.get_colmap_meta_from_scene_required(scene).colmap_model_path)
+        images_metas = cmu.read_images_binary(f"{model_input}/images.bin")
+        img_root = self.get_colmap_meta_from_scene_required(scene).colmap_image_root
+        assert img_root is not None, "image root must be set"
+        img_root_p = Path(img_root)
+        for key in images_metas:
+            name_p = Path(images_metas[key].name)
+            path = workdirs_img_root / name_p
+            if not path.parent.exists():
+                path.parent.mkdir(exist_ok=True, parents=True, mode=0o755)
+            shutil.copy(img_root_p / name_p, path)
+        
+        self.store_colmap_image_root(scene, str(workdirs_img_root))
         return scene 
 
 @dataclasses.dataclass
@@ -377,16 +509,19 @@ class ColmapCustomMatch(ColmapSceneTransformOfflineDisk):
 
     def forward(self, scene: Scene[BasicFrame]):
         assert scene.uri is not None 
-        colmap_dir = Path(scene.uri) / "__colmap"
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
         # if self.file_flag_exists(colmap_dir):
         #     return scene
-
         workdirs = ColmapWorkDirs(colmap_dir, create=False)
-
+        meta = self.get_colmap_meta_from_scene(scene)
+        if meta is None or meta.colmap_match_txt_path is None:
+            match_list_path = str(workdirs.match_list_path)
+        else:
+            match_list_path = meta.colmap_match_txt_path
         colmap_matches_importer_args = [
             self.colmap_path, "matches_importer",
             "--database_path", str(workdirs.database_path),
-            "--match_list_path", str(workdirs.match_list_path),
+            "--match_list_path", str(match_list_path),
         ]
         # use_gpu = self.use_gpu
         # if use_gpu is None:
@@ -395,7 +530,7 @@ class ColmapCustomMatch(ColmapSceneTransformOfflineDisk):
         #     assert not IsAppleSiliconMacOs, "gpu is not supported on apple silicon"
         #     colmap_matches_importer_args.append("--SiftMatching.use_gpu")
         #     colmap_matches_importer_args.append("1")
-        subprocess.run(colmap_matches_importer_args, check=True)
+        _run_colmap_subprocess(colmap_matches_importer_args)
         self.write_file_flag(colmap_dir)
         return scene 
 
@@ -414,7 +549,6 @@ class ColmapCopyResultToFolder(ColmapSceneTransformOfflineDisk):
         _copy_model(out_path, colmap_dir)
         return scene
 
-
 @dataclasses.dataclass
 class ColmapBuiltinMatch(ColmapSceneTransformOfflineDisk):
     """Do colmap calibration without any priors.
@@ -427,7 +561,7 @@ class ColmapBuiltinMatch(ColmapSceneTransformOfflineDisk):
 
     def forward(self, scene: Scene[BasicFrame]):
         assert scene.uri is not None 
-        colmap_dir = Path(scene.uri) / "__colmap"
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
         unique_key = f"{self.matcher}"
         # if self.file_flag_exists(colmap_dir):
         #     return scene
@@ -445,7 +579,7 @@ class ColmapBuiltinMatch(ColmapSceneTransformOfflineDisk):
             assert not IsAppleSiliconMacOs, "gpu is not supported on apple silicon"
             colmap_matches_importer_args.append("--SiftMatching.use_gpu")
             colmap_matches_importer_args.append("1")
-        subprocess.run(colmap_matches_importer_args, check=True)
+        _run_colmap_subprocess(colmap_matches_importer_args)
         self.write_file_flag(colmap_dir)
         return scene 
 
@@ -463,13 +597,13 @@ class ColmapMapper(ColmapSceneTransformOfflineDisk):
 
     def forward(self, scene: Scene[BasicFrame]):
         assert scene.uri is not None 
-        colmap_dir = Path(scene.uri) / "__colmap"
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
         workdirs = ColmapWorkDirs(colmap_dir, create=False)
         this_work_dir = self.get_work_dir_path(colmap_dir)
         self.store_colmap_model_path(scene, str(this_work_dir / "0"))
         # scene.set_user_data(ColmapConstants.ModelOutput, str(this_work_dir / "0"))
         # _copy_model(this_work_dir / "0", workdirs.sfm_out_root)
-
+        workdirs.create_dir(workdirs.sfm_out_root)
         # if self.file_flag_exists(colmap_dir):
         #     return scene
         self.delete_and_create_work_dir(colmap_dir)
@@ -488,7 +622,7 @@ class ColmapMapper(ColmapSceneTransformOfflineDisk):
         #     assert not IsAppleSiliconMacOs, "gpu is not supported on apple silicon"
         #     colmap_args.append("--Mapper.ba_use_gpu")
         #     colmap_args.append("1")
-        subprocess.run(colmap_args, check=True)
+        _run_colmap_subprocess(colmap_args)
         this_work_dir_childs = list(this_work_dir.iterdir())
         print("Mapper Generated", len(this_work_dir_childs) - 1, "models")
         # copy the first model to the root
@@ -540,9 +674,10 @@ class ColmapPointTriangulator(ColmapSceneTransformOfflineDisk):
     external_output_path: str | None = None
     def forward(self, scene: Scene[BasicFrame]):
         assert scene.uri is not None 
-        colmap_dir = Path(scene.uri) / "__colmap"
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
         # if self.file_flag_exists(colmap_dir):
         #     return scene
+        model_input = self.get_colmap_meta_from_scene_required(scene).colmap_model_path
         workdirs = ColmapWorkDirs(colmap_dir, create=False)
         if self.external_output_path is not None:
             this_work_dir = Path(self.external_output_path)
@@ -553,7 +688,7 @@ class ColmapPointTriangulator(ColmapSceneTransformOfflineDisk):
             self.colmap_path, "point_triangulator",
             "--database_path", f"{workdirs.database_path}",
             "--image_path", f"{workdirs.cameras_root}",
-            "--input_path", f"{workdirs.sfm_prior_root}",
+            "--input_path", f"{model_input}",
             "--output_path", str(this_work_dir),
             ]
         colmap_args.extend([
@@ -563,64 +698,11 @@ class ColmapPointTriangulator(ColmapSceneTransformOfflineDisk):
         if self.ba_global_function_tolerance is not None:
             colmap_args.append("--Mapper.ba_global_function_tolerance")
             colmap_args.append(str(self.ba_global_function_tolerance))
-        subprocess.run(colmap_args, check=True)
+        _run_colmap_subprocess(colmap_args)
         self.store_colmap_model_path(scene, str(this_work_dir))
         self.write_file_flag(colmap_dir)
         return scene 
 
-@dataclasses.dataclass
-class ColmapTBALoop(ColmapSceneTransformOfflineDisk):
-    """assume you run point_triangulator first. (get a complete sparse model)
-    """
-    colmap_path: str = "colmap"
-    use_gpu: bool | None = None
-    ba_refine_extra_params: bool = False
-    ba_function_tolerance: float = 0.000001
-    ba_max_linear_solver_iterations: int = 100
-    ba_max_num_iterations: int = 50
-    ba_refine_focal_length: bool = False
-    external_output_path: str | None = None
-
-    def forward(self, scene: Scene[BasicFrame]):
-        assert scene.uri is not None 
-        colmap_dir = Path(scene.uri) / "__colmap"
-        # if self.file_flag_exists(colmap_dir):
-            # return scene
-        workdirs = ColmapWorkDirs(colmap_dir, create=False)
-        # workdir save immediate results
-        if self.external_output_path is not None:
-            this_work_dir = Path(self.external_output_path)
-            assert this_work_dir.exists(), "external output path must exist"
-        else:
-            this_work_dir = self.delete_and_create_work_dir(colmap_dir)
-        colmap_args = [
-            self.colmap_path, "bundle_adjuster",
-            "--database_path", f"{workdirs.database_path}",
-            "--image_path", f"{workdirs.cameras_root}",
-            "--input_path", f"{workdirs.sfm_prior_root}",
-            "--output_path", str(this_work_dir),
-            ]
-        use_gpu = self.use_gpu
-        if use_gpu is None:
-            use_gpu = not IsAppleSiliconMacOs and HAS_CUDA
-        if use_gpu:
-            assert not IsAppleSiliconMacOs, "gpu is not supported on apple silicon"
-            colmap_args.append("--BundleAdjustment.use_gpu")
-            colmap_args.append("1")
-        colmap_args.extend([
-            "--BundleAdjustment.refine_extra_params", str(int(self.ba_refine_extra_params)),
-            "--BundleAdjustment.function_tolerance", str(self.ba_function_tolerance),
-            "--BundleAdjustment.max_linear_solver_iterations", str(self.ba_max_linear_solver_iterations),
-            "--BundleAdjustment.max_num_iterations", str(self.ba_max_num_iterations),
-            "--BundleAdjustment.refine_focal_length", str(int(self.ba_refine_focal_length)),
-        ])
-        subprocess.run(colmap_args, check=True)
-        self.store_colmap_model_path(scene, str(this_work_dir))
-        # copy the first model to the root
-        # TODO check ba output format
-        _copy_model(this_work_dir / "0", workdirs.sfm_out_root)
-        self.write_file_flag(colmap_dir)
-        return scene 
 
 @dataclasses.dataclass
 class ColmapBundleAdjustment(ColmapSceneTransformOfflineDisk):
@@ -635,7 +717,63 @@ class ColmapBundleAdjustment(ColmapSceneTransformOfflineDisk):
     refine_focal_length: bool = False
     external_output_path: str | None = None
 
+    def forward(self, scene: Scene[BasicFrame]):
+        assert scene.uri is not None 
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
+        # if self.file_flag_exists(colmap_dir):
+        #     return scene
+        model_input = self.get_colmap_meta_from_scene_required(scene).colmap_model_path
+        if self.external_output_path is not None:
+            this_work_dir = Path(self.external_output_path)
+            assert this_work_dir.exists(), "external output path must exist"
+        else:
+            this_work_dir = self.delete_and_create_work_dir(colmap_dir)
+        colmap_args = [
+            self.colmap_path, "bundle_adjuster",
+            "--input_path", f"{model_input}",
+            "--output_path", str(this_work_dir),
+            ]
+        colmap_args.extend([
+            "--BundleAdjustment.refine_extra_params", str(int(self.refine_extra_params)),
+            "--BundleAdjustment.function_tolerance", str(self.function_tolerance),
+            "--BundleAdjustment.max_linear_solver_iterations", str(self.max_linear_solver_iterations),
+            "--BundleAdjustment.max_num_iterations", str(self.max_num_iterations), 
+            "--BundleAdjustment.refine_focal_length", str(int(self.refine_focal_length)),
+        ])
+        _run_colmap_subprocess(colmap_args)
+        self.store_colmap_model_path(scene, str(this_work_dir))
+        self.write_file_flag(colmap_dir)
+        return scene 
 
+@dataclasses.dataclass(kw_only=True)
+class ColmapTBALoop(ColmapSceneTransformOfflineDisk):
+    """assume you run point_triangulator first. (get a complete sparse model)
+    """
+    colmap_path: str = "colmap"
+    num_loop: int = 2
+    point_triangulator: ColmapPointTriangulator
+    bundle_adjustment: ColmapBundleAdjustment
+
+    def forward(self, scene: Scene[BasicFrame]):
+        assert scene.uri is not None 
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
+        this_work_dir = self.delete_and_create_work_dir(colmap_dir)
+        scene_in_loop = scene
+        for j in range(self.num_loop):
+            pt_out_tmp = this_work_dir / f"pt_tmp_{j}"
+            pt_out_tmp.mkdir(exist_ok=True, parents=True, mode=0o755)
+            ba_out_tmp = this_work_dir / f"ba_tmp_{j}"
+            ba_out_tmp.mkdir(exist_ok=True, parents=True, mode=0o755)
+            point_triangulator = dataclasses.replace(self.point_triangulator, external_output_path=str(pt_out_tmp))
+            bundle_adjustment = dataclasses.replace(self.bundle_adjustment, external_output_path=str(ba_out_tmp))
+            scene_in_loop = point_triangulator(scene_in_loop) 
+            scene_in_loop = bundle_adjustment(scene_in_loop)
+        out_path = this_work_dir / "tba_model"
+        out_path.mkdir(exist_ok=True, parents=True, mode=0o755)
+        out_model_path = self.get_colmap_meta_from_scene_required(scene_in_loop).colmap_model_path
+        _copy_model(Path(out_model_path), out_path)
+        self.store_colmap_model_path(scene, str(out_path))
+        return scene
 
 @dataclasses.dataclass
 class OpencvUndistort(ColmapSceneTransformOfflineDisk):
@@ -655,7 +793,7 @@ class ColmapUndistort(ColmapSceneTransformOfflineDisk):
     def forward(self, scene: Scene[BasicFrame]):
         # TODO use opencv remap for segmentation (undistort without interpolation)
         assert scene.uri is not None 
-        colmap_dir = Path(scene.uri) / "__colmap"
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
         assert scene.has_user_data("colmap_result_fetched"), "colmap result must be fetched first"
         workdirs = ColmapWorkDirs(colmap_dir, create=False)
         gid_to_cams = scene.get_global_id_to_sensor(BasicPinholeCamera)
@@ -676,7 +814,7 @@ class ColmapUndistort(ColmapSceneTransformOfflineDisk):
                 "--output_type", "COLMAP",
                 "--max_image_size", str(self.max_image_size),
             ]
-            subprocess.run(colmap_args, check=True)
+            _run_colmap_subprocess(colmap_args)
 
             if has_mask:
                 with tempfile.TemporaryDirectory() as tmpdir:
@@ -692,7 +830,7 @@ class ColmapUndistort(ColmapSceneTransformOfflineDisk):
                         "--output_type", "COLMAP",
                         "--max_image_size", str(self.max_image_size),
                     ]
-                subprocess.run(colmap_args, check=True)
+                _run_colmap_subprocess(colmap_args)
         remain_gid_to_cams, _ = fetch_colmap_camera_result_and_assign_to_scene(str(this_work_dir / "sparse"), scene, assign_pose=False)
         assert len(remain_gid_to_cams) == 0
         for gid, cam in gid_to_cams.items():
@@ -741,7 +879,7 @@ class ColmapFilterFloatingAndNoSFM(ColmapSceneTransformOfflineDisk):
 
     def forward(self, scene: Scene[BasicFrame]):
         assert scene.uri is not None 
-        colmap_dir = Path(scene.uri) / "__colmap"
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
         meta = self.get_colmap_meta_from_scene(scene)
         assert meta is not None 
         out_path = Path(meta.colmap_model_path)
@@ -841,7 +979,7 @@ class ColmapRefineRotAndScale(ColmapSceneTransformOfflineDisk):
 
     def forward(self, scene: Scene[BasicFrame]):
         assert scene.uri is not None 
-        colmap_dir = Path(scene.uri) / "__colmap"
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
         this_work_dir = self.get_work_dir_path(colmap_dir)
         workdirs = ColmapWorkDirs(colmap_dir, create=False)
         meta = self.get_colmap_meta_from_scene(scene)
@@ -1016,7 +1154,7 @@ class ColmapFetchResult(SceneTransform):
     def forward(self, scene: Scene[BasicFrame]):
         assert scene.uri is not None 
         assert not scene.has_user_data("colmap_result_fetched"), "you can't fetch result twice"
-        colmap_dir = Path(scene.uri) / "__colmap"
+        colmap_dir = ColmapMetaHandleBase.get_colmap_workdir_root_from_scene(scene)
         workdirs = ColmapWorkDirs(colmap_dir, create=False)
         if self.external_model_path is not None:
             out_path = Path(self.external_model_path)
@@ -1048,7 +1186,7 @@ class ColmapFromRefUnrectifiedResult(ColmapSceneTransformOfflineDisk):
     def forward(self, scene: Scene[BasicFrame]):
         assert scene.uri is not None 
         assert not scene.has_user_data("colmap_result_fetched"), "you can't fetch result twice"
-        colmap_dir = Path(scene.uri) / "__colmap"
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
         workdirs = ColmapWorkDirs(colmap_dir, create=False)
         this_work_dir = self.delete_and_create_work_dir(colmap_dir)
         ref_path = Path(self.ref_unrectified_result_path)
@@ -1081,7 +1219,7 @@ class ColmapToRefUnrectifiedResult(ColmapSceneTransformOfflineDisk):
     """
     def forward(self, scene: Scene[BasicFrame]):
         assert scene.uri is not None 
-        colmap_dir = Path(scene.uri) / "__colmap"
+        colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
         workdirs = ColmapWorkDirs(colmap_dir, create=False)
         this_work_dir = self.delete_and_create_work_dir(colmap_dir)
         out_path = Path(self.get_colmap_meta_from_scene_required(scene).colmap_model_path)
