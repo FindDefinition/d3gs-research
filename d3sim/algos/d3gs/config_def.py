@@ -100,7 +100,11 @@ class GaussianSplatConfig:
     render_rgba: bool = False
 
     transmittance_is_double = False
-    backward_reduction: Literal["none", "warp", "block"] = "block"
+    backward_reduction: Literal["none", "warp"] = "warp"
+    # load-balanced warp-sum-atomic-add https://arxiv.org/pdf/2401.05345
+    # slightly faster (4.6ms->4.1ms in rasterize backward) in garden scene.
+    # you may need to change this factor for different scene.
+    backward_reduction_balanced_factor: int = 4
     verbose: bool = False
 
     recalc_cov3d_in_bwd: bool = True
@@ -140,6 +144,7 @@ class GaussianSplatConfig:
 
     # rasterize backward algorithm
     rasterize_backward_algo: RasterizeBackwardAlgo = RasterizeBackwardAlgo.DEFAULT
+    # currently this must equal to warp size.
     per_gaussian_bucket_size: int = 32
 
     @property 

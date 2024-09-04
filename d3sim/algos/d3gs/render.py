@@ -1,3 +1,4 @@
+import code
 from contextlib import contextmanager, nullcontext
 import copy
 from pydoc import doc
@@ -41,13 +42,17 @@ class BatchCameraParams:
     image_shape_wh: tuple[int, int]
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
-class _RasterizeSnap(DataClassWithArrayCheck):
+class _RasterizeSnapContext(DataClassWithArrayCheck):
+    bucket_cumsum: Annotated[torch.Tensor, ac.ArrayCheck([-1], ac.I32)]
+    bucket_to_tile_idx: Annotated[torch.Tensor, ac.ArrayCheck([-1], ac.I32)]
+    max_contributer_per_tile: Annotated[torch.Tensor, ac.ArrayCheck([-1], ac.I32)]
+
     custom_features: Annotated[torch.Tensor | None,
-                               ac.ArrayCheck(["NumBucket", -1], ac.F32)]
-    T: Annotated[torch.Tensor, ac.ArrayCheck(["NumBucket"], ac.F32)]
-    color: Annotated[torch.Tensor, ac.ArrayCheck(["NumBucket", -1], ac.F32)]
+                               ac.ArrayCheck(["NumBucketElem", -1], ac.F32)]
+    T: Annotated[torch.Tensor, ac.ArrayCheck(["NumBucketElem"], ac.F32)]
+    color: Annotated[torch.Tensor, ac.ArrayCheck(["NumBucketElem", -1], ac.F32)]
     depth: Annotated[torch.Tensor | None,
-                     ac.ArrayCheck(["NumBucket", -1], ac.F32)] = None
+                     ac.ArrayCheck(["NumBucketElem", -1], ac.F32)] = None
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatOpContext(DataClassWithArrayCheck):
@@ -66,7 +71,7 @@ class GaussianSplatOpContext(DataClassWithArrayCheck):
     sh_to_rgb_ne_0: Annotated[torch.Tensor | None,
                               ac.ArrayCheck([-1], ac.U8)] = None
 
-    per_gaussian_snap: _RasterizeSnap | None = None
+    per_gaussian_snap: _RasterizeSnapContext | None = None
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatOutput(DataClassWithArrayCheck):
@@ -789,7 +794,9 @@ class GaussianSplatOp:
                 gaussian_idx_sorted = torch.gather(gaussian_idx, 0, indices)
         num_tiles = batch_size * tile_num_x * tile_num_y
         num_bucket = 0
-        per_gaussian_snap: _RasterizeSnap | None = None
+        bucket_sizes : torch.Tensor | None = None
+        per_gaussian_snap: _RasterizeSnapContext | None = None
+        bucket_to_tile_idx: torch.Tensor | None = None
         with measure_and_print_torch("prepare workrange", enable=enable_verbose):
             workload_ranges = torch.zeros([num_tiles, 2],
                                           dtype=torch.int32,
@@ -834,7 +841,7 @@ class GaussianSplatOp:
             self._inliner.kernel_1d(
                 f"prepare_workload_range_{enable_32bit_sort}", num_rendered, 0,
                 code)
-            if self._cfg.rasterize_backward_algo == RasterizeBackwardAlgo.PER_GAUSSIAN:
+            if self._cfg.rasterize_backward_algo == RasterizeBackwardAlgo.PER_GAUSSIAN and training:
                 bucket_sizes = torch.empty([num_tiles], dtype=torch.int32, device=xyz.device)
                 self._inliner.kernel_1d(
                     f"prepare_bucket_{self._cfg.per_gaussian_bucket_size}", num_tiles, 0,
@@ -845,12 +852,16 @@ class GaussianSplatOp:
                     """)
                 bucket_sizes.cumsum_(0)
                 num_bucket = int(bucket_sizes[-1].item())
-
-                per_gaussian_snap = _RasterizeSnap(
-                    custom_features=torch.empty([num_bucket, num_custom_feat], dtype=torch.float32, device=xyz.device),
-                    T=torch.empty([num_bucket], dtype=torch.float32, device=xyz.device),
-                    color=torch.empty([num_bucket, self._cfg.num_channels], dtype=torch.float32, device=xyz.device),
-                    depth=torch.empty([num_bucket], dtype=torch.float32, device=xyz.device) if self._cfg.render_depth else None,
+                num_bucket_element = num_bucket * self._cfg.block_size
+                bucket_to_tile_idx = torch.empty([num_bucket], dtype=torch.int32, device=xyz.device)
+                per_gaussian_snap = _RasterizeSnapContext(
+                    bucket_to_tile_idx=bucket_to_tile_idx,
+                    bucket_cumsum=bucket_sizes,
+                    max_contributer_per_tile=torch.zeros([tile_num_x * tile_num_y], dtype=torch.int32, device=xyz.device),
+                    custom_features=torch.empty([num_bucket_element, num_custom_feat], dtype=torch.float32, device=xyz.device),
+                    T=torch.empty([num_bucket_element], dtype=torch.float32, device=xyz.device),
+                    color=torch.empty([num_bucket_element, self._cfg.num_channels], dtype=torch.float32, device=xyz.device),
+                    depth=torch.empty([num_bucket_element], dtype=torch.float32, device=xyz.device) if self._cfg.render_depth else None,
                 )
 
         # workload_ranges_tv = torch_tensor_to_tv(workload_ranges, to_const=True)
@@ -1308,6 +1319,18 @@ class GaussianSplatOp:
                 dcolor=dcolor,
                 dcustom_features=dcustom_features,
                 dz=dz)
+
+        is_per_gaussian_algo = ctx.per_gaussian_snap is not None
+        if not is_bwd and ctx.per_gaussian_snap is not None:
+            snap = ctx.per_gaussian_snap
+            custom_feat_snap = snap.custom_features
+            T_snap = snap.T
+            color_snap = snap.color
+            depth_snap = snap.depth
+            bucket_cumsum = snap.bucket_cumsum
+            bucket_to_tile_idx = snap.bucket_to_tile_idx
+            max_contributer_per_tile = snap.max_contributer_per_tile
+
         bwd_reduce_method = self._cfg.backward_reduction
         t_dtype = "double" if self._cfg.transmittance_is_double else "float"
         use_bwd_reduce = bwd_reduce_method != "none"
@@ -1320,14 +1343,14 @@ class GaussianSplatOp:
         render_rgba = self._cfg.render_rgba
         # when use raw kernel in metal, we don't use nonuniform grid to
         # keep logic same as cuda.
-        if IsAppleSiliconMacOs:
-            launch_param = tv.LaunchParam(
-                (tile_num_x, tile_num_y, batch_size),
-                (self._cfg.tile_size[0], self._cfg.tile_size[1], 1))
-        else:
-            launch_param = tv.LaunchParam(
-                (tile_num_x, tile_num_y, batch_size),
-                (self._cfg.tile_size[0] * self._cfg.tile_size[1], 1, 1))
+        # if IsAppleSiliconMacOs:
+        #     launch_param = tv.LaunchParam(
+        #         (tile_num_x, tile_num_y, batch_size),
+        #         (self._cfg.tile_size[0], self._cfg.tile_size[1], 1))
+        # else:
+        launch_param = tv.LaunchParam(
+            (tile_num_x, tile_num_y, batch_size),
+            (self._cfg.tile_size[0] * self._cfg.tile_size[1], 1, 1))
         atomic_add_count = None 
         if is_bwd and self._cfg.measure_atomic_add_count:
             atomic_add_count = torch.zeros([1], dtype=torch.int32, device=final_T.device)
@@ -1342,20 +1365,33 @@ class GaussianSplatOp:
                 print(f"atomic add count: {atomic_add_count.item()}")
 
             return grad_out
-        block_reduce_cache_length = 16
         num_warp = self._cfg.tile_size[0] * self._cfg.tile_size[1] // 32
         code_rasterize = pccm.code()
         code_rasterize.raw(f"""
         namespace op = tv::arrayops;
         using math_op_t = tv::arrayops::MathScalarOp<float>;
         """)
+        # for 16x16 tile, the warp shape is 16x2, we need to convert to 8x4
+        # slightly faster when use warp reduce.
+        lane_matrix_shape = self._cfg.warp_size
+        num_lane_matrix_shape = (self._cfg.tile_size[0] // lane_matrix_shape[0], self._cfg.tile_size[1] // lane_matrix_shape[1])
+        assert self._cfg.tile_size[0] % lane_matrix_shape[0] == 0
+        assert self._cfg.tile_size[1] % lane_matrix_shape[1] == 0
+
         if IsAppleSiliconMacOs:
             code_rasterize.raw(f"""
-            tv::array<uint32_t, 2> pixel_idx_xy{{threadPositionInGrid.x, threadPositionInGrid.y}};
+            int warp_idx_tmp = threadPositionInGrid.x / 32;
+            int warp_x = warp_idx_tmp % {num_lane_matrix_shape[0]};
+            int warp_y = warp_idx_tmp / {num_lane_matrix_shape[0]};
+            int lane_idx_tmp = threadPositionInGrid.x % 32;
+            int lane_x = lane_idx_tmp % {lane_matrix_shape[0]};
+            int lane_y = lane_idx_tmp / {lane_matrix_shape[0]};
+
+            tv::array<uint32_t, 2> pixel_idx_xy{{threadgroupPositionInGrid.x * {self._cfg.tile_size[0]} + warp_x * {lane_matrix_shape[0]} + lane_x, 
+                                                 threadgroupPositionInGrid.y * {self._cfg.tile_size[1]} + warp_y * {lane_matrix_shape[1]} + lane_y}};
             tv::array<uint32_t, 2> tile_idx_xy{{threadgroupPositionInGrid.x, threadgroupPositionInGrid.y}};
-            // keep in mind that metal only have 32KB shared memory
             threadgroup int num_done_shared[32];
-            uint thread_rank = threadPositionInThreadgroup.y * {self._cfg.tile_size[0]} + threadPositionInThreadgroup.x;
+            uint thread_rank = threadPositionInThreadgroup.x;
             """)
             if batch_size != 1:
                 code_rasterize.raw(f"""
@@ -1366,12 +1402,6 @@ class GaussianSplatOp:
                 constexpr int batch_idx = 0;
                 """)
         else:
-            # for 16x16 tile, the warp shape is 16x2, we need to convert to 8x4
-            # slightly faster when use warp reduce.
-            lane_matrix_shape = self._cfg.warp_size
-            num_lane_matrix_shape = (self._cfg.tile_size[0] // lane_matrix_shape[0], self._cfg.tile_size[1] // lane_matrix_shape[1])
-            assert self._cfg.tile_size[0] % lane_matrix_shape[0] == 0
-            assert self._cfg.tile_size[1] % lane_matrix_shape[1] == 0
             code_rasterize.raw(f"""
             int warp_idx_tmp = threadIdx.x / 32;
             int warp_x = warp_idx_tmp % {num_lane_matrix_shape[0]};
@@ -1385,12 +1415,6 @@ class GaussianSplatOp:
             tv::array<uint32_t, 2> tile_idx_xy{{blockIdx.x, blockIdx.y}};
             uint32_t thread_rank = threadIdx.x;
             """)
-
-            # code_rasterize.raw(f"""
-            # tv::array<uint32_t, 2> pixel_idx_xy{{blockIdx.x * {self._cfg.tile_size[0]} + threadIdx.x, blockIdx.y * {self._cfg.tile_size[1]} + threadIdx.y}};
-            # tv::array<uint32_t, 2> tile_idx_xy{{blockIdx.x, blockIdx.y}};
-            # uint32_t thread_rank = threadIdx.y * {self._cfg.tile_size[0]} + threadIdx.x;
-            # """)
             if batch_size != 1:
                 code_rasterize.raw(f"""
                 int batch_idx = blockIdx.z;
@@ -1416,20 +1440,6 @@ class GaussianSplatOp:
             code_rasterize.raw(f"""
             TV_SHARED_MEMORY tv::array<float, {num_custom_feat}> collected_custom_feat[{block_size}];
             """)
-        if bwd_reduce_method == "block":
-            code_rasterize.raw(f"""
-            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_drgb_0;
-            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_drgb_1;
-            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_drgb_2;
-            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_dopacity;
-            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_duv_0;
-            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_duv_1;
-            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_dconic_0;
-            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_dconic_1;
-            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_dconic_2;
-            TV_SHARED_MEMORY tv::array_nd<uint8_t, {block_reduce_cache_length}, {block_size // 32}> shared_valid_tile;
-            TV_SHARED_MEMORY tv::array_nd<int, {block_size // 32}> shared_num_contributor;
-            """)
 
         code_rasterize.raw(f"""
         bool inside = pixel_idx_xy[0] < $width && pixel_idx_xy[1] < $height;
@@ -1444,13 +1454,15 @@ class GaussianSplatOp:
         """)
         if batch_size == 1:
             code_rasterize.raw(f"""
-            auto range = op::reinterpret_cast_array_nd<2>($workload_ranges)[tile_idx_xy[1] * $tile_num_x + tile_idx_xy[0]];
+            int tile_index = tile_idx_xy[1] * $tile_num_x + tile_idx_xy[0];
+            auto range = op::reinterpret_cast_array_nd<2>($workload_ranges)[tile_index];
             uint32_t pixel_id_no_batch = pixel_id;
             """)
         else:
             code_rasterize.raw(f"""
             uint32_t pixel_id_no_batch = $width * pixel_idx_xy[1] + pixel_idx_xy[0];
-            auto range = op::reinterpret_cast_array_nd<2>($workload_ranges)[batch_idx * $tile_num_x * $tile_num_y + tile_idx_xy[1] * $tile_num_x + tile_idx_xy[0]];
+            int tile_index = batch_idx * $tile_num_x * $tile_num_y + tile_idx_xy[1] * $tile_num_x + tile_idx_xy[0];
+            auto range = op::reinterpret_cast_array_nd<2>($workload_ranges)[tile_index];
             """)
         if not is_bwd:
             code_rasterize.raw(f"""
@@ -1462,6 +1474,20 @@ class GaussianSplatOp:
             if has_custom_feat:
                 code_rasterize.raw(f"""
                 tv::array<float, {num_custom_feat}> custom_feat_accum{{}};
+                """)
+            if is_per_gaussian_algo:
+                code_rasterize.raw(f"""
+                int num_buckets = tv::div_up(toDo, {self._cfg.per_gaussian_bucket_size});
+                int bucket_offset = tile_index == 0 ? 0 : $bucket_cumsum[tile_index - 1];
+                int bucket_index = bucket_offset;
+
+                if (thread_rank == 0){{
+                    for (int j = 0; j < num_buckets; ++j){{
+                        $bucket_to_tile_idx[bucket_offset + j] = tile_index;
+                    }}
+                }}
+                int warp_idx = thread_rank / 32;
+                int lane_idx = tv::parallel::lane_index();
                 """)
         else:
             code_rasterize.raw(f"""
@@ -1475,14 +1501,6 @@ class GaussianSplatOp:
                 int max_num_contributor = tv::parallel::warp_max(contributor);
                 max_num_contributor = tv::parallel::warp_broadcast(max_num_contributor, 0);
                 """)
-                if bwd_reduce_method == "block":
-                    code_rasterize.raw(f"""
-                    if (lane_idx == 0){{
-                        shared_num_contributor[warp_idx] = max_num_contributor;
-                    }}
-                    tv::parallel::block_sync_shared_io();
-                    max_num_contributor = shared_num_contributor.op<op::reduce_max>();
-                    """)
             else:
                 code_rasterize.raw(f"""
                 int max_num_contributor = contributor;
@@ -1625,6 +1643,24 @@ class GaussianSplatOp:
                 #     code_rasterize.raw(f"""
                 #     ++contributor;
                 #     """)
+                if is_per_gaussian_algo:
+                    with code_rasterize.if_(f"j % {self._cfg.per_gaussian_bucket_size} == 0"):
+                        if render_depth:
+                            code_rasterize.raw(f"""
+                            $depth_snap[bucket_index * {block_size} + thread_rank] = depth_accum;
+                            """)
+                        if num_channels > 0:
+                            code_rasterize.raw(f"""
+                            op::reinterpret_cast_array_nd<{num_channels}>($color_snap)[bucket_index * {block_size} + thread_rank] = rgb;
+                            """)
+                        if custom_features is not None:
+                            code_rasterize.raw(f"""
+                            op::reinterpret_cast_array_nd<{num_custom_feat}>($custom_feat_snap)[bucket_index * {block_size} + thread_rank] = custom_feat_accum;
+                            """)
+                        code_rasterize.raw(f"""
+                        $T_snap[bucket_index * {block_size} + thread_rank] = T;
+                        ++bucket_index;
+                        """)
                 code_rasterize.raw(f"""
                 auto uv = collected_xy[j];
                 auto conic_opacity_vec = collected_conic_opacity[j];
@@ -1649,18 +1685,6 @@ class GaussianSplatOp:
                             continue;
                         }}
                         """)
-                    elif bwd_reduce_method == "block":
-                        code_rasterize.raw(f"""
-                        bool warp_valid = tv::parallel::warp_any(valid);
-                        bool time_to_block_reduce = (j + 1) % {block_reduce_cache_length} == 0 || j == std::min({block_size}, toDo) - 1;
-                        if (lane_idx == 0){{
-                            shared_valid_tile[j % {block_reduce_cache_length}][warp_idx] = warp_valid;
-                        }}
-                        if (!warp_valid && !time_to_block_reduce){{
-                            continue;
-                        }}
-                        """)
-
                 else:
                     if is_bwd:
                         code_rasterize.raw(f"""
@@ -1899,56 +1923,33 @@ class GaussianSplatOp:
                 if is_bwd:
 
                     reduce_if_ctx = nullcontext()
-                    wsum_if_ctx = nullcontext()
 
-                    if bwd_reduce_method == "warp":
+                    if bwd_reduce_method == "warp" and self._cfg.backward_reduction_balanced_factor <= 0:
                         reduce_if_ctx = code_rasterize.if_("lane_idx == 0")
-                    elif bwd_reduce_method == "block":
-                        wsum_if_ctx = code_rasterize.if_("warp_valid")
-                        # reduce_if_ctx = code_rasterize.if_("thread_rank == 0")
-                        reduce_if_ctx = code_rasterize.if_(f"((j + 1) % {block_reduce_cache_length} == 0 || j == std::min({block_size}, toDo) - 1)")
-                    if use_bwd_reduce:
-                        with wsum_if_ctx:
-                            if not self._cfg.disable_builtin_rgb:
-                                code_rasterize.raw(f"""
-                                dL_drgb[0] = tv::parallel::warp_sum(dL_drgb[0]);
-                                dL_drgb[1] = tv::parallel::warp_sum(dL_drgb[1]);
-                                dL_drgb[2] = tv::parallel::warp_sum(dL_drgb[2]);
-                                """)
+                    if use_bwd_reduce and self._cfg.backward_reduction_balanced_factor <= 0:
+                        if not self._cfg.disable_builtin_rgb:
                             code_rasterize.raw(f"""
-                            dL_duv[0] = tv::parallel::warp_sum(dL_duv[0]);
-                            dL_duv[1] = tv::parallel::warp_sum(dL_duv[1]);
-
-                            dL_dcov2d[0] = tv::parallel::warp_sum(dL_dcov2d[0]);
-                            dL_dcov2d[1] = tv::parallel::warp_sum(dL_dcov2d[1]);
-                            dL_dcov2d[2] = tv::parallel::warp_sum(dL_dcov2d[2]);
-
-                            dL_dopacity = tv::parallel::warp_sum(dL_dopacity);
+                            dL_drgb[0] = tv::parallel::warp_sum(dL_drgb[0]);
+                            dL_drgb[1] = tv::parallel::warp_sum(dL_drgb[1]);
+                            dL_drgb[2] = tv::parallel::warp_sum(dL_drgb[2]);
                             """)
-                            if has_custom_feat:
-                                code_rasterize.raw(f"""
-                                dL_dcustom_feat = op::apply(tv::parallel::warp_sum<float>, dL_dcustom_feat);
-                                """)
-                            if render_depth:
-                                code_rasterize.raw(f"""
-                                dL_dz = tv::parallel::warp_sum(dL_dz);
-                                """)
-                        if self._cfg.backward_reduction == "block":
-                            code_rasterize.raw(f"""
-                            
-                            if (lane_idx == 0){{
-                                shared_valid_tile[j % {block_reduce_cache_length}][warp_idx] = warp_valid;
-                                    shared_dL_drgb_0[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_drgb[0] : 0;
-                                    shared_dL_drgb_1[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_drgb[1] : 0;
-                                    shared_dL_drgb_2[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_drgb[2] : 0;
-                                    shared_dL_duv_0[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_duv[0] : 0;
-                                    shared_dL_duv_1[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_duv[1] : 0;
-                                    shared_dL_dconic_0[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_dcov2d[0] : 0;
-                                    shared_dL_dconic_1[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_dcov2d[1] : 0;
-                                    shared_dL_dconic_2[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_dcov2d[2] : 0;
-                                    shared_dL_dopacity[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_dopacity : 0;
+                        code_rasterize.raw(f"""
+                        dL_duv[0] = tv::parallel::warp_sum(dL_duv[0]);
+                        dL_duv[1] = tv::parallel::warp_sum(dL_duv[1]);
 
-                            }}
+                        dL_dcov2d[0] = tv::parallel::warp_sum(dL_dcov2d[0]);
+                        dL_dcov2d[1] = tv::parallel::warp_sum(dL_dcov2d[1]);
+                        dL_dcov2d[2] = tv::parallel::warp_sum(dL_dcov2d[2]);
+
+                        dL_dopacity = tv::parallel::warp_sum(dL_dopacity);
+                        """)
+                        if has_custom_feat:
+                            code_rasterize.raw(f"""
+                            dL_dcustom_feat = op::apply(tv::parallel::warp_sum<float>, dL_dcustom_feat);
+                            """)
+                        if render_depth:
+                            code_rasterize.raw(f"""
+                            dL_dz = tv::parallel::warp_sum(dL_dz);
                             """)
                     with reduce_if_ctx:
                         if not gaussian_id_inited:
@@ -1960,64 +1961,127 @@ class GaussianSplatOp:
                                 code_rasterize.raw(f"""
                                 assert(gaussian_id >= 0 && gaussian_id < $num);
                                 """)
-                        if self._cfg.backward_reduction == "block":
+                        if self._cfg.backward_reduction_balanced_factor > 0:
+                            assert self._cfg.backward_reduction_balanced_factor < 32
                             code_rasterize.raw(f"""
-                            tv::parallel::block_sync_shared_io();
+                            int all_same;
+                            tv::parallel::match_all_sync(gaussian_id, &all_same);
+                            auto mask = tv::parallel::ballot_sync(valid);
+                            auto same_ct = tv::parallel::popcount(mask);
+
                             """)
-                            with code_rasterize.if_("thread_rank == 0"):
-                                with code_rasterize.for_(f"int k = 0; k < j % {block_reduce_cache_length} + 1; ++k"):
+                            with code_rasterize.if_(f"all_same && same_ct >= {self._cfg.backward_reduction_balanced_factor}"):
+                                if not self._cfg.disable_builtin_rgb:
                                     code_rasterize.raw(f"""
-                                    auto collected_idx_cache = j / {block_reduce_cache_length} * {block_reduce_cache_length} + k;
-                                    auto gaussian_id_cache = collected_id[collected_idx_cache];
-                                    auto valid_warp_arr = shared_valid_tile[k];
-                                    auto valid_warp = valid_warp_arr.op<op::sum>();
+                                    dL_drgb[0] = tv::parallel::warp_sum(dL_drgb[0]);
+                                    dL_drgb[1] = tv::parallel::warp_sum(dL_drgb[1]);
+                                    dL_drgb[2] = tv::parallel::warp_sum(dL_drgb[2]);
                                     """)
-                                    with code_rasterize.if_("valid_warp > 0"):
-                                        code_rasterize.raw(f"""
-                                        dL_drgb = {{}};
-                                        dL_duv = {{}};
-                                        dL_dcov2d = {{}};
-                                        dL_dopacity = 0.0f;
-                                        TV_PRAGMA_UNROLL
-                                        for (int l = 0; l < {num_warp}; ++l){{
-                                            bool valid_warp_val = valid_warp_arr[l];
-                                            dL_drgb[0] += valid_warp_val ? shared_dL_drgb_0[k][l] : 0;
-                                            dL_drgb[1] += valid_warp_val ? shared_dL_drgb_1[k][l] : 0;
-                                            dL_drgb[2] += valid_warp_val ? shared_dL_drgb_2[k][l] : 0;
-                                            dL_duv[0] += valid_warp_val ? shared_dL_duv_0[k][l] : 0;
-                                            dL_duv[1] += valid_warp_val ? shared_dL_duv_1[k][l] : 0;
-                                            dL_dcov2d[0] += valid_warp_val ? shared_dL_dconic_0[k][l] : 0;
-                                            dL_dcov2d[1] += valid_warp_val ? shared_dL_dconic_1[k][l] : 0;
-                                            dL_dcov2d[2] += valid_warp_val ? shared_dL_dconic_2[k][l] : 0;
-                                            dL_dopacity += valid_warp_val ? shared_dL_dopacity[k][l] : 0;
-                                        }}
-
-                                        tv::parallel::atomicAdd($dcolor + gaussian_id_cache * 3 + 0, dL_drgb[0]);
-                                        tv::parallel::atomicAdd($dcolor + gaussian_id_cache * 3 + 1, dL_drgb[1]);
-                                        tv::parallel::atomicAdd($dcolor + gaussian_id_cache * 3 + 2, dL_drgb[2]);
-                                        tv::parallel::atomicAdd($duv + gaussian_id_cache * 2 + 0, dL_duv[0]);
-                                        tv::parallel::atomicAdd($duv + gaussian_id_cache * 2 + 1, dL_duv[1]);
-
-                                        tv::parallel::atomicAdd($dconic + gaussian_id_cache * 3 + 0, dL_dcov2d[0]);
-                                        tv::parallel::atomicAdd($dconic + gaussian_id_cache * 3 + 1, dL_dcov2d[1]);
-                                        tv::parallel::atomicAdd($dconic + gaussian_id_cache * 3 + 2, dL_dcov2d[2]);
-                                        tv::parallel::atomicAdd($dopacity + gaussian_id_cache, dL_dopacity);
-
-                                        """)
-                                        if self._cfg.measure_atomic_add_count:
-                                            code_rasterize.raw(f"""
-                                            tv::parallel::atomicAdd($atomic_add_count, 1);
-                                            """)
                                 code_rasterize.raw(f"""
-                                shared_valid_tile = {{}};
+                                dL_duv[0] = tv::parallel::warp_sum(dL_duv[0]);
+                                dL_duv[1] = tv::parallel::warp_sum(dL_duv[1]);
+
+                                dL_dcov2d[0] = tv::parallel::warp_sum(dL_dcov2d[0]);
+                                dL_dcov2d[1] = tv::parallel::warp_sum(dL_dcov2d[1]);
+                                dL_dcov2d[2] = tv::parallel::warp_sum(dL_dcov2d[2]);
+
+                                dL_dopacity = tv::parallel::warp_sum(dL_dopacity);
+                                """)
+                                if has_custom_feat:
+                                    code_rasterize.raw(f"""
+                                    dL_dcustom_feat = op::apply(tv::parallel::warp_sum<float>, dL_dcustom_feat);
+                                    """)
+                                if render_depth:
+                                    code_rasterize.raw(f"""
+                                    dL_dz = tv::parallel::warp_sum(dL_dz);
+                                    """)
+                                with code_rasterize.if_("lane_idx == 0"):
+                                    if not self._cfg.disable_builtin_rgb:
+                                        code_rasterize.raw(f"""
+                                        tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 0, dL_drgb[0]);
+                                        tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 1, dL_drgb[1]);
+                                        tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 2, dL_drgb[2]);
+                                        """)
+                                    code_rasterize.raw(f"""
+                                    tv::parallel::atomicAdd($duv + gaussian_id * 2 + 0, dL_duv[0]);
+                                    tv::parallel::atomicAdd($duv + gaussian_id * 2 + 1, dL_duv[1]);
+
+                                    tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 0, dL_dcov2d[0]);
+                                    tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 1, dL_dcov2d[1]);
+                                    tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 2, dL_dcov2d[2]);
+
+                                    tv::parallel::atomicAdd($dopacity + gaussian_id, dL_dopacity);
+
+                                    """)
+                                    if has_custom_feat:
+                                        code_rasterize.raw(f"""
+                                        TV_PRAGMA_UNROLL
+                                        for (int j = 0; j < {num_custom_feat}; ++j){{
+                                            tv::parallel::atomicAdd($dcustom_features + gaussian_id * {num_custom_feat} + j, dL_dcustom_feat[j]);
+                                        }}
+                                        """)
+                                    if render_depth:
+                                        code_rasterize.raw(f"""
+                                        tv::parallel::atomicAdd($dz + gaussian_id, dL_dz);
+                                        """)
+
+                            with code_rasterize.else_if_("valid"):
+                                code_rasterize.raw(f"""
+                                tv::parallel::atomicAdd($duv + gaussian_id * 2 + 0, dL_duv[0]);
+                                tv::parallel::atomicAdd($duv + gaussian_id * 2 + 1, dL_duv[1]);
+
+                                tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 0, dL_dcov2d[0]);
+                                tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 1, dL_dcov2d[1]);
+                                tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 2, dL_dcov2d[2]);
+
+                                tv::parallel::atomicAdd($dopacity + gaussian_id, dL_dopacity);
+                                """)
+                                if render_depth:
+                                    code_rasterize.raw(f"""
+                                    tv::parallel::atomicAdd($dz + gaussian_id, dL_dz);
+                                    """)
+                                if has_custom_feat:
+                                    for j in range(num_custom_feat):
+                                        code_rasterize.raw(f"""
+                                        tv::parallel::atomicAdd($dcustom_features + gaussian_id * {num_custom_feat} + {j}, dL_dcustom_feat[{j}]);
+                                        """)
+                                if self._cfg.measure_atomic_add_count:
+                                    code_rasterize.raw(f"""
+                                    tv::parallel::atomicAdd($atomic_add_count, 1);
+                                    """)
+
+
+
+                            # atomic_add_func = f"tv::parallel::atomic_add_warp_sum_balanced<float, {self._cfg.backward_reduction_balanced_factor}>"
+                            # if not self._cfg.disable_builtin_rgb:
+                            #     code_rasterize.raw(f"""
+                            #     {atomic_add_func}($dcolor + gaussian_id * 3 + 0, dL_drgb[0], gaussian_id, valid);
+                            #     {atomic_add_func}($dcolor + gaussian_id * 3 + 1, dL_drgb[1], gaussian_id, valid);
+                            #     {atomic_add_func}($dcolor + gaussian_id * 3 + 2, dL_drgb[2], gaussian_id, valid);
+                            #     """)
+                            # code_rasterize.raw(f"""
+                            # {atomic_add_func}($duv + gaussian_id * 2 + 0, dL_duv[0], gaussian_id, valid);
+                            # {atomic_add_func}($duv + gaussian_id * 2 + 1, dL_duv[1], gaussian_id, valid);
+
+                            # {atomic_add_func}($dconic + gaussian_id * 3 + 0, dL_dcov2d[0], gaussian_id, valid);
+                            # {atomic_add_func}($dconic + gaussian_id * 3 + 1, dL_dcov2d[1], gaussian_id, valid);
+                            # {atomic_add_func}($dconic + gaussian_id * 3 + 2, dL_dcov2d[2], gaussian_id, valid);
+                            # {atomic_add_func}($dopacity + gaussian_id, dL_dopacity, gaussian_id, valid);
+                            # """)
+                            # if render_depth:
+                            #     code_rasterize.raw(f"""
+                            #     {atomic_add_func}($dz + gaussian_id, dL_dz, gaussian_id, valid);
+                            #     """)
+                            # if has_custom_feat:
+                            #     for j in range(num_custom_feat):
+                            #         code_rasterize.raw(f"""
+                            #         {atomic_add_func}($dcustom_features + gaussian_id * {num_custom_feat} + {j}, dL_dcustom_feat[{j}], gaussian_id, valid);
+                            #         """)
+                            if self._cfg.measure_atomic_add_count:
+                                code_rasterize.raw(f"""
+                                tv::parallel::atomicAdd($atomic_add_count, 1);
                                 """)
 
-                            code_rasterize.raw(f"""
-                            tv::parallel::block_sync_shared_io();
-                            """)
-
-                            if render_depth:
-                                raise NotImplementedError("not implemented yet")
                         else:
                             if not self._cfg.disable_builtin_rgb:
                                 code_rasterize.raw(f"""
@@ -2047,12 +2111,17 @@ class GaussianSplatOp:
                                 code_rasterize.raw(f"""
                                 tv::parallel::atomicAdd($atomic_add_count, 1);
                                 """)
-                    # if has_custom_feat:
-                    #     code_rasterize.raw(f"""
-                    #     for (int channel_idx = 0; channel_idx < {num_custom_feat}; ++channel_idx){{
-                    #         custom_feature[channel_idx] += weight * $custom_feat[gaussian_id * {num_custom_feat} + channel_idx];
-                    #     }}
-                    #     """)
+        if is_per_gaussian_algo and not is_bwd:
+            code_rasterize.raw(f"""
+            TV_SHARED_MEMORY tv::array_nd<int, {block_size // 32}> shared_num_contributor;
+            int max_num_contributor = tv::parallel::warp_max(inside ? contributor + 1 : 0);
+            if (lane_idx == 0){{
+                shared_num_contributor[warp_idx] = max_num_contributor;
+            }}
+            tv::parallel::block_sync_shared_io();
+            max_num_contributor = shared_num_contributor.op<op::reduce_max>();
+            $max_contributer_per_tile[tile_index] = max_num_contributor;
+            """)
         if not is_bwd:
             if not training:
                 if not self._cfg.disable_builtin_rgb:
@@ -2149,6 +2218,467 @@ class GaussianSplatOp:
         #     print(INLINER.get_nvrtc_kernel_attrs(kernel_unique_name))
         return grad_out
 
+
+    def rasterize_backward_per_gaussian(self,
+                                   model: GaussianModelOriginBase,
+                                   ctx: GaussianSplatOpContext,
+                                   out: GaussianSplatOutput,
+                                   grad: GaussianSplatGradients,
+                                   training: bool = False,
+                                   render_depth: bool = False,
+                                   custom_features: torch.Tensor | None = None):
+        """if grad is not None, run backward mode, otherwise run forward mode.
+        rasterize backward share many code with forward, so we use a single function to handle both.
+        """
+        num = model.xyz.shape[0]
+        is_bwd = grad is not None
+        image_shape_wh = ctx.image_shape_wh
+        block_size = self._cfg.block_size
+        width = image_shape_wh[0]
+        height = image_shape_wh[1]
+
+        depths = ctx.depths
+
+        tile_num_x = div_up(width, self._cfg.tile_size[0])
+        tile_num_y = div_up(height, self._cfg.tile_size[1])
+        workload_ranges = ctx.workload_ranges
+        conic_opacity_tv = torch_tensor_to_tv(ctx.conic_opacity, to_const=True)
+        uvs_tv = torch_tensor_to_tv(ctx.uvs, to_const=True)
+        gaussian_idx_sorted_tv = torch_tensor_to_tv(ctx.gaussian_idx_sorted,
+                                                    to_const=True)
+        rgb_gaussian_tv = None 
+        if ctx.rgb_gaussian is not None:
+            rgb_gaussian_tv = torch_tensor_to_tv(ctx.rgb_gaussian, to_const=True)
+        final_custom_feat = out.custom_features
+        # assume nhwc
+        num_custom_feat = 0 if final_custom_feat is None else final_custom_feat.shape[
+            1 if self._cfg.use_nchw else -1]
+        has_custom_feat = num_custom_feat > 0
+
+        final_T = out.T
+        final_color = out.color
+        final_n_contrib = out.n_contrib
+        batch_size = final_color.shape[0]
+        # assert final_T.numel() == width * height
+        # assert final_color.numel() == width * height * 3
+
+        assert final_n_contrib is not None
+        assert not self._cfg.use_nchw
+        final_depth = out.depth
+        if render_depth:
+            assert final_depth is not None
+
+        grad_out: RasterizeGradientOutput | None = None
+        color_use_smem = is_bwd  # TODO why bwd use smem for color?
+        custom_feat_use_smem = num_custom_feat <= 16
+        if grad is not None:
+            drgb = grad.drgb
+            assert drgb.is_contiguous(), "drgb must be contiguous"
+            dT = grad.dT
+            ddepth_th = grad.ddepth
+            # assert drgb.numel() == width * height * 3
+            # assert dT.numel() == width * height
+        duv = torch.zeros([batch_size * num, 2],
+                            dtype=torch.float32,
+                            device=final_T.device)
+        dconic = torch.zeros([batch_size * num, 3],
+                                dtype=torch.float32,
+                                device=final_T.device)
+        dopacity = torch.zeros([batch_size * num],
+                                dtype=torch.float32,
+                                device=final_T.device)
+        dcolor = None 
+        if not self._cfg.disable_builtin_rgb:
+            dcolor = torch.zeros([batch_size * num, 3],
+                                dtype=torch.float32,
+                                device=final_T.device)
+        dcustom_features = None 
+        if num_custom_feat > 0:
+            dcustom_features = torch.zeros([batch_size * num, num_custom_feat],
+                                        dtype=torch.float32,
+                                        device=final_T.device)
+        dz = None
+        if render_depth:
+            dz = torch.zeros([batch_size * num],
+                                dtype=torch.float32,
+                                device=final_T.device)
+        grad_out = RasterizeGradientOutput(
+            duv=duv,
+            dconic=dconic,
+            dopacity=dopacity,
+            dcolor=dcolor,
+            dcustom_features=dcustom_features,
+            dz=dz)
+
+        assert ctx.per_gaussian_snap is not None
+        snap = ctx.per_gaussian_snap
+        custom_feat_snap = snap.custom_features
+        T_snap = snap.T
+        color_snap = snap.color
+        depth_snap = snap.depth
+        bucket_cumsum = snap.bucket_cumsum
+        bucket_to_tile_idx = snap.bucket_to_tile_idx
+        max_contributer_per_tile = snap.max_contributer_per_tile
+        # breakpoint()
+        t_dtype = "double" if self._cfg.transmittance_is_double else "float"
+        kernel_unique_name = (
+            f"rasterize_bwd_per_gaussian_{self._cfg.tile_size}"
+            f"_{num_custom_feat}_{self._cfg.render_depth}_{self._cfg.render_inv_depth}"
+            f"_{self._cfg.render_rgba}_{batch_size == 1}"
+            f"_{final_n_contrib is None}")
+        num_channels = self._cfg.num_channels
+        render_rgba = self._cfg.render_rgba
+        atomic_add_count = None 
+        if is_bwd and self._cfg.measure_atomic_add_count:
+            atomic_add_count = torch.zeros([1], dtype=torch.int32, device=final_T.device)
+        per_gaussian_block_size = self._cfg.per_gaussian_bucket_size * 8
+        # breakpoint()
+        num_warp = per_gaussian_block_size // self._cfg.per_gaussian_bucket_size
+
+        if kernel_unique_name in self._code_obj_caches:
+            code_rasterize = self._code_obj_caches[kernel_unique_name]
+            with measure_and_print_torch(
+                    f"BWD-rasterize-per-gaussian-{gaussian_idx_sorted_tv.shape[0]}",
+                    enable=self._cfg.verbose):
+                self._inliner.kernel_1d(kernel_unique_name, T_snap.shape[0] // block_size * self._cfg.per_gaussian_bucket_size, 0,
+                                        code_rasterize, num_1d_threads=per_gaussian_block_size)
+            if atomic_add_count is not None:
+                print(f"atomic add count: {atomic_add_count.item()}")
+
+            return grad_out
+        code_rasterize = pccm.code()
+        if IsAppleSiliconMacOs:
+            code_rasterize.raw(f"""
+            uint thread_rank = threadPositionInThreadgroup.x;
+            """)
+        else:
+            code_rasterize.raw(f"""
+            uint32_t thread_rank = threadIdx.x;
+            """)
+        lane_matrix_shape = self._cfg.warp_size
+        num_lane_matrix_shape = (self._cfg.tile_size[0] // lane_matrix_shape[0], self._cfg.tile_size[1] // lane_matrix_shape[1])
+        assert self._cfg.tile_size[0] % lane_matrix_shape[0] == 0
+        assert self._cfg.tile_size[1] % lane_matrix_shape[1] == 0
+        use_smem: bool = False
+        code_rasterize.raw(f"""
+        namespace op = tv::arrayops;
+        using math_op_t = tv::arrayops::MathScalarOp<float>;
+        int bucket_idx = i / {self._cfg.per_gaussian_bucket_size};
+        int lane_idx = tv::parallel::lane_index();
+        int warp_idx = thread_rank / 32;
+
+        int tile_index = $bucket_to_tile_idx[bucket_idx];
+        int bucket_offset = tile_index == 0 ? 0 : $bucket_cumsum[tile_index - 1];
+        int bucket_idx_in_tile = bucket_idx - bucket_offset;
+        int max_contributer_per_tile_val = $max_contributer_per_tile[tile_index];
+        if (bucket_idx_in_tile * {self._cfg.per_gaussian_bucket_size} >= max_contributer_per_tile_val){{
+            return;
+        }}
+
+        auto range = op::reinterpret_cast_array_nd<2>($workload_ranges)[tile_index];
+        int local_gaussian_idx = bucket_idx_in_tile * {self._cfg.per_gaussian_bucket_size} + lane_idx;
+        bool is_valid_gaussian = local_gaussian_idx < range[1] - range[0];
+        int batch_idx = tile_index / ($tile_num_x * $tile_num_y);
+        auto local_tile_idx = tile_index % ($tile_num_x * $tile_num_y);
+        tv::array<uint32_t, 2> tile_idx_xy{{local_tile_idx % $tile_num_x, local_tile_idx / $tile_num_x}};
+
+        tv::array<uint32_t, 2> pixel_idx_base{{tile_idx_xy[0] * {self._cfg.tile_size[0]}, 
+                                                tile_idx_xy[1] * {self._cfg.tile_size[1]}}};
+
+        int gaussian_id = is_valid_gaussian ? $gaussian_idx_sorted_tv[local_gaussian_idx + range[0]] : -1;
+        auto uv = is_valid_gaussian ? op::reinterpret_cast_array_nd<2>($uvs_tv)[gaussian_id] : tv::array<float, 2>{{}};
+        auto conic_opacity_vec = is_valid_gaussian ? op::reinterpret_cast_array_nd<4>($conic_opacity_tv)[gaussian_id] : tv::array<float, 4>{{}};
+        auto rgb_gaussian = is_valid_gaussian ? op::reinterpret_cast_array_nd<3>($rgb_gaussian_tv)[gaussian_id] : tv::array<float, 3>{{}};
+        """)
+        if render_depth:
+            code_rasterize.raw(f"""
+            float depth_val = is_valid_gaussian ? $depths[gaussian_id] : 0.0f;
+            """)
+        if num_custom_feat > 0:
+            code_rasterize.raw(f"""
+            auto custom_feat_val = op::reinterpret_cast_array_nd<{num_custom_feat}>($custom_features)[gaussian_id];
+            """)
+        if not self._cfg.disable_builtin_rgb:
+            code_rasterize.raw(f"""
+            tv::array<float, 3> dL_drgb{{}};
+            """)
+        if num_custom_feat > 0:
+            code_rasterize.raw(f"""
+            tv::array<float, {num_custom_feat}> dL_dcustom_feat{{}};
+            """)
+        code_rasterize.raw(f"""
+        tv::array<float, 2> dL_duv{{}};
+        tv::array<float, 3> dL_dcov2d{{}};
+        float dL_dopacity = 0.0f;
+        float dL_dz = 0.0f;
+        
+        uint32_t contributor;
+
+        {t_dtype} T, dT_val, render_T;
+        tv::array<float, {num_channels}> render_rgb, drgb_array;
+        """)
+        if use_smem:
+            code_rasterize.raw(f"""
+            TV_SHARED_MEMORY tv::array_nd<float, {block_size * num_warp}> shared_dT_val;
+            TV_SHARED_MEMORY tv::array_nd<float, {block_size * num_warp}> shared_render_T_val;
+
+            TV_SHARED_MEMORY tv::array_nd<float, {block_size * num_warp}, {num_channels}> shared_drgb_array;
+            TV_SHARED_MEMORY tv::array_nd<int, {block_size * num_warp}> shared_contributor;
+            """)
+        if render_depth:
+            code_rasterize.raw(f"""
+            float render_depth, ddepth;
+            /// TV_SHARED_MEMORY tv::array<float, {block_size * num_warp}> shared_ddepth;
+
+            """)
+        if num_custom_feat > 0:
+            code_rasterize.raw(f"""
+            tv::array<float, {num_custom_feat}> render_custom_feat, dcustom_feat;
+            """)
+        if use_smem:
+            with code_rasterize.for_(f"int j = 0; j < {block_size // 32}; ++j", prefix="TV_PRAGMA_UNROLL"):
+                code_rasterize.raw(f"""
+                int local_index = j * 32 + lane_idx;
+
+                int warp_idx_tmp = local_index / 32;
+                int warp_x = warp_idx_tmp % {num_lane_matrix_shape[0]};
+                int warp_y = warp_idx_tmp / {num_lane_matrix_shape[0]};
+                int lane_idx_tmp = local_index % 32;
+                int lane_x = lane_idx_tmp % {lane_matrix_shape[0]};
+                int lane_y = lane_idx_tmp / {lane_matrix_shape[0]};
+
+                tv::array<int, 2> local_pixel_idx_xy{{warp_x * {lane_matrix_shape[0]} + lane_x, warp_y * {lane_matrix_shape[1]} + lane_y}};
+
+                // tv::array<int, 2> local_pixel_idx_xy{{local_index % {self._cfg.tile_size[0]}, local_index / {self._cfg.tile_size[0]} }};
+                auto pixel_idx_xy = local_pixel_idx_xy + pixel_idx_base;
+                auto pixel_id = batch_idx * ($width * $height) + pixel_idx_xy[1] * $width + pixel_idx_xy[0];
+                bool inside = pixel_idx_xy[0] < $width && pixel_idx_xy[1] < $height;
+                if (inside){{
+                    shared_dT_val[warp_idx * {block_size} + local_index] = $dT[pixel_id];
+                    shared_render_T_val[warp_idx * {block_size} + local_index] = $final_T[pixel_id];
+                    shared_drgb_array[warp_idx * {block_size} + local_index] = op::reinterpret_cast_array_nd<{num_channels}>($drgb)[pixel_id];
+                    shared_contributor[warp_idx * {block_size} + local_index] = $final_n_contrib[pixel_id] + 1;
+                }}
+                """)
+        with code_rasterize.for_(f"int j = 0; j < {self._cfg.block_size} + {self._cfg.per_gaussian_bucket_size} - 1; ++j"):
+            code_rasterize.raw(f"""
+            // load from previous lane
+            T = tv::parallel::shfl_up(T, 1);
+            render_T = tv::parallel::shfl_up(render_T, 1);
+            dT_val = tv::parallel::shfl_up(dT_val, 1);
+            render_rgb = op::apply(tv::parallel::shfl_up<float>, render_rgb, 1);
+            drgb_array = op::apply(tv::parallel::shfl_up<float>, drgb_array, 1);
+            contributor = tv::parallel::shfl_up(contributor, 1u);
+            """)
+            if render_depth:
+                code_rasterize.raw(f"""
+                render_depth = tv::parallel::shfl_up(render_depth, 1);
+                ddepth = tv::parallel::shfl_up(ddepth, 1);
+                """)
+            if num_custom_feat > 0:
+                code_rasterize.raw(f"""
+                render_custom_feat = op::apply(tv::parallel::shfl_up<float>, render_custom_feat, 1);
+                dcustom_feat = op::apply(tv::parallel::shfl_up<float>, dcustom_feat, 1);
+                """)
+            code_rasterize.raw(f"""
+            int idx = j - lane_idx;
+
+            int warp_idx_tmp = idx / 32;
+            int warp_x = warp_idx_tmp % {num_lane_matrix_shape[0]};
+            int warp_y = warp_idx_tmp / {num_lane_matrix_shape[0]};
+            int lane_idx_tmp = idx % 32;
+            int lane_x = lane_idx_tmp % {lane_matrix_shape[0]};
+            int lane_y = lane_idx_tmp / {lane_matrix_shape[0]};
+
+            tv::array<int, 2> local_pixel_idx_xy{{warp_x * {lane_matrix_shape[0]} + lane_x, warp_y * {lane_matrix_shape[1]} + lane_y}};
+            auto pixel_idx_xy = local_pixel_idx_xy + pixel_idx_base;
+            auto pixel_id = batch_idx * ($width * $height) + pixel_idx_xy[1] * $width + pixel_idx_xy[0];
+            auto pixel_idx_xy_fp = pixel_idx_xy.cast<float>();
+            bool inside = pixel_idx_xy[0] < $width && pixel_idx_xy[1] < $height;
+            bool lane_valid = idx >= 0 && idx < {block_size};
+            """)
+            with code_rasterize.if_(f"(inside && is_valid_gaussian && lane_idx == 0 && idx < {block_size})"):
+                code_rasterize.raw(f"""
+                int local_id_in_tile = bucket_idx * {block_size} + idx;
+                // load from global memory
+                render_rgb = op::reinterpret_cast_array_nd<{num_channels}>($final_color)[pixel_id] - op::reinterpret_cast_array_nd<{num_channels}>($color_snap)[local_id_in_tile];
+                render_T = $final_T[pixel_id];
+                dT_val = $dT[pixel_id];
+                drgb_array = op::reinterpret_cast_array_nd<{num_channels}>($drgb)[pixel_id];
+                T = $T_snap[local_id_in_tile];
+                contributor = $final_n_contrib[pixel_id] + 1;
+                """)
+                if render_depth:
+                    code_rasterize.raw(f"""
+                    render_depth = $final_depth[pixel_id] - $depth_snap[local_id_in_tile];
+                    ddepth = $ddepth[pixel_id];
+                    """)
+                if num_custom_feat > 0:
+                    code_rasterize.raw(f"""
+                    render_custom_feat = op::reinterpret_cast_array_nd<{num_custom_feat}>($final_custom_feat)[pixel_id] - op::reinterpret_cast_array_nd<{num_custom_feat}>($custom_feat_snap)[local_id_in_tile];
+                    dcustom_feat = op::reinterpret_cast_array_nd<{num_custom_feat}>($dcustom_features)[pixel_id];
+                    """)
+            with code_rasterize.if_(f"inside && is_valid_gaussian && lane_valid "):
+                code_rasterize.raw(f"""
+                // contributor = shared_contributor[warp_idx * {block_size} + idx];
+                if (local_gaussian_idx >= contributor){{
+                    continue;
+                }}
+                // drgb_array = shared_drgb_array[warp_idx * {block_size} + idx];
+                // dT_val = shared_dT_val[warp_idx * {block_size} + idx];
+                // render_T = shared_render_T_val[warp_idx * {block_size} + idx];
+                tv::array<float, 2> dist{{uv[0] - pixel_idx_xy_fp[0], uv[1] - pixel_idx_xy_fp[1]}};
+                float power = (-0.5f * (conic_opacity_vec[0] * dist[0] * dist[0] + 
+                                       conic_opacity_vec[2] * dist[1] * dist[1]) - 
+                                        conic_opacity_vec[1] * dist[0] * dist[1]);
+                if (power > 0.0f) {{
+                    continue;
+                }}
+
+                float G = math_op_t::fast_exp(power);
+                float alpha = math_op_t::min(0.99f, conic_opacity_vec[3] * G);
+                if (alpha < {self._cfg.alpha_eps}f){{
+                    continue;
+                }}
+                {t_dtype} next_T = T * {t_dtype}(1.0f - alpha);
+
+                float weight = alpha * T;
+                T = next_T;
+
+                """)
+                if not self._cfg.disable_builtin_rgb:
+                    if render_rgba:
+                        code_rasterize.raw(f"""
+                        render_rgb[0] -= weight * rgb_gaussian[0];
+                        render_rgb[1] -= weight * rgb_gaussian[1];
+                        render_rgb[2] -= weight * rgb_gaussian[2];
+                        render_rgb[3] -= weight;
+                        """)
+                    else:
+                        code_rasterize.raw(f"""
+                        render_rgb -= weight * rgb_gaussian;
+                        """)
+                else:
+                    if render_rgba:
+                        code_rasterize.raw(f"""
+                        render_rgb -= weight;
+                        """)
+                if render_depth:
+                    code_rasterize.raw(f"""
+                    render_depth -= weight * depth_val;
+                    """)
+                if has_custom_feat:
+                    code_rasterize.raw(f"""
+                    render_custom_feat -= weight * custom_feat_val;
+                    """)
+                if not self._cfg.disable_builtin_rgb:
+                    if render_rgba:
+                        code_rasterize.raw(f"""
+                        float dL_dalpha_without_div = (drgb_array.op<op::dot>(T * op::concat(rgb_gaussian, tv::array<float, 1>{{1.0f}}) - render_rgb));
+                        // grad from T, we don't apply background when training, apply it in torch side.
+                        dL_dalpha_without_div += -dT_val * render_T;
+                        """)
+                    else:
+                        code_rasterize.raw(f"""
+                        float dL_dalpha_without_div = (drgb_array.op<op::dot>(T * rgb_gaussian - render_rgb));
+                        dL_dalpha_without_div += -dT_val * render_T;
+                        """)
+                else:
+                    if render_rgba:
+                        code_rasterize.raw(f"""
+                        float dL_dalpha_without_div = (drgb_array.op<op::dot>(T - render_rgb));
+                        dL_dalpha_without_div += -dT_val * render_T;
+                        """)
+                    else:
+                        code_rasterize.raw(f"""
+                        float dL_dalpha_without_div = -dT_val * render_T;
+                        """)
+
+                if render_depth:
+                    code_rasterize.raw(f"""
+                    dL_dalpha_without_div += ddepth * (T * depth_val - render_depth);
+                    """)
+                if has_custom_feat:
+                    code_rasterize.raw(f"""
+                    dL_dalpha_without_div += (dcustom_feat.op<op::dot>(T * custom_feat_val - render_custom_feat));
+                    """)
+                code_rasterize.raw(f"""
+                auto dL_dalpha = dL_dalpha_without_div / (1.0f - alpha);
+                """)
+                if not self._cfg.disable_builtin_rgb:
+                    code_rasterize.raw(f"""
+                    dL_drgb += weight * {"op::slice<0, 3>(drgb_array)" if render_rgba else "drgb_array"};
+                    """)
+                if render_depth:
+                    # WARNING this is actually dL/dz_inv if render_inv_depth is True.
+                    code_rasterize.raw(f"""
+                    dL_dz += weight * ddepth;
+                    """)
+                if has_custom_feat:
+                    code_rasterize.raw(f"""
+                    dL_dcustom_feat += weight * dcustom_feat;
+                    """)
+                code_rasterize.raw(f"""
+                const float dL_dG = conic_opacity_vec[3] * dL_dalpha;
+
+                const float gdx = G * dist[0];
+                const float gdy = G * dist[1];
+                const float dG_du = -gdx * conic_opacity_vec[0] - gdy * conic_opacity_vec[1];
+                const float dG_dv = -gdy * conic_opacity_vec[2] - gdx * conic_opacity_vec[1];
+                dL_duv += tv::array<float, 2>{{
+                    dL_dG * dG_du,
+                    dL_dG * dG_dv
+                }};
+                dL_dcov2d += tv::array<float, 3>{{
+                    -0.5f * gdx * dist[0] * dL_dG,
+                    -gdx * dist[1] * dL_dG,
+                    -0.5f * gdy * dist[1] * dL_dG,
+                }};
+                dL_dopacity += dL_dalpha * G;
+                """)
+        with code_rasterize.if_("is_valid_gaussian"):
+            code_rasterize.raw(f"""
+            tv::parallel::atomicAdd($duv + gaussian_id * 2 + 0, dL_duv[0]);
+            tv::parallel::atomicAdd($duv + gaussian_id * 2 + 1, dL_duv[1]);
+
+            tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 0, dL_dcov2d[0]);
+            tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 1, dL_dcov2d[1]);
+            tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 2, dL_dcov2d[2]);
+
+            tv::parallel::atomicAdd($dopacity + gaussian_id, dL_dopacity);
+            """)
+            if not self._cfg.disable_builtin_rgb:
+                code_rasterize.raw(f"""
+                tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 0, dL_drgb[0]);
+                tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 1, dL_drgb[1]);
+                tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 2, dL_drgb[2]);
+                """)
+            if render_depth:
+                code_rasterize.raw(f"""
+                tv::parallel::atomicAdd($dz + gaussian_id, dL_dz);
+                """)
+            if has_custom_feat:
+                for j in range(num_custom_feat):
+                    code_rasterize.raw(f"""
+                    tv::parallel::atomicAdd($dcustom_features + gaussian_id * {num_custom_feat} + {j}, dL_dcustom_feat[{j}]);
+                    """)
+
+
+        self._code_obj_caches[kernel_unique_name] = code_rasterize
+        with measure_and_print_torch(
+                f"BWD-rasterize-per-gaussian-{gaussian_idx_sorted_tv.shape[0]}",
+                enable=self._cfg.verbose):
+            self._inliner.kernel_1d(kernel_unique_name, T_snap.shape[0] // block_size * self._cfg.per_gaussian_bucket_size, 0,
+                                    code_rasterize, num_1d_threads=per_gaussian_block_size)
+        if atomic_add_count is not None:
+            print(f"atomic add count: {atomic_add_count.item()}")
+        # if is_bwd:
+        # print(self._inliner.get_nvrtc_module(kernel_unique_name).params.debug_code)
+
+        #     print(INLINER.get_nvrtc_kernel_attrs(kernel_unique_name))
+        return grad_out
+
+
     def backward(self,
                  model: GaussianModelOriginBase,
                  cameras: BasicPinholeCamera | CameraBundle,
@@ -2172,12 +2702,21 @@ class GaussianSplatOp:
         tile_num_x = div_up(width, self._cfg.tile_size[0])
         tile_num_y = div_up(height, self._cfg.tile_size[1])
         radii = ctx.radii
-        grad_out = self.rasterize_forward_backward(model,
-                                                   ctx,
-                                                   out,
-                                                   grad,
-                                                   training=True,
-                                                   custom_features=custom_features)
+        if self._cfg.rasterize_backward_algo == RasterizeBackwardAlgo.PER_GAUSSIAN:
+            grad_out = self.rasterize_backward_per_gaussian(model,
+                                                    ctx,
+                                                    out,
+                                                    grad,
+                                                    training=True,
+                                                    custom_features=custom_features)
+        else:
+            grad_out = self.rasterize_forward_backward(model,
+                                                    ctx,
+                                                    out,
+                                                    grad,
+                                                    training=True,
+                                                    custom_features=custom_features)
+
         assert grad_out is not None
         duv = grad_out.duv
         dconic = grad_out.dconic
@@ -2726,8 +3265,22 @@ class _RasterizeGaussians(torch.autograd.Function):
         with measure_and_print_torch("FWD-all-torch", enable=enable_verbose):
             out, fwd_ctx = op.forward(model, cam_bundle, training, instance2world_T, custom_features, mask)
         with measure_and_print_torch("FWD-all-torch-2", enable=enable_verbose):
-
             if fwd_ctx is not None:
+                per_gauss_snap_tensors: list[torch.Tensor | None] = [
+                    None, None, None, None, None, None, None
+                ]
+                if op._cfg.rasterize_backward_algo == RasterizeBackwardAlgo.PER_GAUSSIAN:
+                    snap = fwd_ctx.per_gaussian_snap
+                    assert snap is not None 
+                    per_gauss_snap_tensors = [
+                        snap.bucket_cumsum,
+                        snap.bucket_to_tile_idx,
+                        snap.color,
+                        snap.custom_features,
+                        snap.T,
+                        snap.depth,
+                        snap.max_contributer_per_tile
+                    ]
                 ctx.save_for_backward(
                     # ctx tensors
                     fwd_ctx.conic_opacity,
@@ -2740,6 +3293,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                     fwd_ctx.cov2d_vecs,
                     fwd_ctx.sh_to_rgb_ne_0,
                     fwd_ctx.depths,
+                    *per_gauss_snap_tensors,
                     # model tensors
                     xyz,
                     color_sh,
@@ -2807,22 +3361,34 @@ class _RasterizeGaussians(torch.autograd.Function):
                 sh_to_rgb_ne_0=ctx.saved_tensors[8],
                 depths=ctx.saved_tensors[9],
             )
+            if op._cfg.rasterize_backward_algo == RasterizeBackwardAlgo.PER_GAUSSIAN:
+                snap_ctx = _RasterizeSnapContext(
+                    bucket_cumsum=ctx.saved_tensors[10],
+                    bucket_to_tile_idx=ctx.saved_tensors[11],
+                    color=ctx.saved_tensors[12],
+                    custom_features=ctx.saved_tensors[13],
+                    T=ctx.saved_tensors[14],
+                    depth=ctx.saved_tensors[15],
+                    max_contributer_per_tile=ctx.saved_tensors[16]
+                )
+                fwd_ctx.per_gaussian_snap = snap_ctx
+            saved_tensors = ctx.saved_tensors[17:]
             model = ctx.model_cls(
-                xyz=ctx.saved_tensors[10],
-                color_sh=ctx.saved_tensors[11],
-                color_sh_base=ctx.saved_tensors[12],
-                scale=ctx.saved_tensors[13],
-                quaternion_xyzw=ctx.saved_tensors[14],
-                opacity=ctx.saved_tensors[15],
-                instance_id=ctx.saved_tensors[16],
+                xyz=saved_tensors[0],
+                color_sh=saved_tensors[1],
+                color_sh_base=saved_tensors[2],
+                scale=saved_tensors[3],
+                quaternion_xyzw=saved_tensors[4],
+                opacity=saved_tensors[5],
+                instance_id=saved_tensors[6],
                 act_applied=True,
                 cur_sh_degree=ctx.cur_sh_degree,
             )
-            custom_features = ctx.saved_tensors[17]
-            cam2world_T = ctx.saved_tensors[18]
-            frame_ids = ctx.saved_tensors[19]
-            focal_xy_ppoint = ctx.saved_tensors[20]
-            instance2world_T = ctx.saved_tensors[21]
+            custom_features = saved_tensors[7]
+            cam2world_T = saved_tensors[8]
+            frame_ids = saved_tensors[9]
+            focal_xy_ppoint = saved_tensors[10]
+            instance2world_T = saved_tensors[11]
             if cam2world_T is not None:
                 cam_bundle = CameraBundle(
                     focal_xy_ppoint=focal_xy_ppoint,
@@ -2905,6 +3471,21 @@ class _RasterizeGaussiansWithDynamicInput(torch.autograd.Function):
         with measure_and_print_torch("FWD-all-torch-2", enable=enable_verbose):
 
             if fwd_ctx is not None:
+                per_gauss_snap_tensors: list[torch.Tensor | None] = [
+                    None, None, None, None, None, None, None
+                ]
+                if op._cfg.rasterize_backward_algo == RasterizeBackwardAlgo.PER_GAUSSIAN:
+                    snap = fwd_ctx.per_gaussian_snap
+                    assert snap is not None 
+                    per_gauss_snap_tensors = [
+                        snap.bucket_cumsum,
+                        snap.bucket_to_tile_idx,
+                        snap.color,
+                        snap.custom_features,
+                        snap.T,
+                        snap.depth,
+                        snap.max_contributer_per_tile
+                    ]
                 ctx.save_for_backward(
                     # ctx tensors
                     fwd_ctx.conic_opacity,
@@ -2917,6 +3498,7 @@ class _RasterizeGaussiansWithDynamicInput(torch.autograd.Function):
                     fwd_ctx.cov2d_vecs,
                     fwd_ctx.sh_to_rgb_ne_0,
                     fwd_ctx.depths,
+                    *per_gauss_snap_tensors,
                     # model tensors
                     custom_features,
                     # cam bundle
@@ -2979,21 +3561,34 @@ class _RasterizeGaussiansWithDynamicInput(torch.autograd.Function):
                 sh_to_rgb_ne_0=ctx.saved_tensors[8],
                 depths=ctx.saved_tensors[9],
             )
-            custom_features = ctx.saved_tensors[10]
-            cam2world_T = ctx.saved_tensors[11]
-            frame_ids = ctx.saved_tensors[12]
-            focal_xy_ppoint = ctx.saved_tensors[13]
-            instance2world_T = ctx.saved_tensors[14]
+            if op._cfg.rasterize_backward_algo == RasterizeBackwardAlgo.PER_GAUSSIAN:
+                snap_ctx = _RasterizeSnapContext(
+                    bucket_cumsum=ctx.saved_tensors[10],
+                    bucket_to_tile_idx=ctx.saved_tensors[11],
+                    color=ctx.saved_tensors[12],
+                    custom_features=ctx.saved_tensors[13],
+                    T=ctx.saved_tensors[14],
+                    depth=ctx.saved_tensors[15],
+                    max_contributer_per_tile=ctx.saved_tensors[16]
+                )
+                fwd_ctx.per_gaussian_snap = snap_ctx
+            saved_tensors = ctx.saved_tensors[17:]
+
+            custom_features = saved_tensors[0]
+            cam2world_T = saved_tensors[1]
+            frame_ids = saved_tensors[2]
+            focal_xy_ppoint = saved_tensors[3]
+            instance2world_T = saved_tensors[4]
 
             out = GaussianSplatOutput(
-                n_contrib=ctx.saved_tensors[15],
-                color=ctx.saved_tensors[16],
-                depth=ctx.saved_tensors[17],
-                custom_features=ctx.saved_tensors[18],
-                T=ctx.saved_tensors[19],
+                n_contrib=saved_tensors[5],
+                color=saved_tensors[6],
+                depth=saved_tensors[7],
+                custom_features=saved_tensors[8],
+                T=saved_tensors[9],
             )
-            model = ctx.model_cls.from_autograd_tuple_repr(ctx.saved_tensors[20:20+len(model_tensor_names)], model_tensor_names, ctx.model_nontensor_dict)
-            user_input_tensors = {k: v for k, v in zip(ctx.user_input_tensor_names, ctx.saved_tensors[20+len(model_tensor_names):])}
+            model = ctx.model_cls.from_autograd_tuple_repr(saved_tensors[10:10+len(model_tensor_names)], model_tensor_names, ctx.model_nontensor_dict)
+            user_input_tensors = {k: v for k, v in zip(ctx.user_input_tensor_names, saved_tensors[10+len(model_tensor_names):])}
             if cam2world_T is not None:
                 cam_bundle = CameraBundle(
                     focal_xy_ppoint=focal_xy_ppoint,
