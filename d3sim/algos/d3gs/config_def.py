@@ -95,7 +95,7 @@ class GaussianSplatConfig:
     render_rgba: bool = False
 
     transmittance_is_double = False
-    backward_reduction: Literal["none", "warp", "block"] = "warp"
+    backward_reduction: Literal["none", "warp", "block"] = "block"
     verbose: bool = False
 
     recalc_cov3d_in_bwd: bool = True

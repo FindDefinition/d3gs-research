@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import io
+import json
 from pathlib import Path
 import random
 from typing import Annotated, Any
@@ -333,12 +334,14 @@ class ColmapSceneSplitChunks:
                 for idx in range(len(new_xyzs))
             }
             if not self.debug:
-
                 cmu.write_model(cam_intrinsics, images_out, points_out,
                                 out_colmap)
-
-                # with open(os.path.join(out_path, "center.txt"), 'w') as f:
-                #     f.write(' '.join(map(str, (corner_min + corner_max) / 2)))
+                chunk_meta_data = {
+                    "center": ((corner_min + corner_max) / 2).tolist(),
+                    "extent": (corner_max - corner_min).tolist()
+                }
+                with open(os.path.join(out_path, "meta.json"), 'w') as f:
+                    f.write(json.dumps(chunk_meta_data))
                 # with open(os.path.join(out_path, "extent.txt"), 'w') as f:
                 #     f.write(' '.join(map(str, corner_max - corner_min)))
             else:

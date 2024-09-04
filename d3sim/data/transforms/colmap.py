@@ -1,3 +1,6 @@
+import collections
+import hashlib
+import io
 from pathlib import Path
 import tempfile
 from typing import Literal
@@ -21,13 +24,18 @@ from sklearn.neighbors import NearestNeighbors
 import scipy
 import scipy.spatial
 import os 
+import rich
 
 class ColmapConstants:
     Meta = "__colmap_transform_meta"
 
-def _run_colmap_subprocess(colmap_args: list[str]):
-    print("[COLMAP]", " ".join(colmap_args))
-    subprocess.run(colmap_args, check=True)
+def _run_colmap_subprocess(colmap_args: list[str], disable_info_log: bool = True):
+    rich.print("[COLMAP]", " ".join(colmap_args))
+    env = None 
+    if disable_info_log:
+        env = os.environ.copy()
+        env["GLOG_minloglevel"] = "2"
+    subprocess.run(colmap_args, check=True, env=env)
 
 # disable colmap info logging
 # os.environ["GLOG_minloglevel"] = "2"
@@ -347,8 +355,8 @@ class ColmapCreatePriorFromModel(ColmapSceneTransformOfflineDisk):
             colmap_dir.mkdir(exist_ok=True, parents=True, mode=0o755)
         model_dir = colmap_dir / "prior_model"
         model_dir.mkdir(exist_ok=True, parents=True, mode=0o755)
-        if (colmap_dir / "database.db").exists() and (model_dir / "images.bin").exists():
-            return scene
+        # if (colmap_dir / "database.db").exists() and (model_dir / "images.bin").exists():
+        #     return scene
         # database must be removed before we can add new cameras
         (colmap_dir / "database.db").unlink(missing_ok=True)
         model_output = Path(self.get_colmap_meta_from_scene_required(scene).colmap_model_path)
@@ -481,7 +489,6 @@ class ColmapCopySubsetImageFromModel(ColmapSceneTransformOfflineDisk):
         colmap_dir = self.get_colmap_workdir_root_from_scene(scene)
         workdirs = ColmapWorkDirs(colmap_dir, create=False)
         workdirs_img_root = workdirs.cameras_root
-        print(workdirs_img_root, "workdirs_img_root")
         workdirs.create_dir(workdirs_img_root)
         # if self.file_flag_exists(colmap_dir):
         #     return scene
@@ -489,6 +496,7 @@ class ColmapCopySubsetImageFromModel(ColmapSceneTransformOfflineDisk):
         images_metas = cmu.read_images_binary(f"{model_input}/images.bin")
         img_root = self.get_colmap_meta_from_scene_required(scene).colmap_image_root
         assert img_root is not None, "image root must be set"
+        assert workdirs_img_root != Path(img_root), "workdirs_img_root and img_root must be different"
         img_root_p = Path(img_root)
         for key in images_metas:
             name_p = Path(images_metas[key].name)
@@ -817,19 +825,18 @@ class ColmapUndistort(ColmapSceneTransformOfflineDisk):
             _run_colmap_subprocess(colmap_args)
 
             if has_mask:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    mask_root = Path(this_work_dir) / "masks"
-                    for cam_id, cams in cam_id_to_cams.items():
-                        _create_image_field_colmap_subfolder(cam_id, CameraFieldTypes.VALID_MASK, cams, mask_root)
-                    _change_suffix_in_model_image_name(out_path, Path(this_work_dir / "masks"), ".png")
-                    colmap_args = [
-                        self.colmap_path, "image_undistorter",
-                        "--image_path", f"{mask_root}",
-                        "--input_path", f"{this_work_dir / "masks"}",
-                        "--output_path", str(this_work_dir / "masks_model"),
-                        "--output_type", "COLMAP",
-                        "--max_image_size", str(self.max_image_size),
-                    ]
+                mask_root = Path(this_work_dir) / "masks"
+                for cam_id, cams in cam_id_to_cams.items():
+                    _create_image_field_colmap_subfolder(cam_id, CameraFieldTypes.VALID_MASK, cams, mask_root)
+                _change_suffix_in_model_image_name(out_path, Path(this_work_dir / "masks"), ".png")
+                colmap_args = [
+                    self.colmap_path, "image_undistorter",
+                    "--image_path", f"{mask_root}",
+                    "--input_path", f"{this_work_dir / "masks"}",
+                    "--output_path", str(this_work_dir / "masks_model"),
+                    "--output_type", "COLMAP",
+                    "--max_image_size", str(self.max_image_size),
+                ]
                 _run_colmap_subprocess(colmap_args)
         remain_gid_to_cams, _ = fetch_colmap_camera_result_and_assign_to_scene(str(this_work_dir / "sparse"), scene, assign_pose=False)
         assert len(remain_gid_to_cams) == 0
@@ -851,12 +858,16 @@ class ColmapUndistort(ColmapSceneTransformOfflineDisk):
             cam.distortion[:] = 0
         # copy the first model to the root
         # _copy_model(workdirs.sfm_out_root, workdirs.undistorted_img_root / "sparse")
+        self.store_colmap_image_root(scene, str(this_work_dir / "images"))
+        if has_mask:
+            self.store_colmap_mask_root(scene, str(this_work_dir / "masks"))
         self.store_colmap_model_path(scene, str(this_work_dir / "sparse"))
         self.write_file_flag(colmap_dir)
         return scene 
 
 
 def _copy_model(src: Path, dst: Path):
+    rich.print("[COLMAP-Util] Copy model", src, "to", dst)
     img_bin0 = src / "images.bin"
     img_bin1 = dst / "images.bin"
     shutil.copy(img_bin0, img_bin1)
@@ -1073,6 +1084,180 @@ class ColmapRefineRotAndScale(ColmapSceneTransformOfflineDisk):
         # _copy_model(this_work_dir, workdirs.sfm_out_root)
         self.write_file_flag(colmap_dir)
         return scene 
+
+def get_nb_pts(image_metas):
+    n_pts = 0
+    for key in image_metas:
+        pts_idx = image_metas[key].point3D_ids
+        if (len(pts_idx) > 5):
+            n_pts = max(n_pts, np.max(pts_idx))
+
+    return n_pts + 1
+
+Transform = collections.namedtuple(
+    "Transform", ["t0", "t1", "s0", "s1", "R"]
+)
+
+def procrustes_analysis(X0,X1): # [N,3]
+    """
+    From https://github.com/chenhsuanlin/bundle-adjusting-NeRF/blob/803291bd0ee91c7c13fb5cc42195383c5ade7d15/camera.py#L278
+    """
+    # translation
+    t0 = X0.mean(dim=0,keepdim=True)
+    t1 = X1.mean(dim=0,keepdim=True)
+    X0c = X0-t0
+    X1c = X1-t1
+    # scale
+    s0 = (X0c**2).sum(dim=-1).mean().sqrt()
+    s1 = (X1c**2).sum(dim=-1).mean().sqrt()
+    X0cs = X0c/s0
+    X1cs = X1c/s1
+    # rotation (use double for SVD, float loses precision)
+    U,S,V = (X0cs.t()@X1cs).double().svd(some=True)
+    R = (U@V.t()).float()
+    if R.det()<0: R[2] *= -1
+    # align X1 to X0: X1to0 = (X1-t1)/s1@R.t()*s0+t0
+    sim3 = Transform(t0=t0[0],t1=t1[0],s0=s0,s1=s1,R=R)
+    return sim3
+
+def align_two_colmap_models(src_path: str, dst_path: str, out_path: str):
+    old_images_metas = cmu.read_images_binary(str(Path(dst_path) / "images.bin"))
+    new_images_metas = cmu.read_images_binary(str(Path(src_path) / "images.bin"))
+    n_pts = get_nb_pts(new_images_metas)
+    
+    old_keys = old_images_metas.keys()
+    old_keys_dict = {old_images_metas[key].name: key for key in old_keys}
+    new_old_key_mapping = {key: old_keys_dict[new_images_metas[key].name] for key in new_images_metas}
+
+    old_cam_centers = np.array([
+        -cmu.qvec2rotmat(old_images_metas[new_old_key_mapping[key]].qvec).astype(np.float32).T @ old_images_metas[new_old_key_mapping[key]].tvec.astype(np.float32) 
+        for key in new_images_metas
+    ])
+    new_cam_centers = np.array([
+        -cmu.qvec2rotmat(new_images_metas[key].qvec).astype(np.float32).T @ new_images_metas[key].tvec.astype(np.float32) 
+        for key in new_images_metas
+    ])
+
+    dists = np.linalg.norm(old_cam_centers - new_cam_centers, axis=-1)
+    valid_cams = dists <= (np.median(dists) * 5) + 1e-8
+
+    old_cam_centers_torch = torch.from_numpy(old_cam_centers)
+    new_cam_centers_torch = torch.from_numpy(new_cam_centers)
+
+    old_cam_centers_trimmed = old_cam_centers[valid_cams]
+    new_cam_centers_trimmed = new_cam_centers[valid_cams]
+    old_cam_centers_torch_trimmed = torch.from_numpy(old_cam_centers_trimmed)
+    new_cam_centers_torch_trimmed = torch.from_numpy(new_cam_centers_trimmed)
+
+    sim3 = procrustes_analysis(old_cam_centers_torch_trimmed, new_cam_centers_torch_trimmed)
+    center_aligned = (new_cam_centers_torch-sim3.t1)/sim3.s1@sim3.R.t()*sim3.s0+sim3.t0
+    points3d = cmu.read_points3D_binary(f"{src_path}/points3D.bin")
+
+    xyzs = np.zeros([n_pts, 3], np.float32)
+    errors = np.zeros([n_pts], np.float32) + 9e9
+    indices = np.zeros([n_pts], np.int64)
+    n_images = np.zeros([n_pts], np.int64)
+    colors = np.zeros([n_pts, 3], np.float32)
+
+    idx = 0    
+    for key in points3d:
+        xyzs[idx] = points3d[key].xyz
+        indices[idx] = points3d[key].id
+        errors[idx] = points3d[key].error
+        colors[idx] = points3d[key].rgb
+        n_images[idx] = len(points3d[key].image_ids)
+        idx +=1
+
+    mask = errors < 1.5
+    mask *= n_images > 3
+
+    xyzsC, colorsC, errorsC, indicesC, n_imagesC = xyzs[mask], colors[mask], errors[mask], indices[mask], n_images[mask]
+
+    points3dC_aligned = ((torch.from_numpy(xyzsC)-sim3.t1)/sim3.s1@sim3.R.t()*sim3.s0+sim3.t0).numpy()
+    
+    R = torch.from_numpy(np.array([
+        cmu.qvec2rotmat(new_images_metas[key].qvec).astype(np.float32)
+        for key in new_images_metas
+    ]))
+    R_aligned = R@sim3.R.t()
+    t_aligned = (-R_aligned@center_aligned[...,None])[...,0]
+
+    # with open(f"{args.in_dir}/center.txt", 'r') as f:
+    #     center = np.array(tuple(map(float, f.readline().strip().split())))
+    # with open(f"{args.in_dir}/extent.txt", 'r') as f:
+    #     extent = np.array(tuple(map(float, f.readline().strip().split())))
+
+    # corner_min = center - 1.1 * extent / 2
+    # corner_max = center + 1.1 * extent / 2
+
+    out_colmap = f"{out_path}"
+    os.makedirs(out_colmap, exist_ok=True)
+    
+    # mask = np.all(points3dC_aligned < corner_max, axis=-1) * np.all(points3dC_aligned > corner_min, axis=-1)
+    new_points3d = points3dC_aligned#[mask]
+    new_colors = np.clip(colorsC, 0, 255).astype(np.uint8)
+    new_indices = indicesC#[mask]
+    new_errors = errorsC#[mask]
+
+    images_metas_out = {}
+    for key, R, t, valid_cam in zip(new_images_metas, R_aligned.numpy(), t_aligned.numpy(), valid_cams):
+        if valid_cam:
+            image_meta = new_images_metas[key]
+
+            images_metas_out[key] = cmu.Image(
+                id = key,
+                qvec = cmu.rotmat2qvec(R),
+                tvec = t,
+                camera_id = image_meta.camera_id,
+                name = image_meta.name,
+                xys = image_meta.xys,
+                point3D_ids = image_meta.point3D_ids,
+            )
+    points_out = {
+        new_indices[idx] : cmu.Point3D(
+                id=indicesC[idx],
+                xyz= points3dC_aligned[idx],
+                rgb=new_colors[idx],
+                error=errorsC[idx],
+                image_ids=np.array([]),
+                point2D_idxs=np.array([])
+            )
+        for idx in range(len(points3dC_aligned))
+    }
+    debug = False 
+    if debug:
+        bss = io.BytesIO()
+        cmu.write_images_binary(images_metas_out, bss)
+        print(hashlib.md5(bss.getvalue()).hexdigest())
+        bss = io.BytesIO()
+
+        cmu.write_points3D_binary(points_out, bss)    
+        print(hashlib.md5(bss.getvalue()).hexdigest())
+    else:
+        cmu.write_images_binary(images_metas_out, f"{out_colmap}/images.bin")
+        cmu.write_points3D_binary(points_out, f"{out_colmap}/points3D.bin")    
+
+
+def extract_scene_colmap_model_images(scene: Scene[BasicFrame], save_path: str, ref_colmap_model_path: str):
+    """Used for align colmap model to scene.
+    """
+    gid_to_cams = scene.get_global_id_to_sensor(BasicPinholeCamera)
+    cameras_extrinsic_file = os.path.join(ref_colmap_model_path, "images.bin")
+    cam_extrinsics = cmu.read_images_binary(cameras_extrinsic_file)
+    res_cam_extrinsics = {}
+    for idx, key in enumerate(cam_extrinsics):
+        extr = cam_extrinsics[key]
+        cam_file_name = extr.name 
+        cam_global_id = Path(cam_file_name).stem
+        if cam_global_id in gid_to_cams:
+            cam = gid_to_cams[cam_global_id]
+            qvec = cmu.rotmat2qvec(cam.pose.to_world[:3, :3])
+            tvec = cam.pose.to_world[:3, 3]
+            new_extr = extr._replace(qvec=qvec, tvec=tvec)
+            res_cam_extrinsics[key] = new_extr
+    assert len(res_cam_extrinsics) > 0
+    cmu.write_images_binary(res_cam_extrinsics, os.path.join(save_path, "images.bin")) 
+
 
 def fetch_colmap_camera_result_and_assign_to_scene(model_path: str, scene: Scene, assign_pose: bool = True):
     try:

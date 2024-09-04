@@ -730,7 +730,6 @@ class GaussianSplatOp:
 
             self._inliner.kernel_1d(f"prepare_sort_data_{enable_32bit_sort}",
                                     batch_size * num, 0, code)
-        # TODO use radix sort with trunated bits (faster) for cuda
         # TODO use 32bit sort, for 1920x1080 tile, the max tile idx is 8100, 13 bits
         # so we can use 18bit for depth. (19bit if torch support uint32, true in torch >= 2.3 and cuda)
         with measure_and_print_torch("do sort", enable=enable_verbose):
@@ -1312,7 +1311,8 @@ class GaussianSplatOp:
                 print(f"atomic add count: {atomic_add_count.item()}")
 
             return grad_out
-
+        block_reduce_cache_length = 16
+        num_warp = self._cfg.tile_size[0] * self._cfg.tile_size[1] // 32
         code_rasterize = pccm.code()
         code_rasterize.raw(f"""
         namespace op = tv::arrayops;
@@ -1387,17 +1387,17 @@ class GaussianSplatOp:
             """)
         if bwd_reduce_method == "block":
             code_rasterize.raw(f"""
-            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_drgb_0;
-            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_drgb_1;
-            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_drgb_2;
-            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_dopacity;
-            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_duv_0;
-            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_duv_1;
-            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_dconic_0;
-            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_dconic_1;
-            TV_SHARED_MEMORY tv::array<float, {block_size // 32}> shared_dL_dconic_2;
-            // TV_SHARED_MEMORY float shared_dL_dopacity[{block_size // 32}];
-            TV_SHARED_MEMORY tv::array<int, {block_size // 32}> shared_num_contributor;
+            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_drgb_0;
+            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_drgb_1;
+            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_drgb_2;
+            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_dopacity;
+            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_duv_0;
+            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_duv_1;
+            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_dconic_0;
+            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_dconic_1;
+            TV_SHARED_MEMORY tv::array_nd<float, {block_reduce_cache_length}, {block_size // 32}> shared_dL_dconic_2;
+            TV_SHARED_MEMORY tv::array_nd<uint8_t, {block_reduce_cache_length}, {block_size // 32}> shared_valid_tile;
+            TV_SHARED_MEMORY tv::array_nd<int, {block_size // 32}> shared_num_contributor;
             """)
 
         code_rasterize.raw(f"""
@@ -1619,16 +1619,17 @@ class GaussianSplatOp:
                         }}
                         """)
                     elif bwd_reduce_method == "block":
-                        # don't support block reduce for metal
-                        # block reduce currently greatly slower
-                        # than warp reduce, so we don't need to support it.
-                        if not IsAppleSiliconMacOs:
-                            code_rasterize.raw(f"""
-                            // avoid empty atomic write
-                            if (!__syncthreads_or(valid)){{
-                                continue;
-                            }}
-                            """)
+                        code_rasterize.raw(f"""
+                        bool warp_valid = tv::parallel::warp_any(valid);
+                        bool time_to_block_reduce = (j + 1) % {block_reduce_cache_length} == 0 || j == std::min({block_size}, toDo) - 1;
+                        if (lane_idx == 0){{
+                            shared_valid_tile[warp_idx][warp_idx] = warp_valid;
+                        }}
+                        if (!warp_valid && !time_to_block_reduce){{
+                            continue;
+                        }}
+                        """)
+
                 else:
                     if is_bwd:
                         code_rasterize.raw(f"""
@@ -1865,52 +1866,58 @@ class GaussianSplatOp:
                             {"" if use_bwd_reduce else "float"} dL_dopacity = dL_dalpha * G;
                             """)
                 if is_bwd:
+
                     reduce_if_ctx = nullcontext()
+                    wsum_if_ctx = nullcontext()
+
                     if bwd_reduce_method == "warp":
                         reduce_if_ctx = code_rasterize.if_("lane_idx == 0")
                     elif bwd_reduce_method == "block":
-                        reduce_if_ctx = code_rasterize.if_("thread_rank == 0")
+                        wsum_if_ctx = code_rasterize.if_("warp_valid")
+                        # reduce_if_ctx = code_rasterize.if_("thread_rank == 0")
+                        reduce_if_ctx = code_rasterize.if_(f"((j + 1) % {block_reduce_cache_length} == 0 || j == std::min({block_size}, toDo) - 1)")
                     if use_bwd_reduce:
-                        if not self._cfg.disable_builtin_rgb:
+                        with wsum_if_ctx:
+                            if not self._cfg.disable_builtin_rgb:
+                                code_rasterize.raw(f"""
+                                dL_drgb[0] = tv::parallel::warp_sum(dL_drgb[0]);
+                                dL_drgb[1] = tv::parallel::warp_sum(dL_drgb[1]);
+                                dL_drgb[2] = tv::parallel::warp_sum(dL_drgb[2]);
+                                """)
                             code_rasterize.raw(f"""
-                            dL_drgb[0] = tv::parallel::warp_sum(dL_drgb[0]);
-                            dL_drgb[1] = tv::parallel::warp_sum(dL_drgb[1]);
-                            dL_drgb[2] = tv::parallel::warp_sum(dL_drgb[2]);
-                            """)
-                        code_rasterize.raw(f"""
-                        dL_duv[0] = tv::parallel::warp_sum(dL_duv[0]);
-                        dL_duv[1] = tv::parallel::warp_sum(dL_duv[1]);
+                            dL_duv[0] = tv::parallel::warp_sum(dL_duv[0]);
+                            dL_duv[1] = tv::parallel::warp_sum(dL_duv[1]);
 
-                        dL_dcov2d[0] = tv::parallel::warp_sum(dL_dcov2d[0]);
-                        dL_dcov2d[1] = tv::parallel::warp_sum(dL_dcov2d[1]);
-                        dL_dcov2d[2] = tv::parallel::warp_sum(dL_dcov2d[2]);
+                            dL_dcov2d[0] = tv::parallel::warp_sum(dL_dcov2d[0]);
+                            dL_dcov2d[1] = tv::parallel::warp_sum(dL_dcov2d[1]);
+                            dL_dcov2d[2] = tv::parallel::warp_sum(dL_dcov2d[2]);
 
-                        dL_dopacity = tv::parallel::warp_sum(dL_dopacity);
-                        """)
-                        if has_custom_feat:
-                            code_rasterize.raw(f"""
-                            dL_dcustom_feat = op::apply(tv::parallel::warp_sum<float>, dL_dcustom_feat);
+                            dL_dopacity = tv::parallel::warp_sum(dL_dopacity);
                             """)
-                        if render_depth:
-                            code_rasterize.raw(f"""
-                            dL_dz = tv::parallel::warp_sum(dL_dz);
-                            """)
+                            if has_custom_feat:
+                                code_rasterize.raw(f"""
+                                dL_dcustom_feat = op::apply(tv::parallel::warp_sum<float>, dL_dcustom_feat);
+                                """)
+                            if render_depth:
+                                code_rasterize.raw(f"""
+                                dL_dz = tv::parallel::warp_sum(dL_dz);
+                                """)
                         if self._cfg.backward_reduction == "block":
                             code_rasterize.raw(f"""
-                            tv::parallel::block_sync_shared_io();
-
+                            
                             if (lane_idx == 0){{
-                                shared_dL_drgb_0[warp_idx] = dL_drgb[0];
-                                shared_dL_drgb_1[warp_idx] = dL_drgb[1];
-                                shared_dL_drgb_2[warp_idx] = dL_drgb[2];
-                                shared_dL_duv_0[warp_idx] = dL_duv[0];
-                                shared_dL_duv_1[warp_idx] = dL_duv[1];
-                                shared_dL_dconic_0[warp_idx] = dL_dcov2d[0];
-                                shared_dL_dconic_1[warp_idx] = dL_dcov2d[1];
-                                shared_dL_dconic_2[warp_idx] = dL_dcov2d[2];
-                                shared_dL_dopacity[warp_idx] = dL_dopacity;
+                                shared_valid_tile[j % {block_reduce_cache_length}][warp_idx] = warp_valid;
+                                    shared_dL_drgb_0[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_drgb[0] : 0;
+                                    shared_dL_drgb_1[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_drgb[1] : 0;
+                                    shared_dL_drgb_2[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_drgb[2] : 0;
+                                    shared_dL_duv_0[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_duv[0] : 0;
+                                    shared_dL_duv_1[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_duv[1] : 0;
+                                    shared_dL_dconic_0[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_dcov2d[0] : 0;
+                                    shared_dL_dconic_1[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_dcov2d[1] : 0;
+                                    shared_dL_dconic_2[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_dcov2d[2] : 0;
+                                    shared_dL_dopacity[j % {block_reduce_cache_length}][warp_idx] = warp_valid ? dL_dopacity : 0;
+
                             }}
-                            tv::parallel::block_sync_shared_io();
                             """)
                     with reduce_if_ctx:
                         if not gaussian_id_inited:
@@ -1924,46 +1931,77 @@ class GaussianSplatOp:
                                 """)
                         if self._cfg.backward_reduction == "block":
                             code_rasterize.raw(f"""
-                            dL_drgb[0] = shared_dL_drgb_0.op<op::sum>();
-                            dL_drgb[1] = shared_dL_drgb_1.op<op::sum>();
-                            dL_drgb[2] = shared_dL_drgb_2.op<op::sum>();
-                            dL_duv[0] = shared_dL_duv_0.op<op::sum>();
-                            dL_duv[1] = shared_dL_duv_1.op<op::sum>();
-                            dL_dcov2d[0] = shared_dL_dconic_0.op<op::sum>();
-                            dL_dcov2d[1] = shared_dL_dconic_1.op<op::sum>();
-                            dL_dcov2d[2] = shared_dL_dconic_2.op<op::sum>();
-                            dL_dopacity = shared_dL_dopacity.op<op::sum>();
+                            tv::parallel::block_sync_shared_io();
                             """)
+                            with code_rasterize.if_("thread_rank == 0"):
+                                with code_rasterize.for_(f"int k = 0; k < j % {block_reduce_cache_length} + 1; ++k"):
+                                    code_rasterize.raw(f"""
+                                    auto collected_idx_cache = j / {block_reduce_cache_length} * {block_reduce_cache_length} + k;
+                                    auto gaussian_id_cache = collected_id[collected_idx_cache];
+                                    auto valid_warp = shared_valid_tile[k].op<op::sum>();
+                                    """)
+                                    with code_rasterize.if_("valid_warp > 0"):
+                                        code_rasterize.raw(f"""
+                                        tv::parallel::atomicAdd($dcolor + gaussian_id_cache * 3 + 0, shared_dL_drgb_0[k].op<op::sum>());
+                                        tv::parallel::atomicAdd($dcolor + gaussian_id_cache * 3 + 1, shared_dL_drgb_1[k].op<op::sum>());
+                                        tv::parallel::atomicAdd($dcolor + gaussian_id_cache * 3 + 2, shared_dL_drgb_2[k].op<op::sum>());
+                                        tv::parallel::atomicAdd($duv + gaussian_id_cache * 2 + 0, shared_dL_duv_0[k].op<op::sum>());
+                                        tv::parallel::atomicAdd($duv + gaussian_id_cache * 2 + 1, shared_dL_duv_1[k].op<op::sum>());
+
+                                        tv::parallel::atomicAdd($dconic + gaussian_id_cache * 3 + 0, shared_dL_dconic_0[k].op<op::sum>());
+                                        tv::parallel::atomicAdd($dconic + gaussian_id_cache * 3 + 1, shared_dL_dconic_1[k].op<op::sum>());
+                                        tv::parallel::atomicAdd($dconic + gaussian_id_cache * 3 + 2, shared_dL_dconic_2[k].op<op::sum>());
+                                        tv::parallel::atomicAdd($dopacity + gaussian_id_cache, shared_dL_dopacity[k].op<op::sum>());
+
+                                        """)
+                                        if self._cfg.measure_atomic_add_count:
+                                            code_rasterize.raw(f"""
+                                            tv::parallel::atomicAdd($atomic_add_count, 1);
+                                            """)
+                                code_rasterize.raw(f"""
+                                shared_valid_tile = {{}};
+                                """)
+
+                            code_rasterize.raw(f"""
+                            tv::parallel::block_sync_shared_io();
+                            """)
+
                             if render_depth:
                                 raise NotImplementedError("not implemented yet")
-                        if not self._cfg.disable_builtin_rgb:
-                            code_rasterize.raw(f"""
-                            tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 0, dL_drgb[0]);
-                            tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 1, dL_drgb[1]);
-                            tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 2, dL_drgb[2]);
-                            """)
-                        code_rasterize.raw(f"""
-                        tv::parallel::atomicAdd($duv + gaussian_id * 2 + 0, dL_duv[0]);
-                        tv::parallel::atomicAdd($duv + gaussian_id * 2 + 1, dL_duv[1]);
-
-                        tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 0, dL_dcov2d[0]);
-                        tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 1, dL_dcov2d[1]);
-                        tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 2, dL_dcov2d[2]);
-                        tv::parallel::atomicAdd($dopacity + gaussian_id, dL_dopacity);
-                        """)
-                        if render_depth:
-                            code_rasterize.raw(f"""
-                            tv::parallel::atomicAdd($dz + gaussian_id, dL_dz);
-                            """)
-                        if has_custom_feat:
-                            for j in range(num_custom_feat):
+                        else:
+                            if not self._cfg.disable_builtin_rgb:
                                 code_rasterize.raw(f"""
-                                tv::parallel::atomicAdd($dcustom_features + gaussian_id * {num_custom_feat} + {j}, dL_dcustom_feat[{j}]);
+                                tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 0, dL_drgb[0]);
+                                tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 1, dL_drgb[1]);
+                                tv::parallel::atomicAdd($dcolor + gaussian_id * 3 + 2, dL_drgb[2]);
                                 """)
-                        if self._cfg.measure_atomic_add_count:
                             code_rasterize.raw(f"""
-                            tv::parallel::atomicAdd($atomic_add_count, 1);
+                            tv::parallel::atomicAdd($duv + gaussian_id * 2 + 0, dL_duv[0]);
+                            tv::parallel::atomicAdd($duv + gaussian_id * 2 + 1, dL_duv[1]);
+
+                            tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 0, dL_dcov2d[0]);
+                            tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 1, dL_dcov2d[1]);
+                            tv::parallel::atomicAdd($dconic + gaussian_id * 3 + 2, dL_dcov2d[2]);
+                            tv::parallel::atomicAdd($dopacity + gaussian_id, dL_dopacity);
                             """)
+                            if render_depth:
+                                code_rasterize.raw(f"""
+                                tv::parallel::atomicAdd($dz + gaussian_id, dL_dz);
+                                """)
+                            if has_custom_feat:
+                                for j in range(num_custom_feat):
+                                    code_rasterize.raw(f"""
+                                    tv::parallel::atomicAdd($dcustom_features + gaussian_id * {num_custom_feat} + {j}, dL_dcustom_feat[{j}]);
+                                    """)
+                            if self._cfg.measure_atomic_add_count:
+                                code_rasterize.raw(f"""
+                                tv::parallel::atomicAdd($atomic_add_count, 1);
+                                """)
+                    if self._cfg.backward_reduction == "block":
+                        code_rasterize.raw(f"""
+                        tv::parallel::block_sync_shared_io();
+                        """)
+
                     # if has_custom_feat:
                     #     code_rasterize.raw(f"""
                     #     for (int channel_idx = 0; channel_idx < {num_custom_feat}; ++channel_idx){{
