@@ -69,6 +69,11 @@ class EarlyFilterAlgo(enum.IntEnum):
     # best for large scene 
     OBB_DFVT = 4
 
+class RasterizeBackwardAlgo(enum.IntEnum):
+    DEFAULT = 0
+    PER_GAUSSIAN = 1
+
+
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatConfig:
     tile_size: tuple[int, int] = (16, 16)
@@ -132,6 +137,10 @@ class GaussianSplatConfig:
     # up to 500% performance increase in large scene.
     # TODO completely remove original 3-sigma ellipse in the future.
     early_filter_algo: EarlyFilterAlgo = EarlyFilterAlgo.OBB_DFVT
+
+    # rasterize backward algorithm
+    rasterize_backward_algo: RasterizeBackwardAlgo = RasterizeBackwardAlgo.DEFAULT
+    per_gaussian_bucket_size: int = 32
 
     @property 
     def num_channels(self):

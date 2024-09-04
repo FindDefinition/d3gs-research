@@ -24,7 +24,7 @@ import cumm.tensorview as tv
 from d3sim.algos.d3gs.origin.data.utils.general_utils import strip_symmetric, build_scaling_rotation
 from cumm.inliner import torch_tensor_to_tv, measure_and_print_torch, get_current_stream
 from torch.autograd.function import once_differentiable
-from d3sim.algos.d3gs.config_def import EarlyFilterAlgo, GaussianSplatConfig
+from d3sim.algos.d3gs.config_def import EarlyFilterAlgo, GaussianSplatConfig, RasterizeBackwardAlgo
 
 
 
@@ -40,6 +40,14 @@ class BatchCameraParams:
     tan_fov: torch.Tensor
     image_shape_wh: tuple[int, int]
 
+@dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
+class _RasterizeSnap(DataClassWithArrayCheck):
+    custom_features: Annotated[torch.Tensor | None,
+                               ac.ArrayCheck(["NumBucket", -1], ac.F32)]
+    T: Annotated[torch.Tensor, ac.ArrayCheck(["NumBucket"], ac.F32)]
+    color: Annotated[torch.Tensor, ac.ArrayCheck(["NumBucket", -1], ac.F32)]
+    depth: Annotated[torch.Tensor | None,
+                     ac.ArrayCheck(["NumBucket", -1], ac.F32)] = None
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatOpContext(DataClassWithArrayCheck):
@@ -58,6 +66,7 @@ class GaussianSplatOpContext(DataClassWithArrayCheck):
     sh_to_rgb_ne_0: Annotated[torch.Tensor | None,
                               ac.ArrayCheck([-1], ac.U8)] = None
 
+    per_gaussian_snap: _RasterizeSnap | None = None
 
 @dataclasses.dataclass(config=dataclasses.PyDanticConfigForAnyObject)
 class GaussianSplatOutput(DataClassWithArrayCheck):
@@ -778,9 +787,11 @@ class GaussianSplatOp:
             else:
                 sorted_vals, indices = torch.sort(keys_tile_idx_depth)
                 gaussian_idx_sorted = torch.gather(gaussian_idx, 0, indices)
-
+        num_tiles = batch_size * tile_num_x * tile_num_y
+        num_bucket = 0
+        per_gaussian_snap: _RasterizeSnap | None = None
         with measure_and_print_torch("prepare workrange", enable=enable_verbose):
-            workload_ranges = torch.zeros([batch_size * tile_num_x * tile_num_y, 2],
+            workload_ranges = torch.zeros([num_tiles, 2],
                                           dtype=torch.int32,
                                           device=xyz.device)
             shift_bits = 32 if not enable_32bit_sort else 18
@@ -793,7 +804,7 @@ class GaussianSplatOp:
             """)
             if self._cfg.enable_device_asserts:
                 code.raw(f"""
-                assert(tile_idx < $batch_size * $tile_num_x * $tile_num_y);
+                assert(tile_idx < $num_tiles);
                 """)
             with code.if_("i == 0"):
                 code.raw(f"""
@@ -806,7 +817,7 @@ class GaussianSplatOp:
                 """)
                 if self._cfg.enable_device_asserts:
                     code.raw(f"""
-                    assert(last_tile_idx < $batch_size * $tile_num_x * $tile_num_y);
+                    assert(last_tile_idx < $num_tiles);
                     """)
                 code.raw(f"""
                 if (tile_idx != last_tile_idx){{
@@ -823,6 +834,25 @@ class GaussianSplatOp:
             self._inliner.kernel_1d(
                 f"prepare_workload_range_{enable_32bit_sort}", num_rendered, 0,
                 code)
+            if self._cfg.rasterize_backward_algo == RasterizeBackwardAlgo.PER_GAUSSIAN:
+                bucket_sizes = torch.empty([num_tiles], dtype=torch.int32, device=xyz.device)
+                self._inliner.kernel_1d(
+                    f"prepare_bucket_{self._cfg.per_gaussian_bucket_size}", num_tiles, 0,
+                    f"""
+                    auto start = $workload_ranges[i * 2 + 0];
+                    auto end = $workload_ranges[i * 2 + 1];
+                    $bucket_sizes[i] = tv::div_up(end - start, {self._cfg.per_gaussian_bucket_size});
+                    """)
+                bucket_sizes.cumsum_(0)
+                num_bucket = int(bucket_sizes[-1].item())
+
+                per_gaussian_snap = _RasterizeSnap(
+                    custom_features=torch.empty([num_bucket, num_custom_feat], dtype=torch.float32, device=xyz.device),
+                    T=torch.empty([num_bucket], dtype=torch.float32, device=xyz.device),
+                    color=torch.empty([num_bucket, self._cfg.num_channels], dtype=torch.float32, device=xyz.device),
+                    depth=torch.empty([num_bucket], dtype=torch.float32, device=xyz.device) if self._cfg.render_depth else None,
+                )
+
         # workload_ranges_tv = torch_tensor_to_tv(workload_ranges, to_const=True)
         with measure_and_print_torch("5-prep", enable=enable_verbose):
 
@@ -861,6 +891,7 @@ class GaussianSplatOp:
                 cov3d_vecs=cov3d_vecs,
                 cov2d_vecs=cov2d_vecs,
                 sh_to_rgb_ne_0=sh_to_rgb_ne_0,
+                per_gaussian_snap=per_gaussian_snap,
                 depths=depths)
         with measure_and_print_torch("rasterize", enable=enable_verbose):
             self.rasterize_forward_backward(
@@ -1623,7 +1654,7 @@ class GaussianSplatOp:
                         bool warp_valid = tv::parallel::warp_any(valid);
                         bool time_to_block_reduce = (j + 1) % {block_reduce_cache_length} == 0 || j == std::min({block_size}, toDo) - 1;
                         if (lane_idx == 0){{
-                            shared_valid_tile[warp_idx][warp_idx] = warp_valid;
+                            shared_valid_tile[j % {block_reduce_cache_length}][warp_idx] = warp_valid;
                         }}
                         if (!warp_valid && !time_to_block_reduce){{
                             continue;
@@ -1938,20 +1969,39 @@ class GaussianSplatOp:
                                     code_rasterize.raw(f"""
                                     auto collected_idx_cache = j / {block_reduce_cache_length} * {block_reduce_cache_length} + k;
                                     auto gaussian_id_cache = collected_id[collected_idx_cache];
-                                    auto valid_warp = shared_valid_tile[k].op<op::sum>();
+                                    auto valid_warp_arr = shared_valid_tile[k];
+                                    auto valid_warp = valid_warp_arr.op<op::sum>();
                                     """)
                                     with code_rasterize.if_("valid_warp > 0"):
                                         code_rasterize.raw(f"""
-                                        tv::parallel::atomicAdd($dcolor + gaussian_id_cache * 3 + 0, shared_dL_drgb_0[k].op<op::sum>());
-                                        tv::parallel::atomicAdd($dcolor + gaussian_id_cache * 3 + 1, shared_dL_drgb_1[k].op<op::sum>());
-                                        tv::parallel::atomicAdd($dcolor + gaussian_id_cache * 3 + 2, shared_dL_drgb_2[k].op<op::sum>());
-                                        tv::parallel::atomicAdd($duv + gaussian_id_cache * 2 + 0, shared_dL_duv_0[k].op<op::sum>());
-                                        tv::parallel::atomicAdd($duv + gaussian_id_cache * 2 + 1, shared_dL_duv_1[k].op<op::sum>());
+                                        dL_drgb = {{}};
+                                        dL_duv = {{}};
+                                        dL_dcov2d = {{}};
+                                        dL_dopacity = 0.0f;
+                                        TV_PRAGMA_UNROLL
+                                        for (int l = 0; l < {num_warp}; ++l){{
+                                            bool valid_warp_val = valid_warp_arr[l];
+                                            dL_drgb[0] += valid_warp_val ? shared_dL_drgb_0[k][l] : 0;
+                                            dL_drgb[1] += valid_warp_val ? shared_dL_drgb_1[k][l] : 0;
+                                            dL_drgb[2] += valid_warp_val ? shared_dL_drgb_2[k][l] : 0;
+                                            dL_duv[0] += valid_warp_val ? shared_dL_duv_0[k][l] : 0;
+                                            dL_duv[1] += valid_warp_val ? shared_dL_duv_1[k][l] : 0;
+                                            dL_dcov2d[0] += valid_warp_val ? shared_dL_dconic_0[k][l] : 0;
+                                            dL_dcov2d[1] += valid_warp_val ? shared_dL_dconic_1[k][l] : 0;
+                                            dL_dcov2d[2] += valid_warp_val ? shared_dL_dconic_2[k][l] : 0;
+                                            dL_dopacity += valid_warp_val ? shared_dL_dopacity[k][l] : 0;
+                                        }}
 
-                                        tv::parallel::atomicAdd($dconic + gaussian_id_cache * 3 + 0, shared_dL_dconic_0[k].op<op::sum>());
-                                        tv::parallel::atomicAdd($dconic + gaussian_id_cache * 3 + 1, shared_dL_dconic_1[k].op<op::sum>());
-                                        tv::parallel::atomicAdd($dconic + gaussian_id_cache * 3 + 2, shared_dL_dconic_2[k].op<op::sum>());
-                                        tv::parallel::atomicAdd($dopacity + gaussian_id_cache, shared_dL_dopacity[k].op<op::sum>());
+                                        tv::parallel::atomicAdd($dcolor + gaussian_id_cache * 3 + 0, dL_drgb[0]);
+                                        tv::parallel::atomicAdd($dcolor + gaussian_id_cache * 3 + 1, dL_drgb[1]);
+                                        tv::parallel::atomicAdd($dcolor + gaussian_id_cache * 3 + 2, dL_drgb[2]);
+                                        tv::parallel::atomicAdd($duv + gaussian_id_cache * 2 + 0, dL_duv[0]);
+                                        tv::parallel::atomicAdd($duv + gaussian_id_cache * 2 + 1, dL_duv[1]);
+
+                                        tv::parallel::atomicAdd($dconic + gaussian_id_cache * 3 + 0, dL_dcov2d[0]);
+                                        tv::parallel::atomicAdd($dconic + gaussian_id_cache * 3 + 1, dL_dcov2d[1]);
+                                        tv::parallel::atomicAdd($dconic + gaussian_id_cache * 3 + 2, dL_dcov2d[2]);
+                                        tv::parallel::atomicAdd($dopacity + gaussian_id_cache, dL_dopacity);
 
                                         """)
                                         if self._cfg.measure_atomic_add_count:
@@ -1997,11 +2047,6 @@ class GaussianSplatOp:
                                 code_rasterize.raw(f"""
                                 tv::parallel::atomicAdd($atomic_add_count, 1);
                                 """)
-                    if self._cfg.backward_reduction == "block":
-                        code_rasterize.raw(f"""
-                        tv::parallel::block_sync_shared_io();
-                        """)
-
                     # if has_custom_feat:
                     #     code_rasterize.raw(f"""
                     #     for (int channel_idx = 0; channel_idx < {num_custom_feat}; ++channel_idx){{
