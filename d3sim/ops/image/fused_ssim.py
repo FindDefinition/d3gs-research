@@ -8,6 +8,7 @@ from math import exp
 import torch.nn.functional as F
 from cumm.inliner.sympy_codegen import VectorSymOperator, Scalar, Vector, VectorExpr
 from torch.autograd.function import once_differentiable
+from cumm.inliner import measure_and_print_torch
 
 class SSIMOperator(VectorSymOperator):
     def forward(self, mu1, mu2, mu11, mu22, mu12) -> dict[str, VectorExpr]:
@@ -98,8 +99,8 @@ def ssim_forward(images_x: torch.Tensor, images_y: torch.Tensor, window_size: in
     width = images_y.shape[3]
     height = images_y.shape[2]
     ssim_res = torch.empty_like(images_y)
-    tile_size_x = 32
-    tile_size_y = 32
+    tile_size_x = 16
+    tile_size_y = 16
     block_size = tile_size_x * tile_size_y
     tile_num_x = tv.div_up(width, tile_size_x)
     tile_num_y = tv.div_up(height, tile_size_y)
@@ -129,8 +130,7 @@ def ssim_forward(images_x: torch.Tensor, images_y: torch.Tensor, window_size: in
             tv::array<uint32_t, 2> tile_idx_xy{{threadgroupPositionInGrid.x, threadgroupPositionInGrid.y}};
             tv::array<uint32_t, 2> thread_idx_xy{{threadPositionInThreadgroup.x, threadPositionInThreadgroup.y}};
 
-            threadgroup int num_done_shared[32];
-            uint thread_rank = threadgroupPositionInGrid.y * {tile_size_x} + threadgroupPositionInGrid.x;
+            uint thread_rank = threadPositionInThreadgroup.y * {tile_size_x} + threadPositionInThreadgroup.x;
             int batch_idx = threadgroupPositionInGrid.z;
             """)
         else:
@@ -289,14 +289,13 @@ def ssim_backward(dssim_map: torch.Tensor, mu_tensors: tuple[torch.Tensor, ...],
             tv::array<uint32_t, 2> tile_idx_xy{{threadgroupPositionInGrid.x, threadgroupPositionInGrid.y}};
             tv::array<uint32_t, 2> thread_idx_xy{{threadPositionInThreadgroup.x, threadPositionInThreadgroup.y}};
 
-            threadgroup int num_done_shared[32];
-            uint thread_rank = threadgroupPositionInGrid.y * {tile_size_x} + threadgroupPositionInGrid.x;
+            uint thread_rank = threadPositionInThreadgroup.y * {tile_size_x} + threadPositionInThreadgroup.x;
             int batch_idx = threadgroupPositionInGrid.z;
             """)
         else:
             code.raw(f"""
             tv::array<uint32_t, 2> pixel_idx_xy{{blockIdx.x * {tile_size_x} + threadIdx.x,
-                                                    blockIdx.y * {tile_size_y} + threadIdx.y}};
+                                                 blockIdx.y * {tile_size_y} + threadIdx.y}};
             
             tv::array<uint32_t, 2> tile_idx_xy{{blockIdx.x, blockIdx.y}};
             tv::array<uint32_t, 2> thread_idx_xy{{threadIdx.x, threadIdx.y}};
@@ -423,7 +422,7 @@ class _FusedSSIMMap(torch.autograd.Function):
 
         dimages_x = ssim_backward(dssim_map, mu_tensors, images_x, images_y, ctx.window_size, ctx.imgx_is_nhwc)
         
-        return dimages_x, None, None, None
+        return dimages_x, None, None, None, None
 
 def fused_ssim_loss(pred: torch.Tensor, target: torch.Tensor, window_size: int = 11, size_average: bool = True, pred_is_nhwc: bool = False):
     res = _FusedSSIMMap.apply(pred, target, window_size, True, pred_is_nhwc)
@@ -433,11 +432,11 @@ def fused_ssim_loss(pred: torch.Tensor, target: torch.Tensor, window_size: int =
         return res.mean(1).mean(1).mean(1)
 
 def _test_ssim_bwd():
-    img1 = torch.rand(8, 3, 1080, 1920).to(D3SIM_DEFAULT_DEVICE)
-    img2 = torch.rand(8, 3, 1080, 1920).to(D3SIM_DEFAULT_DEVICE)
+    img1 = torch.rand(1, 3, 1080, 1920).to(D3SIM_DEFAULT_DEVICE)
+    img2 = torch.rand(1, 3, 1080, 1920).to(D3SIM_DEFAULT_DEVICE)
 
     img1.requires_grad_(True)
-    imgx_is_nhwc = True 
+    imgx_is_nhwc = False
     img1_my = img1.detach().clone()
     if imgx_is_nhwc:
         img1_my = img1_my.permute(0, 2, 3, 1).contiguous()
@@ -459,19 +458,51 @@ def _test_ssim_bwd():
 
     for j in range(10):
         img1.grad = None 
-        with tv.measure_and_print("ssim ref"):
+        with measure_and_print_torch("ssim ref"):
             ssim_map_res_ref = ssim_map(img1, img2, window_size)
+        with measure_and_print_torch("ssim ref bwd"):
+
             ssim_map_res_ref.backward(dssim_map)
 
 
     for j in range(10):
         img1.grad = None 
-        with tv.measure_and_print("ssim my"):
+        with measure_and_print_torch("ssim my"):
             ssim_map_res, ctx = ssim_forward(img1_my,img2, window_size, training=True, imgx_is_nhwc=imgx_is_nhwc)
+        with measure_and_print_torch("ssim my bwd"):
+
             dimg1_my = ssim_backward(dssim_map, ctx, img1_my, img2, window_size, imgx_is_nhwc=imgx_is_nhwc)
 
     breakpoint()
     print("?")
+
+def _test_ssim_fwd():
+    img1 = torch.rand(1, 3, 1080, 1920).to(D3SIM_DEFAULT_DEVICE)
+    img2 = torch.rand(1, 3, 1080, 1920).to(D3SIM_DEFAULT_DEVICE)
+
+    imgx_is_nhwc = False
+    img1_my = img1.detach().clone()
+    if imgx_is_nhwc:
+        img1_my = img1_my.permute(0, 2, 3, 1).contiguous()
+    window_size = 11
+    ssim_map_res, ctx = ssim_forward(img1_my, img2, window_size, training=False, imgx_is_nhwc=imgx_is_nhwc)
+    ssim_map_res_ref = ssim_map(img1, img2, window_size)
+    print("FWD RES", torch.linalg.norm(ssim_map_res_ref - ssim_map_res))
+
+    for j in range(10):
+        img1.grad = None 
+        with measure_and_print_torch("ssim ref"):
+            ssim_map_res_ref = ssim_map(img1, img2, window_size)
+
+
+    for j in range(10):
+        img1.grad = None 
+        with measure_and_print_torch("ssim my"):
+            ssim_map_res, ctx = ssim_forward(img1_my,img2, window_size, training=False, imgx_is_nhwc=imgx_is_nhwc)
+
+    breakpoint()
+    print("?")
+
 
 def _test_check_ssim_grad():
     op = SSIMOperator().build()

@@ -1380,10 +1380,10 @@ class GaussianSplatOp:
 
         if IsAppleSiliconMacOs:
             code_rasterize.raw(f"""
-            int warp_idx_tmp = threadPositionInGrid.x / 32;
+            int warp_idx_tmp = threadPositionInThreadgroup.x / 32;
             int warp_x = warp_idx_tmp % {num_lane_matrix_shape[0]};
             int warp_y = warp_idx_tmp / {num_lane_matrix_shape[0]};
-            int lane_idx_tmp = threadPositionInGrid.x % 32;
+            int lane_idx_tmp = threadPositionInThreadgroup.x % 32;
             int lane_x = lane_idx_tmp % {lane_matrix_shape[0]};
             int lane_y = lane_idx_tmp / {lane_matrix_shape[0]};
 
