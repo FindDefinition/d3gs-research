@@ -80,6 +80,7 @@ def get_ssim_map(img1, img2, window, window_size, channel):
 
     return ssim_map
 
+# get_ssim_map_compiled = torch.compile(get_ssim_map, backend="inductor")
 
 def _ssim(img1, img2, window, window_size, channel, size_average=True):
     ssim_map = get_ssim_map(img1, img2, window, window_size, channel)
@@ -107,17 +108,13 @@ def ssim_forward(images_x: torch.Tensor, images_y: torch.Tensor, window_size: in
     assert window_size % 2 == 1
     padding = window_size // 2
     kernel_unique_name = f"fused_ssim_{window_size}_{num_channels}_{training}_{imgx_is_nhwc}"
-    mu1 = None 
-    mu2 = None
-    mu11 = None
-    mu22 = None
-    mu12 = None
+    dmu1 = None 
+    dmu11 = None
+    dmu12 = None
     if training:
-        mu1 = torch.empty_like(images_y)
-        mu2 = torch.empty_like(images_y)
-        mu11 = torch.empty_like(images_y)
-        mu22 = torch.empty_like(images_y)
-        mu12 = torch.empty_like(images_y)
+        dmu1 = torch.empty_like(images_y)
+        dmu11 = torch.empty_like(images_y)
+        dmu12 = torch.empty_like(images_y)
     if kernel_unique_name in _CACHED_CODES:
         code = _CACHED_CODES[kernel_unique_name]
     else:
@@ -219,18 +216,34 @@ def ssim_forward(images_x: torch.Tensor, images_y: torch.Tensor, window_size: in
                 """)
                 if training:
                     code.raw(f"""
+                    auto mu1 = val_x;
+                    auto mu2 = val_y;
+                    auto mu11 = val_xx;
+                    auto mu22 = val_yy;
+                    auto mu12 = val_xy;
+                    
+                    auto dmu1_val = 2*(mu1*(2*mu1*mu2 + 0.0001F)*(((mu1)*(mu1)) + ((mu2)*(mu2)) + 0.0001F)*(-2*mu1*mu2 + 2*mu12 + 0.0009F) - mu1*(2*mu1*mu2 + 0.0001F)*(-2*mu1*mu2 + 2*mu12 + 0.0009F)*(-((mu1)*(mu1)) + mu11 - ((mu2)*(mu2)) + mu22 + 0.0009F) + mu2*(((mu1)*(mu1)) + ((mu2)*(mu2)) + 0.0001F)*(-4*mu1*mu2 + 2*mu12 + 0.0008F)*(-((mu1)*(mu1)) + mu11 - ((mu2)*(mu2)) + mu22 + 0.0009F))/(((((mu1)*(mu1)) + ((mu2)*(mu2)) + 0.0001F)*(((mu1)*(mu1)) + ((mu2)*(mu2)) + 0.0001F))*((-((mu1)*(mu1)) + mu11 - ((mu2)*(mu2)) + mu22 + 0.0009F)*(-((mu1)*(mu1)) + mu11 - ((mu2)*(mu2)) + mu22 + 0.0009F)));
+                    auto dmu11_val = -(2*mu1*mu2 + 0.0001F)*(-2*mu1*mu2 + 2*mu12 + 0.0009F)/((((mu1)*(mu1)) + ((mu2)*(mu2)) + 0.0001F)*((-((mu1)*(mu1)) + mu11 - ((mu2)*(mu2)) + mu22 + 0.0009F)*(-((mu1)*(mu1)) + mu11 - ((mu2)*(mu2)) + mu22 + 0.0009F)));
+                    auto dmu12_val = 2*(2*mu1*mu2 + 0.0001F)/((((mu1)*(mu1)) + ((mu2)*(mu2)) + 0.0001F)*(-((mu1)*(mu1)) + mu11 - ((mu2)*(mu2)) + mu22 + 0.0009F));
+                    $dmu1[CHW_offset + i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = dmu1_val;
+                    $dmu11[CHW_offset + i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = dmu11_val;
+                    $dmu12[CHW_offset + i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = dmu12_val;
+
+                    """)
+                    """
                     $mu1[CHW_offset + i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_x;
                     $mu2[CHW_offset + i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_y;
                     $mu11[CHW_offset + i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_xx;
                     $mu22[CHW_offset + i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_yy;
                     $mu12[CHW_offset + i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_xy;
-                    """)
+
+                    """
         _CACHED_CODES[kernel_unique_name] = code
     launch_param = tv.LaunchParam(
         (tile_num_x, tile_num_y, batch_size),
         (tile_size_x, tile_size_y, 1))
     INLINER.kernel_raw(kernel_unique_name, launch_param, code)
-    return ssim_res, (mu1, mu2, mu11, mu22, mu12)
+    return ssim_res, (dmu1, dmu11, dmu12)
 
 def ssim_backward(dssim_map: torch.Tensor, mu_tensors: tuple[torch.Tensor, ...], images_x: torch.Tensor, images_y: torch.Tensor, window_size: int, imgx_is_nhwc: bool = False):
     # dssim_map: NCHW
@@ -242,39 +255,27 @@ def ssim_backward(dssim_map: torch.Tensor, mu_tensors: tuple[torch.Tensor, ...],
     height = images_y.shape[2]
     dimages_x = torch.empty_like(images_x)
     tile_size_x = 32
-    tile_size_y = 32
+    tile_size_y = 16
     block_size = tile_size_x * tile_size_y
     tile_num_x = tv.div_up(width, tile_size_x)
     tile_num_y = tv.div_up(height, tile_size_y)
     assert window_size % 2 == 1
     padding = window_size // 2
 
-    dmu1 = torch.empty_like(images_y)
-    dmu11 = torch.empty_like(images_y)
-    dmu12 = torch.empty_like(images_y)
-
-    mu1_ten = mu_tensors[0]
-    mu2_ten = mu_tensors[1]
-    mu11_ten = mu_tensors[2]
-    mu22_ten = mu_tensors[3]
-    mu12_ten = mu_tensors[4]
+    dmu1 = mu_tensors[0]
+    dmu11 = mu_tensors[1]
+    dmu12 = mu_tensors[2]
+    # mu22_ten = mu_tensors[3]
+    # mu12_ten = mu_tensors[4]
     # calc three conv grad
-    INLINER.kernel_1d("ssim_bwd_prep", images_x.numel(), 0, f"""
-    auto dssim_map_val = $dssim_map[i];
-    auto mu1 = $mu1_ten[i];
-    auto mu2 = $mu2_ten[i];
-    auto mu11 = $mu11_ten[i];
-    auto mu22 = $mu22_ten[i];
-    auto mu12 = $mu12_ten[i];
-    // generated by sympy, so looks a bit weird
-    auto dmu1_val = 2*dssim_map_val*(mu1*(2*mu1*mu2 + 0.0001F)*(((mu1)*(mu1)) + ((mu2)*(mu2)) + 0.0001F)*(-2*mu1*mu2 + 2*mu12 + 0.0009F) - mu1*(2*mu1*mu2 + 0.0001F)*(-2*mu1*mu2 + 2*mu12 + 0.0009F)*(-((mu1)*(mu1)) + mu11 - ((mu2)*(mu2)) + mu22 + 0.0009F) + mu2*(((mu1)*(mu1)) + ((mu2)*(mu2)) + 0.0001F)*(-4*mu1*mu2 + 2*mu12 + 0.0008F)*(-((mu1)*(mu1)) + mu11 - ((mu2)*(mu2)) + mu22 + 0.0009F))/(((((mu1)*(mu1)) + ((mu2)*(mu2)) + 0.0001F)*(((mu1)*(mu1)) + ((mu2)*(mu2)) + 0.0001F))*((-((mu1)*(mu1)) + mu11 - ((mu2)*(mu2)) + mu22 + 0.0009F)*(-((mu1)*(mu1)) + mu11 - ((mu2)*(mu2)) + mu22 + 0.0009F)));
-    auto dmu11_val = -dssim_map_val*(2*mu1*mu2 + 0.0001F)*(-2*mu1*mu2 + 2*mu12 + 0.0009F)/((((mu1)*(mu1)) + ((mu2)*(mu2)) + 0.0001F)*((-((mu1)*(mu1)) + mu11 - ((mu2)*(mu2)) + mu22 + 0.0009F)*(-((mu1)*(mu1)) + mu11 - ((mu2)*(mu2)) + mu22 + 0.0009F)));
-    auto dmu12_val = 2*dssim_map_val*(2*mu1*mu2 + 0.0001F)/((((mu1)*(mu1)) + ((mu2)*(mu2)) + 0.0001F)*(-((mu1)*(mu1)) + mu11 - ((mu2)*(mu2)) + mu22 + 0.0009F));
+    # with tv.measure_and_print("ssim_bwd_prep"):
 
-    $dmu1[i] = dmu1_val;
-    $dmu11[i] = dmu11_val;
-    $dmu12[i] = dmu12_val;
-    """)
+    #     INLINER.kernel_1d("ssim_bwd_prep", images_x.numel(), 0, f"""
+    #     auto dssim_map_val = $dssim_map[i];
+    #     $dmu1[i] *= dssim_map_val;
+    #     $dmu11[i] *= dssim_map_val;
+    #     $dmu12[i] *= dssim_map_val;
+    #     """)
     # here we only need to run three gaussian convs.
     kernel_unique_name = f"fused_ssim_bwd_{window_size}_{num_channels}_{imgx_is_nhwc}"
     if kernel_unique_name in _CACHED_CODES:
@@ -316,7 +317,7 @@ def ssim_backward(dssim_map: torch.Tensor, mu_tensors: tuple[torch.Tensor, ...],
         auto dmu12_ptr = $dmu12 + batch_idx * {num_channels} * $width * $height;
 
         auto dimages_x_ptr = $dimages_x + batch_idx * {num_channels} * $width * $height;
-        
+        auto dssim_map_ptr = $dssim_map + batch_idx * {num_channels} * $width * $height;
         constexpr int kPaddedTileSizeX = {tile_size_x} + {2 * padding};
         constexpr int kPaddedTileSizeY = {tile_size_y} + {2 * padding};
 
@@ -342,9 +343,10 @@ def ssim_backward(dssim_map: torch.Tensor, mu_tensors: tuple[torch.Tensor, ...],
                 int pixel_idx_y = pixel_idx_xy_base[1] + load_idx_y - {padding};
                 bool valid = pixel_idx_x >= 0 && pixel_idx_x < $width && pixel_idx_y >= 0 && pixel_idx_y < $height;
                 if (load_idx < kLoadCount){{
-                    buf_x[load_idx_y][load_idx_x] = valid ? dmu1_ptr[i * $width * $height + pixel_idx_y * $width + pixel_idx_x] : 0.0f;
-                    buf_y[load_idx_y][load_idx_x] = valid ? dmu11_ptr[i * $width * $height + pixel_idx_y * $width + pixel_idx_x] : 0.0f;
-                    buf_z[load_idx_y][load_idx_x] = valid ? dmu12_ptr[i * $width * $height + pixel_idx_y * $width + pixel_idx_x] : 0.0f;
+                    auto dssim_map_val = valid ? dssim_map_ptr[i * $width * $height + pixel_idx_y * $width + pixel_idx_x] : 0.0f;
+                    buf_x[load_idx_y][load_idx_x] = valid ? dssim_map_val * dmu1_ptr[i * $width * $height + pixel_idx_y * $width + pixel_idx_x] : 0.0f;
+                    buf_y[load_idx_y][load_idx_x] = valid ? dssim_map_val * dmu11_ptr[i * $width * $height + pixel_idx_y * $width + pixel_idx_x] : 0.0f;
+                    buf_z[load_idx_y][load_idx_x] = valid ? dssim_map_val * dmu12_ptr[i * $width * $height + pixel_idx_y * $width + pixel_idx_x] : 0.0f;
                 }}
             }}
             tv::parallel::block_sync_shared_io();
@@ -389,6 +391,7 @@ def ssim_backward(dssim_map: torch.Tensor, mu_tensors: tuple[torch.Tensor, ...],
     launch_param = tv.LaunchParam(
         (tile_num_x, tile_num_y, batch_size),
         (tile_size_x, tile_size_y, 1))
+    # with tv.measure_and_print(kernel_unique_name):
     INLINER.kernel_raw(kernel_unique_name, launch_param, code)
     return dimages_x
 
@@ -445,7 +448,6 @@ def _test_ssim_bwd():
     ssim_map_res, ctx = ssim_forward(img1_my, img2, window_size, training=True, imgx_is_nhwc=imgx_is_nhwc)
     ssim_map_res_ref = ssim_map(img1, img2, window_size)
     print("FWD RES", torch.linalg.norm(ssim_map_res_ref - ssim_map_res))
-
     dssim_map = torch.rand_like(ssim_map_res)
 
     ssim_map_res_ref.backward(dssim_map)
