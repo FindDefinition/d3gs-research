@@ -15,6 +15,7 @@ from d3sim.algos.d3gs.origin.data.load import OriginDataset, load_scene_info_and
 from d3sim.algos.d3gs.render import CameraBundle, GaussianSplatOp, GaussianSplatOutput, rasterize_gaussians, rasterize_gaussians_dynamic
 from d3sim.algos.d3gs.strategy import GaussianTrainState, reset_param_in_optim
 from d3sim.algos.d3gs.losses import SSimLoss, SSimLossV2, SSimLossV3, l1_loss, ssim
+from d3sim.ops.image.fused_ssim import fused_ssim_loss
 from cumm import tensorview as tv
 from d3sim.algos.d3gs.tools import create_origin_3dgs_optimizers, init_original_3dgs_model
 import contextlib 
@@ -163,10 +164,10 @@ class Trainer:
                     ev.step_ctx_value.output = out
                     color = out.color
                     if not self.cfg.model.op.use_nchw:
-                        color = out.color.permute(0, 3, 1, 2)
+                        color = out.color.permute(0, 3, 1, 2).contiguous()
                     Ll1 = l1_loss(color, gt_image)
                     # WARNING: ssim loss in mps is very slow. 40ms (batch_size=8) in m3.
-                    loss = (1.0 - self.cfg.train.lambda_dssim) * Ll1 + self.cfg.train.lambda_dssim * (1.0 - ssim(color, gt_image))
+                    loss = (1.0 - self.cfg.train.lambda_dssim) * Ll1 + self.cfg.train.lambda_dssim * (1.0 - fused_ssim_loss(color, gt_image))
                     # with tv.measure_and_print("rasterize-bwd"):
                 with measure_and_print_torch(f"bwd-{self.model.xyz.shape[0]}", enable=verbose):
 
@@ -340,7 +341,7 @@ def __main():
     else:
         cfg = config_def.Config(
             model=config_def.Model(config_def.GaussianSplatConfig(enable_32bit_sort=False, gaussian_std_sigma=3.0)),
-            train=config_def.Train(iterations=7000, batch_size=1)
+            train=config_def.Train(iterations=7000, batch_size=8)
         )
     model = GaussianModelOriginFused.create_from_dataset(ds, device=torch.device(D3SIM_DEFAULT_DEVICE)) 
     model = model.to_parameter()

@@ -613,7 +613,7 @@ class GaussianSplatOp:
             # breakpoint()
             tiles_touched.cumsum_(0)
             num_rendered = int(tiles_touched[-1].item())
-        print("num_rendered", num_rendered)
+        # print("num_rendered", num_rendered)
         # raise NotImplementedError
 
 

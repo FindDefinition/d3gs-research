@@ -1,3 +1,4 @@
+from numpy import imag
 from d3sim.constants import D3SIM_DEFAULT_DEVICE, IsAppleSiliconMacOs
 from d3sim.csrc.inliner import INLINER
 import torch
@@ -6,6 +7,8 @@ from cumm import tensorview as tv
 from math import exp
 import torch.nn.functional as F
 from cumm.inliner.sympy_codegen import VectorSymOperator, Scalar, Vector, VectorExpr
+from torch.autograd.function import once_differentiable
+
 class SSIMOperator(VectorSymOperator):
     def forward(self, mu1, mu2, mu11, mu22, mu12) -> dict[str, VectorExpr]:
         mu1_sq = mu1 * mu1 
@@ -85,15 +88,16 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     else:
         return ssim_map.mean(1).mean(1).mean(1)
 
-def ssim_forward(images_x: torch.Tensor, images_y: torch.Tensor, window_size: int, training: bool = True):
+def ssim_forward(images_x: torch.Tensor, images_y: torch.Tensor, window_size: int, training: bool = True, imgx_is_nhwc: bool = False):
     # images_x: NCHW
+    assert images_x.is_contiguous() and images_y.is_contiguous()
     assert images_x.ndim == 4 and images_y.ndim == 4
-    num_channels = images_x.size(-3)
+    num_channels = images_x.size(-3 if not imgx_is_nhwc else -1)
     assert num_channels == images_y.size(-3)
     batch_size = images_x.shape[0]
-    width = images_x.shape[3]
-    height = images_x.shape[2]
-    ssim_res = torch.empty_like(images_x)
+    width = images_y.shape[3]
+    height = images_y.shape[2]
+    ssim_res = torch.empty_like(images_y)
     tile_size_x = 32
     tile_size_y = 32
     block_size = tile_size_x * tile_size_y
@@ -101,18 +105,18 @@ def ssim_forward(images_x: torch.Tensor, images_y: torch.Tensor, window_size: in
     tile_num_y = tv.div_up(height, tile_size_y)
     assert window_size % 2 == 1
     padding = window_size // 2
-    kernel_unique_name = f"fused_ssim_{window_size}_{num_channels}_{training}"
+    kernel_unique_name = f"fused_ssim_{window_size}_{num_channels}_{training}_{imgx_is_nhwc}"
     mu1 = None 
     mu2 = None
     mu11 = None
     mu22 = None
     mu12 = None
     if training:
-        mu1 = torch.empty_like(images_x)
-        mu2 = torch.empty_like(images_x)
-        mu11 = torch.empty_like(images_x)
-        mu22 = torch.empty_like(images_x)
-        mu12 = torch.empty_like(images_x)
+        mu1 = torch.empty_like(images_y)
+        mu2 = torch.empty_like(images_y)
+        mu11 = torch.empty_like(images_y)
+        mu22 = torch.empty_like(images_y)
+        mu12 = torch.empty_like(images_y)
     if kernel_unique_name in _CACHED_CODES:
         code = _CACHED_CODES[kernel_unique_name]
     else:
@@ -145,8 +149,10 @@ def ssim_forward(images_x: torch.Tensor, images_y: torch.Tensor, window_size: in
                                                 tile_idx_xy[1] * {tile_size_y}}};
 
         bool pixel_valid = pixel_idx_xy[0] < $width && pixel_idx_xy[1] < $height;
+        int CHW_offset = batch_idx * {num_channels} * $width * $height;
         auto image_x_ptr = $images_x + batch_idx * {num_channels} * $width * $height;
         auto image_y_ptr = $images_y + batch_idx * {num_channels} * $width * $height;
+        auto ssim_res_ptr = $ssim_res + batch_idx * {num_channels} * $width * $height;
         constexpr int kPaddedTileSizeX = {tile_size_x} + {2 * padding};
         constexpr int kPaddedTileSizeY = {tile_size_y} + {2 * padding};
 
@@ -157,6 +163,7 @@ def ssim_forward(images_x: torch.Tensor, images_y: torch.Tensor, window_size: in
         TV_SHARED_MEMORY float buf_y[{tile_size_y} + {2 * padding}][{tile_size_x} + {2 * padding}];
         """)
         with code.for_(f"int i = 0; i < {num_channels}; ++i"):
+            img_x_index_str = "i * $width * $height + pixel_idx_y * $width + pixel_idx_x" if not imgx_is_nhwc else "pixel_idx_y * $width * $num_channels + pixel_idx_x * $num_channels + i"
             code.raw(f"""
             tv::parallel::block_sync_shared_io();
 
@@ -170,7 +177,7 @@ def ssim_forward(images_x: torch.Tensor, images_y: torch.Tensor, window_size: in
                 int pixel_idx_y = pixel_idx_xy_base[1] + load_idx_y - {padding};
                 bool valid = pixel_idx_x >= 0 && pixel_idx_x < $width && pixel_idx_y >= 0 && pixel_idx_y < $height;
                 if (load_idx < kLoadCount){{
-                    buf_x[load_idx_y][load_idx_x] = valid ? image_x_ptr[i * $width * $height + pixel_idx_y * $width + pixel_idx_x] : 0.0f;
+                    buf_x[load_idx_y][load_idx_x] = valid ? image_x_ptr[{img_x_index_str}] : 0.0f;
                     buf_y[load_idx_y][load_idx_x] = valid ? image_y_ptr[i * $width * $height + pixel_idx_y * $width + pixel_idx_x] : 0.0f;
                 }}
             }}
@@ -203,20 +210,20 @@ def ssim_forward(images_x: torch.Tensor, images_y: torch.Tensor, window_size: in
             float sigma12 = val_xy - mu1_mu2;
             float C1 = 0.01f * 0.01f;
             float C2 = 0.03f * 0.03f;
-            float ssim_val = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2));
+            float ssim_val = ((2.0f * mu1_mu2 + C1) * (2.0f * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2));
 
             """)
             with code.if_("pixel_valid"):
                 code.raw(f"""
-                $ssim_res[i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = ssim_val;
+                ssim_res_ptr[i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = ssim_val;
                 """)
                 if training:
                     code.raw(f"""
-                    $mu1[i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_x;
-                    $mu2[i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_y;
-                    $mu11[i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_xx;
-                    $mu22[i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_yy;
-                    $mu12[i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_xy;
+                    $mu1[CHW_offset + i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_x;
+                    $mu2[CHW_offset + i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_y;
+                    $mu11[CHW_offset + i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_xx;
+                    $mu22[CHW_offset + i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_yy;
+                    $mu12[CHW_offset + i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_xy;
                     """)
         _CACHED_CODES[kernel_unique_name] = code
     launch_param = tv.LaunchParam(
@@ -225,119 +232,14 @@ def ssim_forward(images_x: torch.Tensor, images_y: torch.Tensor, window_size: in
     INLINER.kernel_raw(kernel_unique_name, launch_param, code)
     return ssim_res, (mu1, mu2, mu11, mu22, mu12)
 
-def ssim_conv2d_debug_forward(images_x: torch.Tensor, window_size: int, is_bwd: bool = False):
-    # images_x: NCHW
-    assert images_x.ndim == 4
-    num_channels = images_x.size(-3)
-    batch_size = images_x.shape[0]
-    width = images_x.shape[3]
-    height = images_x.shape[2]
-    ssim_res = torch.empty_like(images_x)
-    tile_size_x = 32
-    tile_size_y = 32
-    block_size = tile_size_x * tile_size_y
-    tile_num_x = tv.div_up(width, tile_size_x)
-    tile_num_y = tv.div_up(height, tile_size_y)
-    assert window_size % 2 == 1
-    padding = window_size // 2
-    kernel_unique_name = f"fused_ssim_debug_fwd_{is_bwd}_{window_size}_{num_channels}"
-    if kernel_unique_name in _CACHED_CODES:
-        code = _CACHED_CODES[kernel_unique_name]
-    else:
-        window = create_window(window_size, num_channels).cpu().numpy()[0][0]
-        code = pccm.code()
-        if IsAppleSiliconMacOs:
-            code.raw(f"""
-            tv::array<uint32_t, 2> pixel_idx_xy{{threadgroupPositionInGrid.x * {tile_size_x} + threadPositionInThreadgroup.x, 
-                                                 threadgroupPositionInGrid.y * {tile_size_y} + threadPositionInThreadgroup.y}};
-            tv::array<uint32_t, 2> tile_idx_xy{{threadgroupPositionInGrid.x, threadgroupPositionInGrid.y}};
-            tv::array<uint32_t, 2> thread_idx_xy{{threadPositionInThreadgroup.x, threadPositionInThreadgroup.y}};
-
-            threadgroup int num_done_shared[32];
-            uint thread_rank = threadgroupPositionInGrid.y * {tile_size_x} + threadgroupPositionInGrid.x;
-            int batch_idx = threadgroupPositionInGrid.z;
-            """)
-        else:
-            code.raw(f"""
-            tv::array<uint32_t, 2> pixel_idx_xy{{blockIdx.x * {tile_size_x} + threadIdx.x,
-                                                    blockIdx.y * {tile_size_y} + threadIdx.y}};
-            
-            tv::array<uint32_t, 2> tile_idx_xy{{blockIdx.x, blockIdx.y}};
-            tv::array<uint32_t, 2> thread_idx_xy{{threadIdx.x, threadIdx.y}};
-            uint32_t thread_rank = threadIdx.y * {tile_size_x} + threadIdx.x;
-            int batch_idx = blockIdx.z;
-            """)
-
-        code.raw(f"""
-        tv::array<uint32_t, 2> pixel_idx_xy_base{{tile_idx_xy[0] * {tile_size_x},
-                                                tile_idx_xy[1] * {tile_size_y}}};
-
-        bool pixel_valid = pixel_idx_xy[0] < $width && pixel_idx_xy[1] < $height;
-        auto image_x_ptr = $images_x + batch_idx * {num_channels} * $width * $height;
-        constexpr int kPaddedTileSizeX = {tile_size_x} + {2 * padding};
-        constexpr int kPaddedTileSizeY = {tile_size_y} + {2 * padding};
-
-        constexpr int kLoadCount = kPaddedTileSizeX * kPaddedTileSizeY;
-        constexpr int kLoadIters = (kLoadCount + {block_size} - 1) / {block_size};
-
-        TV_SHARED_MEMORY float buf_x[{tile_size_y} + {2 * padding}][{tile_size_x} + {2 * padding}];
-        """)
-        with code.for_(f"int i = 0; i < {num_channels}; ++i"):
-            code.raw(f"""
-            tv::parallel::block_sync_shared_io();
-
-            // 32x32 block load (32 + 2 * padding) x (32 + 2 * padding) data
-            TV_PRAGMA_UNROLL
-            for (int j = 0; j < kLoadIters; ++j){{
-                int load_idx = thread_rank + j * {block_size};
-                int load_idx_x = load_idx % kPaddedTileSizeX;
-                int load_idx_y = load_idx / kPaddedTileSizeX;
-                int pixel_idx_x = pixel_idx_xy_base[0] + load_idx_x - {padding};
-                int pixel_idx_y = pixel_idx_xy_base[1] + load_idx_y - {padding};
-                bool valid = pixel_idx_x >= 0 && pixel_idx_x < $width && pixel_idx_y >= 0 && pixel_idx_y < $height;
-                if (load_idx < kLoadCount){{
-                    buf_x[load_idx_y][load_idx_x] = valid ? image_x_ptr[i * $width * $height + pixel_idx_y * $width + pixel_idx_x] : 0.0f;
-                }}
-            }}
-            tv::parallel::block_sync_shared_io();
-            float val_x = 0.0f;
-            int local_x = thread_idx_xy[0];
-            int local_y = thread_idx_xy[1];
-
-            """)
-            for i in range(window_size):
-                for j in range(window_size):
-                    if is_bwd:
-                        gauss_val = float(window[window_size - i - 1, window_size - j - 1].item())
-                    else:
-                        gauss_val = float(window[i, j].item())
-
-                    code.raw(f"""
-                    val_x += buf_x[local_y + {i}][local_x + {j}] * {gauss_val}f;
-                    """)
-            code.raw(f"""
-
-            if (pixel_valid){{
-                $ssim_res[i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = val_x;
-            }}
-            """)
-        _CACHED_CODES[kernel_unique_name] = code
-    launch_param = tv.LaunchParam(
-        (tile_num_x, tile_num_y, batch_size),
-        (tile_size_x, tile_size_y, 1))
-    INLINER.kernel_raw(kernel_unique_name, launch_param, code)
-    return ssim_res
-
-
-
-def ssim_backward(dssim_map: torch.Tensor, mu_tensors: tuple[torch.Tensor, ...], images_x: torch.Tensor, images_y: torch.Tensor, window_size: int):
-    # images_x: NCHW
+def ssim_backward(dssim_map: torch.Tensor, mu_tensors: tuple[torch.Tensor, ...], images_x: torch.Tensor, images_y: torch.Tensor, window_size: int, imgx_is_nhwc: bool = False):
+    # dssim_map: NCHW
     assert images_x.ndim == 4 and images_y.ndim == 4
-    num_channels = images_x.size(-3)
+    num_channels = images_x.size(-3 if not imgx_is_nhwc else -1)
     assert num_channels == images_y.size(-3)
     batch_size = images_x.shape[0]
-    width = images_x.shape[3]
-    height = images_x.shape[2]
+    width = images_y.shape[3]
+    height = images_y.shape[2]
     dimages_x = torch.empty_like(images_x)
     tile_size_x = 32
     tile_size_y = 32
@@ -347,9 +249,9 @@ def ssim_backward(dssim_map: torch.Tensor, mu_tensors: tuple[torch.Tensor, ...],
     assert window_size % 2 == 1
     padding = window_size // 2
 
-    dmu1 = torch.empty_like(images_x)
-    dmu11 = torch.empty_like(images_x)
-    dmu12 = torch.empty_like(images_x)
+    dmu1 = torch.empty_like(images_y)
+    dmu11 = torch.empty_like(images_y)
+    dmu12 = torch.empty_like(images_y)
 
     mu1_ten = mu_tensors[0]
     mu2_ten = mu_tensors[1]
@@ -374,7 +276,7 @@ def ssim_backward(dssim_map: torch.Tensor, mu_tensors: tuple[torch.Tensor, ...],
     $dmu12[i] = dmu12_val;
     """)
     # here we only need to run three gaussian convs.
-    kernel_unique_name = f"fused_ssim_bwd_{window_size}_{num_channels}"
+    kernel_unique_name = f"fused_ssim_bwd_{window_size}_{num_channels}_{imgx_is_nhwc}"
     if kernel_unique_name in _CACHED_CODES:
         code = _CACHED_CODES[kernel_unique_name]
     else:
@@ -413,6 +315,8 @@ def ssim_backward(dssim_map: torch.Tensor, mu_tensors: tuple[torch.Tensor, ...],
         auto dmu1_ptr = $dmu1 + batch_idx * {num_channels} * $width * $height;
         auto dmu11_ptr = $dmu11 + batch_idx * {num_channels} * $width * $height;
         auto dmu12_ptr = $dmu12 + batch_idx * {num_channels} * $width * $height;
+
+        auto dimages_x_ptr = $dimages_x + batch_idx * {num_channels} * $width * $height;
         
         constexpr int kPaddedTileSizeX = {tile_size_x} + {2 * padding};
         constexpr int kPaddedTileSizeY = {tile_size_y} + {2 * padding};
@@ -460,15 +364,28 @@ def ssim_backward(dssim_map: torch.Tensor, mu_tensors: tuple[torch.Tensor, ...],
                     dimg1_square += buf_y[local_y + {i}][local_x + {j}] * {gauss_val}f;
                     dimg1img2 += buf_z[local_y + {i}][local_x + {j}] * {gauss_val}f;
                     """)
-            code.raw(f"""
+            with code.if_("pixel_valid"):
+                if imgx_is_nhwc:
+                    code.raw(f"""
+                    auto img1_val = image_x_ptr[pixel_idx_xy[1] * $width * $num_channels + pixel_idx_xy[0] * $num_channels + i];
+                    """)
+                else:
+                    code.raw(f"""
+                    auto img1_val = image_x_ptr[i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]];
+                    """)
 
-            if (pixel_valid){{
-                auto img1_val = image_x_ptr[i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]];
+                code.raw(f"""
                 auto img2_val = image_y_ptr[i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]];
                 dimg1 += 2.0f * img1_val * dimg1_square + dimg1img2 * img2_val;
-                $dimages_x[i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = dimg1;
-            }}
-            """)
+                """)
+                if imgx_is_nhwc:
+                    code.raw(f"""
+                    dimages_x_ptr[pixel_idx_xy[1] * $width * $num_channels + pixel_idx_xy[0] * $num_channels + i] = dimg1;
+                    """)
+                else:
+                    code.raw(f"""
+                    dimages_x_ptr[i * $width * $height + pixel_idx_xy[1] * $width + pixel_idx_xy[0]] = dimg1;
+                    """)
         _CACHED_CODES[kernel_unique_name] = code
     launch_param = tv.LaunchParam(
         (tile_num_x, tile_num_y, batch_size),
@@ -476,66 +393,85 @@ def ssim_backward(dssim_map: torch.Tensor, mu_tensors: tuple[torch.Tensor, ...],
     INLINER.kernel_raw(kernel_unique_name, launch_param, code)
     return dimages_x
 
+class _FusedSSIMMap(torch.autograd.Function):
 
-def _test_ssim():
-    img1 = torch.rand(1, 3, 1080, 1920).to(D3SIM_DEFAULT_DEVICE)
-    img2 = torch.rand(1, 3, 1080, 1920).to(D3SIM_DEFAULT_DEVICE)
-    window_size = 11
-    ref_ssim_map = ssim_map(img1, img2, window_size)
-    for j in range(10):
-        with tv.measure_and_print("WTF"):
-            my_ssim_map = ssim_forward(img1, img2, window_size)
-    print(my_ssim_map)
-    print(torch.linalg.norm(ref_ssim_map - my_ssim_map))
-    breakpoint()
-    print("?")
+    @staticmethod
+    def forward(
+        ctx,
+        images_x: torch.Tensor,
+        images_y: torch.Tensor,
+        window_size: int,
+        training: bool = True,
+        imgx_is_nhwc: bool = False
+        
+    ):
+        res, ctx_tensors = ssim_forward(images_x, images_y, window_size, training, imgx_is_nhwc)
+        if training:
+            ctx.save_for_backward(images_x, images_y, *ctx_tensors)
+        ctx.window_size = window_size
+        ctx.imgx_is_nhwc = imgx_is_nhwc
+        return res
 
-def _test_conv2d_bwd():
-    img1 = torch.rand(1, 3, 1080, 1920).to(D3SIM_DEFAULT_DEVICE)
-    img1.requires_grad_(True)
-    img1_my = img1.clone()
-    img1_my.requires_grad_(True)
-    window_size = 11
-    conv2d_res = ssim_conv2d_debug_forward(img1_my, window_size)
-    conv2d_res_ref = F.conv2d(img1, create_window(window_size, 3), padding=window_size // 2, groups=3)
-    
-    dconv2d_res = torch.rand_like(conv2d_res)
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, dssim_map):
+        assert dssim_map.is_contiguous()
+        tensors = ctx.saved_tensors
+        mu_tensors = tensors[2:]
+        images_x = tensors[0]
+        images_y = tensors[1]
 
-    conv2d_res_ref.backward(dconv2d_res)
-    dimg1_ref = img1.grad
+        dimages_x = ssim_backward(dssim_map, mu_tensors, images_x, images_y, ctx.window_size, ctx.imgx_is_nhwc)
+        
+        return dimages_x, None, None, None
 
-    dimg1_my = ssim_conv2d_debug_forward(dconv2d_res, window_size, False)
-
-
-    print(torch.linalg.norm(conv2d_res - conv2d_res_ref))
-    print(torch.linalg.norm(dimg1_my - dimg1_ref))
-
-    breakpoint()
-    print("?")
+def fused_ssim_loss(pred: torch.Tensor, target: torch.Tensor, window_size: int = 11, size_average: bool = True, pred_is_nhwc: bool = False):
+    res = _FusedSSIMMap.apply(pred, target, window_size, True, pred_is_nhwc)
+    if size_average:
+        return res.mean()
+    else:
+        return res.mean(1).mean(1).mean(1)
 
 def _test_ssim_bwd():
-    img1 = torch.rand(1, 3, 1080, 1920).to(D3SIM_DEFAULT_DEVICE)
-    img2 = torch.rand(1, 3, 1080, 1920).to(D3SIM_DEFAULT_DEVICE)
+    img1 = torch.rand(8, 3, 1080, 1920).to(D3SIM_DEFAULT_DEVICE)
+    img2 = torch.rand(8, 3, 1080, 1920).to(D3SIM_DEFAULT_DEVICE)
 
     img1.requires_grad_(True)
-    img1_my = img1.clone()
+    imgx_is_nhwc = True 
+    img1_my = img1.detach().clone()
+    if imgx_is_nhwc:
+        img1_my = img1_my.permute(0, 2, 3, 1).contiguous()
     img1_my.requires_grad_(True)
     window_size = 11
-    ssim_map_res, ctx = ssim_forward(img1_my,img2, window_size, training=True)
+    ssim_map_res, ctx = ssim_forward(img1_my, img2, window_size, training=True, imgx_is_nhwc=imgx_is_nhwc)
     ssim_map_res_ref = ssim_map(img1, img2, window_size)
-    
+    print("FWD RES", torch.linalg.norm(ssim_map_res_ref - ssim_map_res))
+
     dssim_map = torch.rand_like(ssim_map_res)
 
     ssim_map_res_ref.backward(dssim_map)
     dimg1_ref = img1.grad
 
-    dimg1_my = ssim_backward(dssim_map, ctx, img1_my, img2, window_size)
+    dimg1_my = ssim_backward(dssim_map, ctx, img1_my, img2, window_size, imgx_is_nhwc=imgx_is_nhwc)
+    if imgx_is_nhwc:
+        dimg1_my = dimg1_my.permute(0, 3, 1, 2)
+    print("BWD_RES", torch.linalg.norm(dimg1_my - dimg1_ref))
 
-    print(torch.linalg.norm(dimg1_my - dimg1_ref))
+    for j in range(10):
+        img1.grad = None 
+        with tv.measure_and_print("ssim ref"):
+            ssim_map_res_ref = ssim_map(img1, img2, window_size)
+            ssim_map_res_ref.backward(dssim_map)
+
+
+    for j in range(10):
+        img1.grad = None 
+        with tv.measure_and_print("ssim my"):
+            ssim_map_res, ctx = ssim_forward(img1_my,img2, window_size, training=True, imgx_is_nhwc=imgx_is_nhwc)
+            dimg1_my = ssim_backward(dssim_map, ctx, img1_my, img2, window_size, imgx_is_nhwc=imgx_is_nhwc)
 
     breakpoint()
     print("?")
-
 
 def _test_check_ssim_grad():
     op = SSIMOperator().build()
