@@ -8,6 +8,7 @@ from d3sim.algos.d3gs.base import GaussianModelBase
 import d3sim.core.arrcheck as ac
 import torch
 from d3sim.csrc.inliner import INLINER
+from d3sim.ops.optim.adam import STEP_PER_GAUSSIAN
 import pccm 
 from d3sim.algos.d3gs.render import GaussianSplatOutput 
 from d3sim.algos.d3gs import config_def
@@ -170,6 +171,8 @@ def zero_optimizer_by_range(
         return getattr(model, name)
 
     def optimizer_fn(key: str, v: torch.Tensor) -> torch.Tensor:
+        if key == STEP_PER_GAUSSIAN:
+            pass 
         v[interval[0]:interval[1]].zero_()
         return v
     # update the parameters and the state in the optimizers

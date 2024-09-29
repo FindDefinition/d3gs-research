@@ -126,6 +126,8 @@ class GaussianModelOriginBase(GaussianModelBase, abc.ABC):
         self.scale.requires_grad_(requires_grad)
         self.opacity.requires_grad_(requires_grad)
         self.color_sh.requires_grad_(requires_grad)
+        if self.color_sh_base is not None:
+            self.color_sh_base.requires_grad_(requires_grad)
 
     def clear_grad(self):
         self.xyz.grad = None
@@ -133,13 +135,15 @@ class GaussianModelOriginBase(GaussianModelBase, abc.ABC):
         self.scale.grad = None
         self.opacity.grad = None
         self.color_sh.grad = None
+        if self.color_sh_base is not None:
+            self.color_sh_base.grad = None
 
     def create_proxy(self, code: pccm.FunctionCode, gaussian_idx: str, batch_idx: str, batch_size: int, is_bwd: bool = False) -> GaussianModelProxyBase:
         raise NotImplementedError
 
     def create_model_with_act(self):
         if self.act_applied:
-            return self
+            return dataclasses.replace(self)
         return dataclasses.replace(
             self,
             xyz=self.xyz_act,
@@ -147,6 +151,7 @@ class GaussianModelOriginBase(GaussianModelBase, abc.ABC):
             scale=self.scale_act,
             opacity=self.opacity_act,
             color_sh=self.color_sh_act,
+            color_sh_base=self.color_sh_base_act,
             act_applied=True,
         )
 
@@ -328,57 +333,81 @@ class GaussianModelProxyOrigin(GaussianModelProxyBase["GaussianModelOriginFused"
             self._code.raw(f"""
             {grad} = {grad}.op<op::{self._model.fused_scale_act_op[1]}>({out}, {out}_raw);
             """)
-            if self._batch_size == 1:
+            if self._is_sparse_grad and self._batch_size != 1:
                 self._code.raw(f"""
-                op::reinterpret_cast_array_nd<3>(scale_grad_ptr)[{self._gaussian_idx}] = {grad};
+                tv::parallel::atomicAdd(op::reinterpret_cast_array_nd<3>(scale_grad_ptr) + {self._out_grad_idx}, {grad});
                 """)
             else:
-                self._code.raw(f"""
-                dscale_acc += {grad};
-                """)
+                if self._batch_size == 1:
+                    self._code.raw(f"""
+                    op::reinterpret_cast_array_nd<3>(scale_grad_ptr)[{self._out_grad_idx}] = {grad};
+                    """)
+                else:
+                    self._code.raw(f"""
+                    dscale_acc += {grad};
+                    """)
         elif field == GaussianCoreFields.QUATERNION_XYZW:
             self._code.raw(f"""
             {grad} = {grad}.op<op::{self._model.fused_quaternion_xyzw_act_op[1]}>({out}, {out}_raw);
             """)
-            if self._batch_size == 1:
+            if self._is_sparse_grad and self._batch_size != 1:
                 self._code.raw(f"""
-                op::reinterpret_cast_array_nd<4>(quaternion_xyzw_grad_ptr)[{self._gaussian_idx}] = {grad};
+                tv::parallel::atomicAdd(op::reinterpret_cast_array_nd<4>(quaternion_xyzw_grad_ptr) + {self._out_grad_idx}, {grad});
                 """)
             else:
-                self._code.raw(f"""
-                dquat_acc += {grad};
-                """)
+
+                if self._batch_size == 1:
+                    self._code.raw(f"""
+                    op::reinterpret_cast_array_nd<4>(quaternion_xyzw_grad_ptr)[{self._out_grad_idx}] = {grad};
+                    """)
+                else:
+                    self._code.raw(f"""
+                    dquat_acc += {grad};
+                    """)
         elif field == GaussianCoreFields.OPACITY:
             self._code.raw(f"""
             {grad} = tv::array<float, 1>{{{grad}}}.op<op::{self._model.fused_opacity_act_op[1]}>(tv::array<float, 1>{{{out}}}, {out}_raw)[0];
             """)
-            if self._batch_size == 1:
+            if self._is_sparse_grad and self._batch_size != 1:
                 self._code.raw(f"""
-                opacity_grad_ptr[{self._gaussian_idx}] = {grad};
+                tv::parallel::atomicAdd(opacity_grad_ptr + {self._out_grad_idx}, {grad});
                 """)
             else:
-                self._code.raw(f"""
-                dopacity_val_acc += {grad};
-                """)
+                if self._batch_size == 1:
+                    self._code.raw(f"""
+                    opacity_grad_ptr[{self._out_grad_idx}] = {grad};
+                    """)
+                else:
+                    self._code.raw(f"""
+                    dopacity_val_acc += {grad};
+                    """)
         elif field == GaussianCoreFields.XYZ:
-            if self._batch_size == 1:
+            if self._is_sparse_grad and self._batch_size != 1:
                 self._code.raw(f"""
-                op::reinterpret_cast_array_nd<3>(xyz_grad_ptr)[{self._gaussian_idx}] = {grad};
+                tv::parallel::atomicAdd(op::reinterpret_cast_array_nd<3>(xyz_grad_ptr) + {self._out_grad_idx}, {grad});
                 """)
             else:
-                self._code.raw(f"""
-                dxyz_acc += {grad};
-                """)
+                if self._batch_size == 1:
+                    self._code.raw(f"""
+                    op::reinterpret_cast_array_nd<3>(xyz_grad_ptr)[{self._out_grad_idx}] = {grad};
+                    """)
+                else:
+                    self._code.raw(f"""
+                    dxyz_acc += {grad};
+                    """)
         elif field == GaussianCoreFields.RGB:
             assert normed_dir != "" and normed_dir_grad != ""
             self._code.raw(f"""
             auto sh_ptr = op::reinterpret_cast_array_nd<3>(color_sh_ptr) + {self._gaussian_idx} * {(max_degree + 1) * (max_degree + 1) - has_color_base};
-            auto dsh_ptr = op::reinterpret_cast_array_nd<3>(color_sh_grad_ptr) + i * {(max_degree + 1) * (max_degree + 1) - has_color_base};
+            auto dsh_ptr = op::reinterpret_cast_array_nd<3>(color_sh_grad_ptr) + {self._out_grad_idx} * {(max_degree + 1) * (max_degree + 1) - has_color_base};
             """)
-            sh_grad_fn = "sh_dir_to_rgb_grad" if self._batch_size == 1 else "sh_dir_to_rgb_grad_batch"
+            if self._is_sparse_grad and self._batch_size != 1:
+                sh_grad_fn = "sh_dir_to_rgb_grad_atomic"
+            else:
+                sh_grad_fn = "sh_dir_to_rgb_grad" if self._batch_size == 1 else "sh_dir_to_rgb_grad_batch"
             if has_color_base:
                 self._code.raw(f"""
-                auto dsh_base_ptr = op::reinterpret_cast_array_nd<3>(color_sh_base_grad_ptr) + {self._gaussian_idx};
+                auto dsh_base_ptr = op::reinterpret_cast_array_nd<3>(color_sh_base_grad_ptr) + {self._out_grad_idx};
                 auto {normed_dir_grad} = Gaussian3D::{sh_grad_fn}<{cur_degree}>(color_grad, dsh_ptr,
                     {normed_dir}, sh_ptr, dsh_base_ptr);
                 """)
@@ -391,14 +420,14 @@ class GaussianModelProxyOrigin(GaussianModelProxyBase["GaussianModelOriginFused"
             raise NotImplementedError(f"field {field} not implemented yet.")
 
     def save_accumulated_grad(self):
-        if self._batch_size == 1:
+        if self._batch_size == 1 or self._is_sparse_grad:
             return 
         else:
             self._code.raw(f"""
-            op::reinterpret_cast_array_nd<3>(xyz_grad_ptr)[{self._gaussian_idx}] = dxyz_acc;
-            op::reinterpret_cast_array_nd<4>(quaternion_xyzw_grad_ptr)[{self._gaussian_idx}] = dquat_acc;
-            op::reinterpret_cast_array_nd<3>(scale_grad_ptr)[{self._gaussian_idx}] = dscale_acc;
-            opacity_grad_ptr[{self._gaussian_idx}] = dopacity_val_acc;
+            op::reinterpret_cast_array_nd<3>(xyz_grad_ptr)[{self._out_grad_idx}] = dxyz_acc;
+            op::reinterpret_cast_array_nd<4>(quaternion_xyzw_grad_ptr)[{self._out_grad_idx}] = dquat_acc;
+            op::reinterpret_cast_array_nd<3>(scale_grad_ptr)[{self._out_grad_idx}] = dscale_acc;
+            opacity_grad_ptr[{self._out_grad_idx}] = dopacity_val_acc;
             """) 
 
 

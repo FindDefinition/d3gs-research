@@ -9,6 +9,7 @@ from d3sim.csrc.gs3d import SHConstants
 from d3sim.algos.d3gs import config_def
 from d3sim.algos.d3gs.ops import simple_knn
 from d3sim.core.pytorch.optim import NgpAdam
+from d3sim.ops.optim.adam import GaussianAdam, GaussianSparseAdam
 
 def rgb_to_sh(rgb):
     return (rgb - 0.5) / SHConstants.C0
@@ -155,16 +156,16 @@ def create_origin_3dgs_optimizers(model: GaussianModelOriginBase, optim_cfg: con
     if IsAppleSiliconMacOs:
         fused = False
     optimizers = {
-        pg["name"] :torch.optim.Adam(
+        pg["name"] :(GaussianAdam if "color" in pg["name"] else GaussianAdam)(
             [{"params": pg["params"], "lr": pg["lr"], "name": pg["name"]}],
-            fused=fused,
+            fused=False,
             eps=1e-15 / bs_scale,
             betas=(1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.999)),
 
         )
         for pg in pgs
     }
-
+    print("Gaussian Adam!!!")
     xyz_schedule_xyz = get_expon_lr_func(lr_init=optim_cfg.position_lr_init*spatial_lr_scale * bs_scale,
                                                     lr_final=optim_cfg.position_lr_final*spatial_lr_scale * bs_scale,
                                                     lr_delay_mult=optim_cfg.position_lr_delay_mult,

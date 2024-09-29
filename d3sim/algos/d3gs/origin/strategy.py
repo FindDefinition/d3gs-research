@@ -1,5 +1,6 @@
 
 import abc
+import copy
 from d3sim.algos.d3gs.origin.model import GaussianModelOriginBase
 from d3sim.core import dataclass_dispatch as dataclasses
 from d3sim.core.arrcheck.dcbase import DataClassWithArrayCheck
@@ -14,7 +15,7 @@ from d3sim.algos.d3gs.render import GaussianSplatOutput
 from d3sim.algos.d3gs import config_def
 from d3sim.core.debugtools import get_from_store
 from torch.optim.optimizer import Optimizer
-from d3sim.algos.d3gs.strategy import GaussianTrainState, GaussianStrategyBase, select_gs_optimizer_by_mask, zero_optimizer_by_range
+from d3sim.algos.d3gs.strategy import GaussianTrainState, GaussianStrategyBase, compare_optimizer_params, select_gs_optimizer_by_mask, zero_optimizer_by_range
 
 @dataclasses.dataclass
 class GaussianStrategyOrigin(GaussianStrategyBase):
@@ -73,6 +74,7 @@ class GaussianStrategyOrigin(GaussianStrategyBase):
 
     @torch.no_grad()
     def update(self, state: GaussianTrainState, out: GaussianSplatOutput, duv: torch.Tensor):
+        assert out.sparse_gaussian_ids is None, "TODO"
         width, height = out.image_shape_wh
         max_width_height = max(width, height)
         N = duv.shape[1]
@@ -162,6 +164,8 @@ class GaussianStrategyOrigin(GaussianStrategyBase):
         state: GaussianTrainState,
         step: int,
     ) -> Any:
+        # model = copy.deepcopy(model)
+        # optimizers = copy.deepcopy(optimizers)
         assert isinstance(model, GaussianModelOriginBase)
         num_gaussian = model.xyz.shape[0]
         duv_ndc_length = state.duv_ndc_length
@@ -170,8 +174,8 @@ class GaussianStrategyOrigin(GaussianStrategyBase):
         xyz = model.xyz_act
         opacity = model.opacity_act
         quat_xyzw = model.quaternion_xyzw_act
-        refine_by_radii = step < self.refine_scale2d_stop_iter
-        prune_too_big = step > self.reset_opacity_every
+        refine_by_radii = (step < self.refine_scale2d_stop_iter)
+        prune_too_big = (step > self.reset_opacity_every)
         max_radii = state.max_radii
         origin_prune_mask_u8 = torch.empty(num_gaussian, dtype=torch.uint8, device=duv_ndc_length.device)
         assert not refine_by_radii
@@ -233,7 +237,9 @@ class GaussianStrategyOrigin(GaussianStrategyBase):
         dupti_should_prune = origin_should_prune[should_dupti]
         n_split = int(should_split.sum().item())
         n_dupti = int(should_dupti.sum().item())
-        # print("n_split", n_split, "n_dupti", n_dupti)
+        print("n_dupti", n_dupti, "n_split", n_split)
+
+        # return should_dupti, should_split
         should_split_inds = torch.nonzero(should_split).view(-1)
         should_dupti_inds = torch.nonzero(should_dupti).view(-1)
         origin_model_inds = torch.arange(num_gaussian, device=duv_ndc_length.device)
@@ -271,7 +277,8 @@ class GaussianStrategyOrigin(GaussianStrategyBase):
         assert n_split * 2 == scale_split.shape[0]
         assert n_split * 2 == opacity_split.shape[0]
         assert n_split * 2 == quaternion_xyzw_split.shape[0]
-
+        # print("opacity prune", (torch.sigmoid(model.opacity) < 0.005).int().sum())
+        # print("opacity_split prune", opacity_split.shape, split_prune_mask_u8.shape, (torch.sigmoid(opacity_split) < 0.005).int().sum())
         code.raw(f"""
         namespace op = tv::arrayops;
         using math_op_t = tv::arrayops::MathScalarOp<float>;
@@ -289,6 +296,7 @@ class GaussianStrategyOrigin(GaussianStrategyBase):
             code.raw(f"""
             quat = quat.op<op::{model.fused_quaternion_xyzw_act_op[0]}>();
             """)
+        # print(model.fused_opacity_act_op, prune_too_big, refine_by_radii)
         if model.fused_opacity_act_op is not None:
             code.raw(f"""
             opacity_val = tv::array<float, 1>{{opacity_val}}.op<op::{model.fused_opacity_act_op[0]}>()[0];
@@ -317,10 +325,12 @@ class GaussianStrategyOrigin(GaussianStrategyBase):
         """)
         kernel_name = f"grow gs do split_{model.fused_scale_act_op}_{model.fused_quaternion_xyzw_act_op}_{model.fused_opacity_act_op}"
         INLINER.kernel_1d(kernel_name, n_split * 2, 0, code)
+        
         # print("SPLIT XYZ", new_model_split.xyz.shape, new_model_split.xyz)
         # model_debug = model[~should_split].concat(new_model)
         # model_debug_dict = model_debug.get_all_tensor_fields()
-
+        # print("PRUNE DEBUG", split_prune_mask_u8.int().sum(), torch.linalg.norm(opacity_split_debug - torch.sigmoid(opacity_split)))
+        # breakpoint()
         new_model_should_prune[n_dupti:] = split_prune_mask_u8 > 0
 
         model_origin_prune = model[~origin_should_prune]
@@ -334,7 +344,7 @@ class GaussianStrategyOrigin(GaussianStrategyBase):
         res_model = model_origin_prune.concat(new_model_prune)
         res_state = state_origin_prune.concat(new_state_prune)
         res_inds = torch.cat([origin_model_inds_prune, new_model_inds_prune], dim=0)
-
+        # print("PRUNE", origin_should_prune.int().sum(), new_model_should_prune.int().sum(), split_prune_mask_u8.int().sum())
         # print(torch.linalg.norm(res_model.xyz - ))
 
         model.assign_inplace(res_model.to_parameter())
@@ -346,9 +356,9 @@ class GaussianStrategyOrigin(GaussianStrategyBase):
         # print(res_inds.shape, res_inds)
         # print("------")
         # debug_optim = get_from_store("debug")
-        # _compare_optimizer_params(optimizers, debug_optim)
+        # compare_optimizer_params(optimizers, debug_optim)
         # print(n_split, n_dupti, res_inds.shape, res_model.xyz.shape)
         # breakpoint()
 
-        return n_dupti, n_split
+        return model
 

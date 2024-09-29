@@ -1,8 +1,9 @@
 import hashlib
+import tempfile
 from d3sim.algos.d3gs.hd3gs.data.chunks import ColmapSceneSplitChunks
 from d3sim.data.scene_def import Scene 
 from pathlib import Path 
-from d3sim.data.transforms.colmap import ColmapCopySubsetImageFromModel, ColmapCreatePriorFromModel, ColmapFetchResult, ColmapMetaHandleBase, ColmapPriorModelCustomMatchKNN, ColmapToRefUnrectifiedResult, ColmapWorkDirs, ColmapFeatureExtract, ColmapCustomMatchGen, ColmapCustomMatch, ColmapMapper, ColmapUndistort, ColmapFilterFloatingAndNoSFM, ColmapRefineRotAndScale, ColmapFromRefUnrectifiedResult
+from d3sim.data.transforms.colmap import ColmapBundleAdjustment, ColmapCopySubsetImageFromModel, ColmapCreatePriorFromModel, ColmapFetchResult, ColmapMetaHandleBase, ColmapPointTriangulator, ColmapPriorModelCustomMatchKNN, ColmapTBALoop, ColmapToRefUnrectifiedResult, ColmapWorkDirs, ColmapFeatureExtract, ColmapCustomMatchGen, ColmapCustomMatch, ColmapMapper, ColmapUndistort, ColmapFilterFloatingAndNoSFM, ColmapRefineRotAndScale, ColmapFromRefUnrectifiedResult, align_two_colmap_models
 
 
 def __main_test_simpify():
@@ -126,11 +127,20 @@ def __test_make_chunk():
     create_db = ColmapCreatePriorFromModel()
     create_knn_match = ColmapPriorModelCustomMatchKNN(k=200)
     copy_img = ColmapCopySubsetImageFromModel()
-    for s in res:
+    feature_extract = ColmapFeatureExtract(from_existing_model=True)
+    custom_match = ColmapCustomMatch()
+    tbaloop = ColmapTBALoop(
+        num_loop=2,
+        point_triangulator=ColmapPointTriangulator(),
+        bundle_adjustment=ColmapBundleAdjustment(),
+    )
+    for s in res[:1]:
         s = create_db(s)
         s = create_knn_match(s)
         s = copy_img(s)
-
+        s = feature_extract(s)
+        s = custom_match(s)
+        s = tbaloop(s)
 
 def __main():
     """run slow global colmap matcher"""
@@ -154,6 +164,13 @@ def __main_stage_2():
     # scene = ColmapUndistort()(scene)
     # scene = ColmapFetchReferenceResult(external_path="/root/autodl-tmp/example_dataset/camera_calibration/rectified/sparse/")(scene)
 
+def __test_align_colmap_model():
+    inp_model_path = "/root/autodl-tmp/example_dataset/camera_calibration/raw_chunks/0_0/bundle_adjustment/sparse/0/"
+    old_model_path = "/root/autodl-tmp/example_dataset/camera_calibration/raw_chunks/0_0/sparse/0/"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_path = tmpdir
+        align_two_colmap_models(inp_model_path, old_model_path, out_path)
+     
 
 if __name__ == "__main__":
-    __test_make_chunk()
+    __test_align_colmap_model()

@@ -74,7 +74,7 @@ def _main_bwd():
     # breakpoint()
     cfg = GaussianSplatConfig(verbose=False)
     op = GaussianSplatOp(cfg)
-    for j in range(5):
+    for j in range(10):
         mod.clear_grad()
         print("cur_sh_degree", mod.cur_sh_degree)
         uv_grad_holder.grad = None
@@ -184,4 +184,4 @@ def _main():
 
     
 if __name__ == "__main__":
-    _main_bwd()
+    _main()

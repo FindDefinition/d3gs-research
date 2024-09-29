@@ -26,7 +26,8 @@ def get_qualname_of_type(klass: Type) -> str:
 
 T = TypeVar("T", bound="GaussianModelBase")
 class GaussianModelProxyBase(Generic[T], abc.ABC):
-    def __init__(self, model: T, code: pccm.FunctionCode, gaussian_idx: str, batch_idx: str, batch_size: int, is_bwd: bool = False):
+    def __init__(self, model: T, code: pccm.FunctionCode, gaussian_idx: str, batch_idx: str, batch_size: int, is_bwd: bool = False,
+            out_grad_idx: str | None = None, is_sparse_grad: bool = False):
         self._model = model 
         self._code = code 
         self._gaussian_idx = gaussian_idx
@@ -34,6 +35,11 @@ class GaussianModelProxyBase(Generic[T], abc.ABC):
         self._is_bwd = is_bwd
         self._batch_idx = batch_idx
         self._unique_id = get_qualname_of_type(type(self))
+        if out_grad_idx is None:
+            self._out_grad_idx = gaussian_idx
+        else:
+            self._out_grad_idx = out_grad_idx
+        self._is_sparse_grad = is_sparse_grad
 
     def get_unique_id(self):
         return self._unique_id

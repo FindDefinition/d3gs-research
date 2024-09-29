@@ -19,6 +19,7 @@ from d3sim.ops.image.fused_ssim import fused_ssim_loss
 from cumm import tensorview as tv
 from d3sim.algos.d3gs.tools import create_origin_3dgs_optimizers, init_original_3dgs_model
 import contextlib 
+from d3sim.ops.optim.adam import GaussianSparseAdam
 import pccm 
 
 import torch 
@@ -84,6 +85,7 @@ class Trainer:
 
         for cam_raw in ds.get_cameras("test"):
             cam = cam_raw
+            assert not self.model.act_applied
             out = rasterize_gaussians(self.model, cam, op=self.gauss_op, training=False)
             gt_image = cam_raw.get_image_torch(device=self.device)
             color = out.color
@@ -176,8 +178,28 @@ class Trainer:
                 ev.step_ctx_value.loss = loss
                 assert duv is not None 
                 with measure_and_print_torch("optim", enable=verbose):
-
+                    # mask = out.radii
+                    # if self.cfg.train.batch_size > 1:
+                    #     bs = self.cfg.train.batch_size
+                    #     radii = out.radii
+                    #     stride = radii.shape[1]
+                    #     assert radii.shape[0] == bs
+                    #     mask = torch.empty([out.radii.shape[0] // bs], dtype=torch.uint8, device=out.radii.device)
+                    #     INLINER.kernel_1d("create_multi_batch_mask", mask.shape[0], 0, f"""
+                        
+                    #     bool mask_val = false;
+                    #     for (int j = 0; j < $bs; ++j){{
+                    #         mask_val |= $radii[j * $stride + i] > 0;
+                    #     }}
+                    #     $mask[i] = mask_val;
+                    #     """)
+                    # else:
                     for optim in self.optims.values():
+                        # optim.step_with_mask(out.radii)
+                        # if isinstance(optim, GaussianSparseAdam):
+                        #     optim.sparse_step_update()
+
+
                         optim.step()
                         # optim.zero_grad(set_to_none = True)
                 # with measure_and_print_torch("optim zero_grad", enable=verbose):
@@ -199,6 +221,10 @@ class Trainer:
                     # print(torch.linalg.norm(self.train_state_ref.duv_ndc_length - self.train_state.duv_ndc_length))
                     # print(torch.linalg.norm(self.train_state_ref.count - self.train_state.count))
                     # breakpoint()
+                with torch.no_grad():
+                    if (ev.cur_step + 1) % (1000 // self.cfg.train.batch_size) == 0 and ev.cur_step + 1 >= (4000 // self.cfg.train.batch_size):
+                        self._on_eval(ev.cur_step + 1, ds)
+
                 if self.use_strategy_ref:
 
                     params = self.model.get_all_tensor_fields()
@@ -245,8 +271,8 @@ class Trainer:
                         cv2.imwrite(str(save_root / f"test_train_{ev.cur_step}.png"), out_color_u8)
 
                 with torch.no_grad():
-                    if (ev.cur_step + 1) % (1000 // self.cfg.train.batch_size) == 0:
-                        self._on_eval(ev.cur_step + 1, ds)
+                    # if (ev.cur_step + 1) % (1000 // self.cfg.train.batch_size) == 0 and ev.cur_step + 1 >= (4000 // self.cfg.train.batch_size):
+                    #     self._on_eval(ev.cur_step + 1, ds)
                     # progress.print(f"LosVals: {loss.item():.{7}f}", self.model.xyz.shape[0])
 
                     ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -281,6 +307,10 @@ class Trainer:
         if ev.cur_step + 1 < self.cfg.train.strategy.refine_stop_iter:
             if (ev.cur_step + 1) > self.cfg.train.strategy.refine_start_iter:
             # if (ev.cur_step + 1) > 200:
+                # for optim in self.optims.values():
+                #     if isinstance(optim, GaussianSparseAdam):
+                #         optim.sparse_step_update()
+
                 self.strategy.refine_gs(self.model, self.optims, self.train_state, ev.cur_step + 1) 
                 # breakpoint()
                 torch.cuda.empty_cache()
@@ -291,8 +321,13 @@ class Trainer:
             return 
 
         if ev.cur_step + 1 < self.cfg.train.strategy.refine_stop_iter:
-            print("RESET GS OPACITY!!!")
-            origin_opacity = self.model.opacity
+            print("RESET GS OPACITY!!!", ev.cur_step + 1)
+            # for optim in self.optims.values():
+            #     if isinstance(optim, GaussianSparseAdam):
+            #         optim.sparse_step_update()
+
+
+            origin_opacity = self.model.opacity_act
             opacities_new = torch.empty_like(self.model.opacity)
             opacity_thresh = self.cfg.train.strategy.reset_opacity_thresh
             code = pccm.code()
@@ -327,6 +362,9 @@ def __main():
         path = "/Users/yanyan/Downloads/360_v2/garden"
     else:
         path = "/root/autodl-tmp/garden_scene/garden"
+        # path = "/root/autodl-tmp/bicycle_scene/bicycle_scene"
+        # path = "/root/autodl-tmp/bonsai_scene/bonsai"
+
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
@@ -341,7 +379,7 @@ def __main():
     else:
         cfg = config_def.Config(
             model=config_def.Model(config_def.GaussianSplatConfig(enable_32bit_sort=False, gaussian_std_sigma=3.0)),
-            train=config_def.Train(iterations=7000, batch_size=8)
+            train=config_def.Train(iterations=7000, batch_size=1)
         )
     model = GaussianModelOriginFused.create_from_dataset(ds, device=torch.device(D3SIM_DEFAULT_DEVICE)) 
     model = model.to_parameter()

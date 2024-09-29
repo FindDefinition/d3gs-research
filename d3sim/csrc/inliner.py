@@ -7,6 +7,8 @@ from .camera import CameraOps, CameraDefs
 from .vis import VisUtils
 from .gs3d import Gaussian3D
 from .geometry import GeometryOps
+from .optim import OptimOps
+
 import pccm
 from d3sim.d3sim_thtools.pytorch_tools import PyTorchTools
 
@@ -26,7 +28,7 @@ class MPSContext(MPSContextBase):
 __deps: list[type[pccm.Class]] = [
     TensorViewArrayLinalg, TensorViewNVRTC, TensorViewNVRTCHashKernel,
     RotationMath, CameraOps, CameraDefs, VisUtils, Gaussian3D,
-    GeometryOps
+    GeometryOps, OptimOps
 ]
 
 def create_default_inliner():

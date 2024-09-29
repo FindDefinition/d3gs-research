@@ -201,16 +201,56 @@ class Gaussian3D(pccm.Class):
         return code.ret("tv::array<T, 3>")
 
     @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def _assign_vec3_ptr(self):
+        code = pccm.FunctionCode()
+        code.targ("T")
+        code.arg("ptr", "TV_METAL_DEVICE tv::array<T, 3>*")
+        code.arg("vec", "const TV_METAL_THREAD tv::array<T, 3>&")
+        code.raw(f"""
+        *ptr = vec;
+        """)
+        return code
+        
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def _assign_add_vec3_ptr(self):
+        code = pccm.FunctionCode()
+        code.targ("T")
+        code.arg("ptr", "TV_METAL_DEVICE tv::array<T, 3>*")
+        code.arg("vec", "const TV_METAL_THREAD tv::array<T, 3>&")
+        code.raw(f"""
+        *ptr += vec;
+        """)
+        return code
+
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def _assign_atomic_add_vec3_ptr(self):
+        code = pccm.FunctionCode()
+        code.targ("T")
+        code.arg("ptr", "TV_METAL_DEVICE tv::array<T, 3>*")
+        code.arg("vec", "const TV_METAL_THREAD tv::array<T, 3>&")
+        code.raw(f"""
+        tv::parallel::atomicAdd(ptr, vec);
+        """)
+        return code
+
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
     def sh_dir_to_rgb_grad(self):
-        return self.sh_dir_to_rgb_grad_template(False)
+        return self.sh_dir_to_rgb_grad_template(False, False)
 
     @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
     def sh_dir_to_rgb_grad_batch(self):
-        return self.sh_dir_to_rgb_grad_template(True)
+        return self.sh_dir_to_rgb_grad_template(True, False)
 
-    def sh_dir_to_rgb_grad_template(self, is_batch: bool):
+    @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
+    def sh_dir_to_rgb_grad_atomic(self):
+        return self.sh_dir_to_rgb_grad_template(False, True)
+
+    def sh_dir_to_rgb_grad_template(self, is_batch: bool, is_atomic_add: bool):
         code = pccm.code()
-        assign_or_add = "+=" if is_batch else "="
+        if is_atomic_add:
+            assign_add_func = "_assign_atomic_add_vec3_ptr"
+        else:
+            assign_add_func = "_assign_add_vec3_ptr" if is_batch else "_assign_vec3_ptr"
         code.nontype_targ("Degree", "int")
         code.targ("T")
         code.arg("drgb", "tv::array<T, 3>")
@@ -232,15 +272,15 @@ class Gaussian3D(pccm.Class):
         T y = dir[1];
         T z = dir[2];
 
-        real_dsh_base_ptr[0] {assign_or_add} T({SHConstants.C0}) * drgb;
+        {assign_add_func}(real_dsh_base_ptr[0], T({SHConstants.C0}) * drgb);
         if (Degree > 0)
         {{
             T dRGBdsh1 = -T({SHConstants.C1}) * y;
             T dRGBdsh2 = T({SHConstants.C1}) * z;
             T dRGBdsh3 = -T({SHConstants.C1}) * x;
-            dsh_ptr[0] {assign_or_add} dRGBdsh1 * drgb;
-            dsh_ptr[1] {assign_or_add} dRGBdsh2 * drgb;
-            dsh_ptr[2] {assign_or_add} dRGBdsh3 * drgb;
+            {assign_add_func}(dsh_ptr, dRGBdsh1 * drgb);
+            {assign_add_func}(dsh_ptr + 1, dRGBdsh2 * drgb);
+            {assign_add_func}(dsh_ptr + 2, dRGBdsh3 * drgb);
 
             dRGBdx = -T({SHConstants.C1}) * sh[2];
             dRGBdy = -T({SHConstants.C1}) * sh[0];
@@ -255,15 +295,19 @@ class Gaussian3D(pccm.Class):
                 T dRGBdsh6 = T({SHConstants.C2[2]}) * (T(2) * zz - xx - yy);
                 T dRGBdsh7 = T({SHConstants.C2[3]}) * xz;
                 T dRGBdsh8 = T({SHConstants.C2[4]}) * (xx - yy);
-                dsh_ptr[3] {assign_or_add} dRGBdsh4 * drgb;
-                dsh_ptr[4] {assign_or_add} dRGBdsh5 * drgb;
-                dsh_ptr[5] {assign_or_add} dRGBdsh6 * drgb;
-                dsh_ptr[6] {assign_or_add} dRGBdsh7 * drgb;
-                dsh_ptr[7] {assign_or_add} dRGBdsh8 * drgb;
-                
-                dRGBdx += T({SHConstants.C2[0]}) * y * sh[3] + T({SHConstants.C2[2]}) * T(2) * -x * sh[5] + T({SHConstants.C2[3]}) * z * sh[6] + T({SHConstants.C2[4]}) * T(2) * x * sh[7];
-                dRGBdy += T({SHConstants.C2[0]}) * x * sh[3] + T({SHConstants.C2[1]}) * z * sh[4] + T({SHConstants.C2[2]}) * T(2) * -y * sh[5] + T({SHConstants.C2[4]}) * T(2) * -y * sh[7];
-                dRGBdz += T({SHConstants.C2[1]}) * y * sh[4] + T({SHConstants.C2[2]}) * T(2) * T(2) * z * sh[5] + T({SHConstants.C2[3]}) * x * sh[6];
+                {assign_add_func}(dsh_ptr + 3, dRGBdsh4 * drgb);
+                {assign_add_func}(dsh_ptr + 4, dRGBdsh5 * drgb);
+                {assign_add_func}(dsh_ptr + 5, dRGBdsh6 * drgb);
+                {assign_add_func}(dsh_ptr + 6, dRGBdsh7 * drgb);
+                {assign_add_func}(dsh_ptr + 7, dRGBdsh8 * drgb);
+                auto sh_3 = sh[3];
+                auto sh_4 = sh[4];
+                auto sh_5 = sh[5];
+                auto sh_6 = sh[6];
+                auto sh_7 = sh[7];
+                dRGBdx += T({SHConstants.C2[0]}) * y * sh_3 + T({SHConstants.C2[2]}) * T(2) * -x * sh_5 + T({SHConstants.C2[3]}) * z * sh_6 + T({SHConstants.C2[4]}) * T(2) * x * sh_7;
+                dRGBdy += T({SHConstants.C2[0]}) * x * sh_3 + T({SHConstants.C2[1]}) * z * sh_4 + T({SHConstants.C2[2]}) * T(2) * -y * sh_5 + T({SHConstants.C2[4]}) * T(2) * -y * sh_7;
+                dRGBdz += T({SHConstants.C2[1]}) * y * sh_4 + T({SHConstants.C2[2]}) * T(2) * T(2) * z * sh_5 + T({SHConstants.C2[3]}) * x * sh_6;
                 
                 if (Degree > 2)
                 {{
@@ -274,38 +318,45 @@ class Gaussian3D(pccm.Class):
                     T dRGBdsh13 = T({SHConstants.C3[4]}) * x * (T(4) * zz - xx - yy);
                     T dRGBdsh14 = T({SHConstants.C3[5]}) * z * (xx - yy);
                     T dRGBdsh15 = T({SHConstants.C3[6]}) * x * (xx - T(3) * yy);
-                    dsh_ptr[8] {assign_or_add} dRGBdsh9 * drgb;
-                    dsh_ptr[9] {assign_or_add} dRGBdsh10 * drgb;
-                    dsh_ptr[10] {assign_or_add} dRGBdsh11 * drgb;
-                    dsh_ptr[11] {assign_or_add} dRGBdsh12 * drgb;
-                    dsh_ptr[12] {assign_or_add} dRGBdsh13 * drgb;
-                    dsh_ptr[13] {assign_or_add} dRGBdsh14 * drgb;
-                    dsh_ptr[14] {assign_or_add} dRGBdsh15 * drgb;
+                    {assign_add_func}(dsh_ptr + 8, dRGBdsh9 * drgb);
+                    {assign_add_func}(dsh_ptr + 9, dRGBdsh10 * drgb);
+                    {assign_add_func}(dsh_ptr + 10, dRGBdsh11 * drgb);
+                    {assign_add_func}(dsh_ptr + 11, dRGBdsh12 * drgb);
+                    {assign_add_func}(dsh_ptr + 12, dRGBdsh13 * drgb);
+                    {assign_add_func}(dsh_ptr + 13, dRGBdsh14 * drgb);
+                    {assign_add_func}(dsh_ptr + 14, dRGBdsh15 * drgb);
+                    auto sh_8 = sh[8];
+                    auto sh_9 = sh[9];
+                    auto sh_10 = sh[10];
+                    auto sh_11 = sh[11];
+                    auto sh_12 = sh[12];
+                    auto sh_13 = sh[13];
+                    auto sh_14 = sh[14];
 
                     dRGBdx += (
-                        T({SHConstants.C3[0]}) * sh[8] * T(3) * T(2) * xy +
-                        T({SHConstants.C3[1]}) * sh[9] * yz +
-                        T({SHConstants.C3[2]}) * sh[10] * -T(2) * xy +
-                        T({SHConstants.C3[3]}) * sh[11] * -T(3) * T(2) * xz +
-                        T({SHConstants.C3[4]}) * sh[12] * (-T(3) * xx + T(4) * zz - yy) +
-                        T({SHConstants.C3[5]}) * sh[13] * T(2) * xz +
-                        T({SHConstants.C3[6]}) * sh[14] * T(3) * (xx - yy));
+                        T({SHConstants.C3[0]}) * sh_8 * T(3) * T(2) * xy +
+                        T({SHConstants.C3[1]}) * sh_9 * yz +
+                        T({SHConstants.C3[2]}) * sh_10 * -T(2) * xy +
+                        T({SHConstants.C3[3]}) * sh_11 * -T(3) * T(2) * xz +
+                        T({SHConstants.C3[4]}) * sh_12 * (-T(3) * xx + T(4) * zz - yy) +
+                        T({SHConstants.C3[5]}) * sh_13 * T(2) * xz +
+                        T({SHConstants.C3[6]}) * sh_14 * T(3) * (xx - yy));
 
                     dRGBdy += (
-                        T({SHConstants.C3[0]}) * sh[8] * T(3) * (xx - yy) +
-                        T({SHConstants.C3[1]}) * sh[9] * xz +
-                        T({SHConstants.C3[2]}) * sh[10] * (-T(3) * yy + T(4) * zz - xx) +
-                        T({SHConstants.C3[3]}) * sh[11] * -T(3) * T(2) * yz +
-                        T({SHConstants.C3[4]}) * sh[12] * -T(2) * xy +
-                        T({SHConstants.C3[5]}) * sh[13] * -T(2) * yz +
-                        T({SHConstants.C3[6]}) * sh[14] * -T(3) * T(2) * xy);
+                        T({SHConstants.C3[0]}) * sh_8 * T(3) * (xx - yy) +
+                        T({SHConstants.C3[1]}) * sh_9 * xz +
+                        T({SHConstants.C3[2]}) * sh_10 * (-T(3) * yy + T(4) * zz - xx) +
+                        T({SHConstants.C3[3]}) * sh_11 * -T(3) * T(2) * yz +
+                        T({SHConstants.C3[4]}) * sh_12 * -T(2) * xy +
+                        T({SHConstants.C3[5]}) * sh_13 * -T(2) * yz +
+                        T({SHConstants.C3[6]}) * sh_14 * -T(3) * T(2) * xy);
 
                     dRGBdz += (
-                        T({SHConstants.C3[1]}) * sh[9] * xy +
-                        T({SHConstants.C3[2]}) * sh[10] * T(4) * T(2) * yz +
-                        T({SHConstants.C3[3]}) * sh[11] * T(3) * (T(2) * zz - xx - yy) +
-                        T({SHConstants.C3[4]}) * sh[12] * T(4) * T(2) * xz +
-                        T({SHConstants.C3[5]}) * sh[13] * (xx - yy));
+                        T({SHConstants.C3[1]}) * sh_9 * xy +
+                        T({SHConstants.C3[2]}) * sh_10 * T(4) * T(2) * yz +
+                        T({SHConstants.C3[3]}) * sh_11 * T(3) * (T(2) * zz - xx - yy) +
+                        T({SHConstants.C3[4]}) * sh_12 * T(4) * T(2) * xz +
+                        T({SHConstants.C3[5]}) * sh_13 * (xx - yy));
                 }}
             }}
         }}
@@ -313,109 +364,6 @@ class Gaussian3D(pccm.Class):
         return ddir;
         """)
         return code.ret("tv::array<T, 3>")
-
-    # @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
-    def sh_dir_to_rgb_grad_v2(self):
-        code = pccm.code()
-        code.nontype_targ("Degree", "int")
-        code.arg("drgb", "tv::array<float, 3>")
-        code.arg("dsh_ptr", "TV_METAL_DEVICE tv::array<float, 3>*")
-        code.arg("dir", "tv::array<float, 3>")
-        code.arg("sh_ptr", "TV_METAL_DEVICE const tv::array<float, 3>*")
-        code.raw(f"""
-        namespace op = tv::arrayops;
-        // op::PointerValueReader<TV_METAL_DEVICE const tv::array<float, 3>> sh(sh_ptr);
-        auto sh = sh_ptr;
-        static_assert(Degree >= 0 && Degree <= 3, "Degree must be in [0, 3]");
-        tv::array<float, 3> dRGBdx{{}};
-        tv::array<float, 3> dRGBdy{{}};
-        tv::array<float, 3> dRGBdz{{}};
-
-        float x = dir[0];
-        float y = dir[1];
-        float z = dir[2];
-
-        dsh_ptr[0] = (SH_C0) * drgb;
-        if (Degree > 0)
-        {{
-            float dRGBdsh1 = -(SH_C1) * y;
-            float dRGBdsh2 = (SH_C1) * z;
-            float dRGBdsh3 = -(SH_C1) * x;
-            dsh_ptr[1] = dRGBdsh1 * drgb;
-            dsh_ptr[2] = dRGBdsh2 * drgb;
-            dsh_ptr[3] = dRGBdsh3 * drgb;
-
-            dRGBdx = -(SH_C1) * sh[3];
-            dRGBdy = -(SH_C1) * sh[1];
-            dRGBdz = (SH_C1) * sh[2];
-
-            if (Degree > 1)
-            {{
-                float xx = x * x, yy = y * y, zz = z * z;
-                float xy = x * y, yz = y * z, xz = x * z;
-                float dRGBdsh4 = (SH_C2[0]) * xy;
-                float dRGBdsh5 = (SH_C2[1]) * yz;
-                float dRGBdsh6 = (SH_C2[2]) * (2.0f * zz - xx - yy);
-                float dRGBdsh7 = (SH_C2[3]) * xz;
-                float dRGBdsh8 = (SH_C2[4]) * (xx - yy);
-                dsh_ptr[4] = dRGBdsh4 * drgb;
-                dsh_ptr[5] = dRGBdsh5 * drgb;
-                dsh_ptr[6] = dRGBdsh6 * drgb;
-                dsh_ptr[7] = dRGBdsh7 * drgb;
-                dsh_ptr[8] = dRGBdsh8 * drgb;
-
-                dRGBdx += (SH_C2[0]) * y * sh[4] + (SH_C2[2]) * 2.0f * -x * sh[6] + (SH_C2[3]) * z * sh[7] + (SH_C2[4]) * 2.0f * x * sh[8];
-                dRGBdy += (SH_C2[0]) * x * sh[4] + (SH_C2[1]) * z * sh[5] + (SH_C2[2]) * 2.0f * -y * sh[6] + (SH_C2[4]) * 2.0f * -y * sh[8];
-                dRGBdz += (SH_C2[1]) * y * sh[5] + (SH_C2[2]) * 2.0f * 2.0f * z * sh[6] + (SH_C2[3]) * x * sh[7];
-                
-                if (Degree > 2)
-                {{
-                    float dRGBdsh9 = (SH_C3[0]) * y * (3.0f * xx - yy);
-                    float dRGBdsh10 = (SH_C3[1]) * xy * z;
-                    float dRGBdsh11 = (SH_C3[2]) * y * (4.0f * zz - xx - yy);
-                    float dRGBdsh12 = (SH_C3[3]) * z * (2.0f * zz - 3.0f * xx - 3.0f * yy);
-                    float dRGBdsh13 = (SH_C3[4]) * x * (4.0f * zz - xx - yy);
-                    float dRGBdsh14 = (SH_C3[5]) * z * (xx - yy);
-                    float dRGBdsh15 = (SH_C3[6]) * x * (xx - 3.0f * yy);
-                    dsh_ptr[9] = dRGBdsh9 * drgb;
-                    dsh_ptr[10] = dRGBdsh10 * drgb;
-                    dsh_ptr[11] = dRGBdsh11 * drgb;
-                    dsh_ptr[12] = dRGBdsh12 * drgb;
-                    dsh_ptr[13] = dRGBdsh13 * drgb;
-                    dsh_ptr[14] = dRGBdsh14 * drgb;
-                    dsh_ptr[15] = dRGBdsh15 * drgb;
-
-                    dRGBdx += (
-                        (SH_C3[0]) * sh[9] * 3.0f * 2.0f * xy +
-                        (SH_C3[1]) * sh[10] * yz +
-                        (SH_C3[2]) * sh[11] * -2.0f * xy +
-                        (SH_C3[3]) * sh[12] * -3.0f * 2.0f * xz +
-                        (SH_C3[4]) * sh[13] * (-3.0f * xx + 4.0f * zz - yy) +
-                        (SH_C3[5]) * sh[14] * 2.0f * xz +
-                        (SH_C3[6]) * sh[15] * 3.0f * (xx - yy));
-
-                    dRGBdy += (
-                        (SH_C3[0]) * sh[9] * 3.0f * (xx - yy) +
-                        (SH_C3[1]) * sh[10] * xz +
-                        (SH_C3[2]) * sh[11] * (-3.0f * yy + 4.0f * zz - xx) +
-                        (SH_C3[3]) * sh[12] * -3.0f * 2.0f * yz +
-                        (SH_C3[4]) * sh[13] * -2.0f * xy +
-                        (SH_C3[5]) * sh[14] * -2.0f * yz +
-                        (SH_C3[6]) * sh[15] * -3.0f * 2.0f * xy);
-
-                    dRGBdz += (
-                        (SH_C3[1]) * sh[10] * xy +
-                        (SH_C3[2]) * sh[11] * 4.0f * 2.0f * yz +
-                        (SH_C3[3]) * sh[12] * 3.0f * (2.0f * zz - xx - yy) +
-                        (SH_C3[4]) * sh[13] * 4.0f * 2.0f * xz +
-                        (SH_C3[5]) * sh[14] * (xx - yy));
-                }}
-            }}
-        }}
-        tv::array<float, 3> ddir{{dRGBdx.template op<op::dot>(drgb), dRGBdy.template op<op::dot>(drgb), dRGBdz.template op<op::dot>(drgb)}};
-        return ddir;
-        """)
-        return code.ret("tv::array<float, 3>")
 
     @pccm.cuda.static_function(attrs=["TV_HOST_DEVICE_INLINE"], header_only=True)
     def scale_quat_to_cov3d(self):

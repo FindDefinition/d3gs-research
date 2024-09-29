@@ -78,6 +78,8 @@ class RasterizeBackwardAlgo(enum.IntEnum):
 class GaussianSplatConfig:
     tile_size: tuple[int, int] = (16, 16)
     warp_size: tuple[int, int] = (8, 4)
+    near: float = 0.2
+    far: float = 10000.0
     eps: float = 1e-6
     cov2d_radii_eigen_eps: float = 0.1
     projected_clamp_factor: float = 1.3
@@ -107,13 +109,14 @@ class GaussianSplatConfig:
     backward_reduction_balanced_factor: int = 4
     verbose: bool = False
 
-    recalc_cov3d_in_bwd: bool = True
     enable_device_asserts: bool = False
 
     use_cub_sort: bool = False if IsAppleSiliconMacOs else True
     # TODO use_int64_tile_touched should be True by default,
     # False should only used for performance benchmark.
     use_int64_tile_touched: bool = False
+
+    sparse_mode: bool = False
 
     use_proxy_model = True
 
