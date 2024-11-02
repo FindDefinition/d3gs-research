@@ -11,3 +11,6 @@ pip install -e .
 ```
 
 then prepare original dataset, change path in `d3sim/algos/d3gs/train.py`, and run that file.
+```
+D3SIM_DISABLE_ARRAY_CHECK=1 python d3sim/algos/d3gs/train.py
+```
